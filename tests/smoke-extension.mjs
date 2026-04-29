@@ -99,6 +99,35 @@ const server = createServer(async (request, response) => {
         headers: request.headers,
         body
       });
+      const summaryText = [
+        "## 一句话结论",
+        "",
+        "**MOCK SUMMARY CUSTOM PROMPT OK**",
+        "",
+        "---",
+        "",
+        "## 关键观点",
+        "- Markdown 粗体应该被渲染",
+        "- 摘要块应该在解析按钮下方",
+        "",
+        "1. 支持有序列表"
+      ].join("\n");
+
+      if (body?.stream) {
+        response.writeHead(200, {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-store",
+          "Connection": "close"
+        });
+        response.flushHeaders?.();
+        for (const chunk of chunkText(summaryText, 9)) {
+          response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: chunk } }] })}\n\n`);
+          await delay(35);
+        }
+        response.end("data: [DONE]\n\n");
+        return;
+      }
+
       response.writeHead(200, {
         "Content-Type": "application/json; charset=utf-8",
         "Cache-Control": "no-store"
@@ -107,19 +136,7 @@ const server = createServer(async (request, response) => {
         choices: [
           {
             message: {
-              content: [
-                "## 一句话结论",
-                "",
-                "**MOCK SUMMARY CUSTOM PROMPT OK**",
-                "",
-                "---",
-                "",
-                "## 关键观点",
-                "- Markdown 粗体应该被渲染",
-                "- 摘要块应该在解析按钮下方",
-                "",
-                "1. 支持有序列表"
-              ].join("\n")
+              content: summaryText
             }
           }
         ]
@@ -146,7 +163,7 @@ const { port } = server.address();
 const baseUrl = `http://127.0.0.1:${port}`;
 const targetVideoUrl = externalVideoUrl || `${baseUrl}/video-page.html`;
 const targetNonVideoUrl = externalNonVideoUrl || `${baseUrl}/blank-page.html`;
-const waitTimeout = externalVideoUrl ? 30000 : 15000;
+const waitTimeout = 30000;
 
 const chrome = spawn(chromePath, [
   `--user-data-dir=${userDataDir}`,
@@ -662,6 +679,20 @@ async function assertPromptTemplateReachesModel({
     return true;
   `, { userGesture: true });
 
+  const streamingUiState = await waitForExpression(videoPage, `
+    (() => {
+      const shadow = document.querySelector("#vcs-root")?.shadowRoot;
+      const text = shadow?.querySelector("#vcs-summary")?.textContent || "";
+      return shadow?.querySelector(".vcs-stream-cursor") && text.length > 0 && !text.includes("支持有序列表")
+        ? {
+            hasCursor: true,
+            partialLength: text.length,
+            text
+          }
+        : null;
+    })()
+  `, 5000);
+
   await waitForExpression(videoPage, `
     (() => {
       const shadow = document.querySelector("#vcs-root")?.shadowRoot;
@@ -677,6 +708,9 @@ async function assertPromptTemplateReachesModel({
   }
 
   const request = modelRequests[0];
+  if (request.body?.stream !== true) {
+    throw new Error(`Model request should enable streaming: ${JSON.stringify(request.body)}`);
+  }
   const messages = Array.isArray(request.body?.messages) ? request.body.messages : [];
   const requestText = JSON.stringify(request.body);
   const requiredMarkers = [
@@ -732,7 +766,8 @@ async function assertPromptTemplateReachesModel({
     requestCount: modelRequests.length,
     customPromptInUserMessage: userMessage.includes("PROMPT_EFFECT_MARKER"),
     outputTemplateInUserMessage: userMessage.includes("OUTPUT_EFFECT_MARKER"),
-    markdownSummaryRendered: summaryLayoutState.strongText.includes("MOCK SUMMARY CUSTOM PROMPT OK")
+    markdownSummaryRendered: summaryLayoutState.strongText.includes("MOCK SUMMARY CUSTOM PROMPT OK"),
+    streamingCursorShown: streamingUiState.hasCursor
   };
 }
 
@@ -826,6 +861,14 @@ async function readRequestBody(request) {
 
 function delay(ms) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+function chunkText(text, size) {
+  const chunks = [];
+  for (let index = 0; index < text.length; index += size) {
+    chunks.push(text.slice(index, index + size));
+  }
+  return chunks;
 }
 
 async function firstExisting(paths) {

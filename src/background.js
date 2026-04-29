@@ -80,7 +80,10 @@ async function handleMessage(message, sender) {
   }
 
   if (message.type === "VCS_SUMMARIZE") {
-    return summarizeTranscript(message.payload, sender);
+    return summarizeTranscript(message.payload, sender, {
+      stream: Boolean(message.stream),
+      streamId: message.streamId || ""
+    });
   }
 
   if (message.type === "VCS_TEST_API") {
@@ -135,11 +138,18 @@ async function fetchText(url) {
   };
 }
 
-async function summarizeTranscript(payload, sender) {
+async function summarizeTranscript(payload, sender, options = {}) {
   const settings = await getSettings();
   const locale = i18n(settings);
   const profile = getActiveProfile(settings);
   validateProfile(profile, locale);
+  const streamId = options.streamId || "";
+  const streamNotifier = options.stream && streamId
+    ? createSummaryStreamNotifier(sender, streamId)
+    : null;
+  const streamDelta = streamNotifier
+    ? (delta) => streamNotifier.push(delta)
+    : null;
 
   const title = payload?.title || "Untitled video";
   const platform = payload?.platform || "Unknown platform";
@@ -168,7 +178,8 @@ async function summarizeTranscript(payload, sender) {
       url,
       transcript: chunks[0],
       chunkLabel: ""
-    }), { i18n: locale });
+    }), { onDelta: streamDelta, i18n: locale });
+    streamNotifier?.flush();
     await maybeSaveHistory(settings, { title, platform, url, summary: text, model: profile.model, provider: profile.provider });
     return {
       text,
@@ -240,7 +251,8 @@ async function summarizeTranscript(payload, sender) {
         outputTemplate: settings.outputTemplate
       })
     }
-  ], { i18n: locale });
+  ], { onDelta: streamDelta, i18n: locale });
+  streamNotifier?.flush();
 
   await maybeSaveHistory(settings, { title, platform, url, summary: finalText, model: profile.model, provider: profile.provider });
   return {
@@ -316,6 +328,7 @@ async function callModel(profile, messages, options = {}) {
 
 async function callOpenAICompatible(profile, messages, options = {}) {
   const locale = options.i18n || i18n(DEFAULT_SETTINGS);
+  const wantsStream = typeof options.onDelta === "function";
   const headers = {
     "Content-Type": "application/json"
   };
@@ -328,7 +341,7 @@ async function callOpenAICompatible(profile, messages, options = {}) {
     model: profile.model,
     messages,
     max_tokens: toNumber(profile.maxTokens, 4096),
-    stream: false
+    stream: wantsStream
   };
 
   if (shouldDisableKimiThinking(profile)) {
@@ -343,6 +356,10 @@ async function callOpenAICompatible(profile, messages, options = {}) {
     body: JSON.stringify(body)
   }, profile, locale);
 
+  if (wantsStream) {
+    return readOpenAICompatibleStream(response, profile, options.onDelta, locale);
+  }
+
   const data = await readJsonResponse(response, profile, locale);
   const content = data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text;
   if (!content) {
@@ -353,6 +370,7 @@ async function callOpenAICompatible(profile, messages, options = {}) {
 
 async function callAnthropic(profile, messages, options = {}) {
   const locale = options.i18n || i18n(DEFAULT_SETTINGS);
+  const wantsStream = typeof options.onDelta === "function";
   const systemMessage = messages.find((message) => message.role === "system")?.content || "";
   const userMessages = messages
     .filter((message) => message.role !== "system")
@@ -374,10 +392,15 @@ async function callAnthropic(profile, messages, options = {}) {
       model: profile.model,
       max_tokens: toNumber(profile.maxTokens, 4096),
       temperature: toNumber(profile.temperature, 1),
+      stream: wantsStream,
       system: systemMessage,
       messages: userMessages.length ? userMessages : [{ role: "user", content: "OK" }]
     })
   }, profile, locale);
+
+  if (wantsStream) {
+    return readAnthropicStream(response, profile, options.onDelta, locale);
+  }
 
   const data = await readJsonResponse(response, profile, locale);
   const content = Array.isArray(data?.content)
@@ -391,8 +414,13 @@ async function callAnthropic(profile, messages, options = {}) {
 
 async function callGemini(profile, messages, options = {}) {
   const locale = options.i18n || i18n(DEFAULT_SETTINGS);
+  const wantsStream = typeof options.onDelta === "function";
   const base = profile.endpoint || `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(profile.model)}:generateContent`;
   const url = new URL(base);
+  if (wantsStream && url.pathname.includes(":generateContent")) {
+    url.pathname = url.pathname.replace(":generateContent", ":streamGenerateContent");
+    url.searchParams.set("alt", "sse");
+  }
   if (profile.apiKey && !url.searchParams.has("key")) {
     url.searchParams.set("key", profile.apiKey);
   }
@@ -420,6 +448,10 @@ async function callGemini(profile, messages, options = {}) {
     })
   }, profile, locale);
 
+  if (wantsStream) {
+    return readGeminiStream(response, profile, options.onDelta, locale);
+  }
+
   const data = await readJsonResponse(response, profile, locale);
   const content = data?.candidates?.[0]?.content?.parts
     ?.map((part) => part.text || "")
@@ -428,6 +460,174 @@ async function callGemini(profile, messages, options = {}) {
     throw new Error(locale.t("background.error.geminiNoText"));
   }
   return content.trim();
+}
+
+async function readOpenAICompatibleStream(response, profile, onDelta, locale = i18n(DEFAULT_SETTINGS)) {
+  let content = "";
+  await readSseEvents(response, profile, async ({ data }) => {
+    if (data === "[DONE]") {
+      return false;
+    }
+
+    const chunk = parseStreamJson(data, profile, response.url, locale);
+    const delta = chunk?.choices?.[0]?.delta?.content
+      || chunk?.choices?.[0]?.message?.content
+      || chunk?.choices?.[0]?.text
+      || "";
+    if (delta) {
+      content += delta;
+      onDelta(delta);
+    }
+    return true;
+  }, locale);
+
+  if (!content.trim()) {
+    throw new Error(locale.t("background.error.openaiStreamNoText"));
+  }
+  return content.trim();
+}
+
+async function readAnthropicStream(response, profile, onDelta, locale = i18n(DEFAULT_SETTINGS)) {
+  let content = "";
+  await readSseEvents(response, profile, async ({ data }) => {
+    if (data === "[DONE]") {
+      return false;
+    }
+
+    const chunk = parseStreamJson(data, profile, response.url, locale);
+    if (chunk?.type === "error") {
+      throw new Error(locale.t("background.error.http", {
+        target: getApiTargetLabel(profile, response.url),
+        status: "stream",
+        message: chunk.error?.message || "stream error"
+      }));
+    }
+
+    const delta = chunk?.delta?.text || "";
+    if (delta) {
+      content += delta;
+      onDelta(delta);
+    }
+    return true;
+  }, locale);
+
+  if (!content.trim()) {
+    throw new Error(locale.t("background.error.anthropicStreamNoText"));
+  }
+  return content.trim();
+}
+
+async function readGeminiStream(response, profile, onDelta, locale = i18n(DEFAULT_SETTINGS)) {
+  let content = "";
+  await readSseEvents(response, profile, async ({ data }) => {
+    if (data === "[DONE]") {
+      return false;
+    }
+
+    const chunk = parseStreamJson(data, profile, response.url, locale);
+    const delta = chunk?.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text || "")
+      .join("") || "";
+    if (delta) {
+      content += delta;
+      onDelta(delta);
+    }
+    return true;
+  }, locale);
+
+  if (!content.trim()) {
+    throw new Error(locale.t("background.error.geminiStreamNoText"));
+  }
+  return content.trim();
+}
+
+async function readSseEvents(response, profile, onEvent, locale = i18n(DEFAULT_SETTINGS)) {
+  if (!response.ok) {
+    await readJsonResponse(response, profile, locale);
+    return;
+  }
+
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    throw new Error(locale.t("background.error.streamUnsupported", {
+      target: getApiTargetLabel(profile, response.url)
+    }));
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const result = await consumeSseBuffer(buffer, onEvent);
+    if (result.done) {
+      return;
+    }
+    buffer = result.buffer;
+  }
+
+  buffer += decoder.decode();
+  const remaining = buffer.trim();
+  if (remaining) {
+    await consumeSseBlock(remaining, onEvent);
+  }
+}
+
+async function consumeSseBuffer(input, onEvent) {
+  let buffer = input.replace(/\r\n/g, "\n");
+  let boundary = buffer.indexOf("\n\n");
+
+  while (boundary >= 0) {
+    const block = buffer.slice(0, boundary);
+    buffer = buffer.slice(boundary + 2);
+    const shouldContinue = await consumeSseBlock(block, onEvent);
+    if (!shouldContinue) {
+      return { buffer, done: true };
+    }
+    boundary = buffer.indexOf("\n\n");
+  }
+
+  return { buffer, done: false };
+}
+
+async function consumeSseBlock(block, onEvent) {
+  const lines = String(block || "").split("\n");
+  let event = "message";
+  const data = [];
+
+  for (const line of lines) {
+    if (!line || line.startsWith(":")) {
+      continue;
+    }
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim() || event;
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      data.push(line.slice(5).trimStart());
+    }
+  }
+
+  if (data.length) {
+    return await onEvent({ event, data: data.join("\n") }) !== false;
+  }
+  return true;
+}
+
+function parseStreamJson(data, profile, endpoint, locale = i18n(DEFAULT_SETTINGS)) {
+  try {
+    return JSON.parse(data);
+  } catch (_error) {
+    throw new Error(locale.t("background.error.invalidStreamJson", {
+      target: getApiTargetLabel(profile, endpoint),
+      text: String(data).slice(0, 240)
+    }));
+  }
 }
 
 async function fetchModel(url, options, profile, locale = i18n(DEFAULT_SETTINGS)) {
@@ -569,6 +769,50 @@ async function notifyProgress(sender, progress) {
     });
   } catch (_error) {
     // The tab may have navigated while the model request was running.
+  }
+}
+
+function createSummaryStreamNotifier(sender, streamId) {
+  let buffer = "";
+  let timer = null;
+
+  const flush = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    const delta = buffer;
+    buffer = "";
+    if (delta) {
+      notifySummaryStream(sender, { streamId, delta });
+    }
+  };
+
+  return {
+    push(delta) {
+      buffer += String(delta || "");
+      if (!timer) {
+        timer = setTimeout(flush, 45);
+      }
+    },
+    flush
+  };
+}
+
+async function notifySummaryStream(sender, event) {
+  const tabId = sender?.tab?.id;
+  if (!tabId || !event?.streamId || !event.delta) {
+    return;
+  }
+
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "VCS_SUMMARY_STREAM",
+      streamId: event.streamId,
+      delta: event.delta
+    });
+  } catch (_error) {
+    // The tab may have navigated while the model request was streaming.
   }
 }
 

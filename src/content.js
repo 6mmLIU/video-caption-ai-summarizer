@@ -30,7 +30,9 @@
     refreshing: false,
     previewLoading: false,
     copyingTranscript: false,
-    copyingSummary: false
+    copyingSummary: false,
+    summaryStreaming: false,
+    summaryStreamId: ""
   };
 
   let root = null;
@@ -42,6 +44,9 @@
   let activeVideo = null;
   let lastActiveTranscriptIndex = -1;
   let transcriptPanelCloseTimer = null;
+  let summaryTypeTimer = null;
+  let summaryTargetText = "";
+  let summaryTypingResolve = null;
 
   init();
 
@@ -112,6 +117,12 @@
         return false;
       }
 
+      if (message?.type === "VCS_SUMMARY_STREAM") {
+        appendSummaryStreamDelta(message.streamId, message.delta);
+        sendResponse({ ok: true });
+        return false;
+      }
+
       return false;
     });
 
@@ -169,6 +180,7 @@
       state.tracks = [];
       state.transcript = "";
       state.lastSummary = "";
+      resetSummaryStream();
       state.platform = null;
       state.previewLoading = false;
       state.collapsed = true;
@@ -217,6 +229,7 @@
       root.remove();
     }
     clearTimeout(transcriptPanelCloseTimer);
+    resetSummaryStream();
     endYouTubeTranscriptProbe();
     removePagePolish();
     unbindVideoSync();
@@ -1057,10 +1070,14 @@
     try {
       setStatus(t("content.status.preparing"), "busy");
       const transcript = await hydrateTranscriptPreview();
+      const streamId = `summary-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      beginSummaryStream(streamId);
 
       setStatus(t("content.status.requestingSummary"), "busy");
       const response = await chrome.runtime.sendMessage({
         type: "VCS_SUMMARIZE",
+        stream: true,
+        streamId,
         payload: {
           title: state.title,
           platform: state.platform?.name || "Unknown",
@@ -1073,15 +1090,121 @@
         throw new Error(response?.error || t("content.status.summaryFailed"));
       }
 
-      state.lastSummary = response.payload.text;
+      await finishSummaryStream(response.payload.text || "");
       setStatus(t("content.status.complete", {
         provider: response.payload.provider,
         model: response.payload.model
       }), "done");
       render();
     } catch (error) {
+      stopSummaryStream();
       setStatus(error.message, "error");
       render();
+    }
+  }
+
+  function beginSummaryStream(streamId) {
+    clearSummaryTypeTimer();
+    summaryTargetText = "";
+    state.lastSummary = "";
+    state.summaryStreaming = true;
+    state.summaryStreamId = streamId;
+    render();
+  }
+
+  function appendSummaryStreamDelta(streamId, delta) {
+    if (!delta || !state.summaryStreaming || streamId !== state.summaryStreamId) {
+      return;
+    }
+
+    summaryTargetText += String(delta);
+    scheduleSummaryTypewriter();
+  }
+
+  async function finishSummaryStream(finalText) {
+    const cleanText = String(finalText || "").trim();
+    if (cleanText && summaryTargetText.trim() !== cleanText) {
+      summaryTargetText = cleanText;
+    }
+    scheduleSummaryTypewriter();
+
+    if (state.lastSummary !== summaryTargetText) {
+      await new Promise((resolve) => {
+        summaryTypingResolve = resolve;
+      });
+    }
+
+    state.lastSummary = summaryTargetText;
+    state.summaryStreaming = false;
+    state.summaryStreamId = "";
+    clearSummaryTypeTimer();
+  }
+
+  function stopSummaryStream() {
+    state.summaryStreaming = false;
+    state.summaryStreamId = "";
+    summaryTargetText = state.lastSummary || summaryTargetText;
+    clearSummaryTypeTimer();
+    resolveSummaryTyping();
+  }
+
+  function resetSummaryStream() {
+    state.summaryStreaming = false;
+    state.summaryStreamId = "";
+    summaryTargetText = "";
+    clearSummaryTypeTimer();
+    resolveSummaryTyping();
+  }
+
+  function scheduleSummaryTypewriter() {
+    if (summaryTypeTimer) {
+      return;
+    }
+
+    const tick = () => {
+      const currentLength = state.lastSummary.length;
+      const remaining = summaryTargetText.length - currentLength;
+
+      if (remaining <= 0) {
+        summaryTypeTimer = null;
+        resolveSummaryTyping();
+        updateSummaryArticle();
+        return;
+      }
+
+      const step = remaining > 240 ? 18 : remaining > 80 ? 10 : 4;
+      state.lastSummary += summaryTargetText.slice(currentLength, currentLength + step);
+      updateSummaryArticle();
+      summaryTypeTimer = window.setTimeout(tick, 28);
+    };
+
+    summaryTypeTimer = window.setTimeout(tick, 18);
+  }
+
+  function clearSummaryTypeTimer() {
+    if (summaryTypeTimer) {
+      clearTimeout(summaryTypeTimer);
+      summaryTypeTimer = null;
+    }
+  }
+
+  function resolveSummaryTyping() {
+    if (summaryTypingResolve) {
+      summaryTypingResolve();
+      summaryTypingResolve = null;
+    }
+  }
+
+  function updateSummaryArticle() {
+    const article = shadow?.querySelector("#vcs-summary");
+    if (!article) {
+      return;
+    }
+
+    article.innerHTML = markdownToHtml(state.lastSummary);
+    const shell = shadow?.querySelector(".vcs-summary-shell");
+    if (shell) {
+      shell.scrollTop = shell.scrollHeight;
     }
   }
 
@@ -1238,13 +1361,14 @@
             <span>${escapeHtml(summarizeLabel)}</span>
           </button>
 
-          <section class="vcs-result" aria-live="polite" ${state.lastSummary ? "" : "hidden"}>
+          <section class="vcs-result ${state.summaryStreaming ? "is-streaming" : ""}" aria-live="polite" ${state.lastSummary || state.summaryStreaming ? "" : "hidden"}>
             <div class="vcs-result-head">
               <span class="vcs-result-title">${escapeHtml(t("content.label.summary"))}</span>
               <button id="vcs-copy-summary" class="vcs-tool-button ${state.copyingSummary ? "is-busy" : ""}" type="button" title="${escapeHtml(t("content.title.copySummary"))}" aria-label="${escapeHtml(t("content.title.copySummary"))}">${state.copyingSummary ? loadingIcon() : copyIcon()}</button>
             </div>
-            <div class="vcs-summary-shell" role="region" aria-label="${escapeHtml(t("content.label.markdownSummary"))}" tabindex="0">
+            <div class="vcs-summary-shell ${state.summaryStreaming ? "is-streaming" : ""}" role="region" aria-label="${escapeHtml(t("content.label.markdownSummary"))}" aria-busy="${state.summaryStreaming ? "true" : "false"}" tabindex="0">
               <article id="vcs-summary" class="vcs-markdown">${markdownToHtml(state.lastSummary)}</article>
+              ${state.summaryStreaming ? `<span class="vcs-stream-cursor" aria-hidden="true"></span>` : ""}
             </div>
           </section>
 
@@ -2823,6 +2947,9 @@
         overscroll-behavior: contain;
         scrollbar-gutter: stable;
       }
+      .vcs-summary-shell.is-streaming {
+        cursor: text;
+      }
       .vcs-summary-shell:focus {
         outline: 2px solid color-mix(in srgb, var(--rikyu) 38%, transparent);
         outline-offset: 3px;
@@ -2874,6 +3001,16 @@
         margin: 14px 0;
         background: var(--haijiro-soft);
         border: 0;
+      }
+      .vcs-stream-cursor {
+        display: inline-block;
+        width: 2px;
+        height: 1.2em;
+        margin-left: 2px;
+        background: var(--sumi);
+        border-radius: 1px;
+        vertical-align: -0.18em;
+        animation: vcs-caret-blink 900ms steps(1, end) infinite;
       }
       .vcs-collapsed-toggle {
         display: none;
@@ -3012,10 +3149,16 @@
         100% { opacity: 1; transform: translateX(0); }
       }
 
+      @keyframes vcs-caret-blink {
+        0%, 49% { opacity: 1; }
+        50%, 100% { opacity: 0; }
+      }
+
       @media (prefers-reduced-motion: reduce) {
         .vcs-panel[data-tone="busy"] .vcs-progress span { animation: none; }
         .vcs-icon-button.is-spinning svg { animation: none; }
         .vcs-tool-button.is-busy svg { animation: none; }
+        .vcs-stream-cursor { animation: none; }
         .vcs-panel, .vcs-collapsed-toggle { animation: none; }
         .vcs-primary, .vcs-icon-button, .vcs-tool-button, .vcs-collapsed-toggle { transition: none; }
         .t-resize { transition: none !important; }
