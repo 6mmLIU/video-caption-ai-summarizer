@@ -31,6 +31,7 @@
     previewLoading: false,
     copyingTranscript: false,
     copyingSummary: false,
+    summaryCollapsed: false,
     summaryStreaming: false,
     summaryStreamId: ""
   };
@@ -44,9 +45,8 @@
   let activeVideo = null;
   let lastActiveTranscriptIndex = -1;
   let transcriptPanelCloseTimer = null;
-  let summaryTypeTimer = null;
+  let summaryScrollFrame = null;
   let summaryTargetText = "";
-  let summaryTypingResolve = null;
 
   init();
 
@@ -1095,7 +1095,6 @@
         provider: response.payload.provider,
         model: response.payload.model
       }), "done");
-      render();
     } catch (error) {
       stopSummaryStream();
       setStatus(error.message, "error");
@@ -1104,9 +1103,9 @@
   }
 
   function beginSummaryStream(streamId) {
-    clearSummaryTypeTimer();
     summaryTargetText = "";
     state.lastSummary = "";
+    state.summaryCollapsed = false;
     state.summaryStreaming = true;
     state.summaryStreamId = streamId;
     render();
@@ -1117,82 +1116,48 @@
       return;
     }
 
+    const shouldRevealSummary = !state.lastSummary && !summaryTargetText;
     summaryTargetText += String(delta);
-    scheduleSummaryTypewriter();
+    if (shouldRevealSummary) {
+      revealSummaryOutput();
+    }
+    state.lastSummary = summaryTargetText;
+    updateSummaryArticle();
   }
 
   async function finishSummaryStream(finalText) {
     const cleanText = String(finalText || "").trim();
+    const hadSummaryOutput = Boolean(state.lastSummary || summaryTargetText);
     if (cleanText && summaryTargetText.trim() !== cleanText) {
       summaryTargetText = cleanText;
     }
-    scheduleSummaryTypewriter();
-
-    if (state.lastSummary !== summaryTargetText) {
-      await new Promise((resolve) => {
-        summaryTypingResolve = resolve;
-      });
+    if (summaryTargetText && state.lastSummary !== summaryTargetText) {
+      state.lastSummary = summaryTargetText;
+    }
+    if (!hadSummaryOutput && summaryTargetText) {
+      revealSummaryOutput();
     }
 
-    state.lastSummary = summaryTargetText;
     state.summaryStreaming = false;
     state.summaryStreamId = "";
-    clearSummaryTypeTimer();
+    cancelSummaryFollowScroll();
+    syncSummaryOutputState();
+    updateSummaryArticle();
   }
 
   function stopSummaryStream() {
     state.summaryStreaming = false;
     state.summaryStreamId = "";
     summaryTargetText = state.lastSummary || summaryTargetText;
-    clearSummaryTypeTimer();
-    resolveSummaryTyping();
+    cancelSummaryFollowScroll();
   }
 
   function resetSummaryStream() {
     state.summaryStreaming = false;
     state.summaryStreamId = "";
     summaryTargetText = "";
-    clearSummaryTypeTimer();
-    resolveSummaryTyping();
-  }
-
-  function scheduleSummaryTypewriter() {
-    if (summaryTypeTimer) {
-      return;
-    }
-
-    const tick = () => {
-      const currentLength = state.lastSummary.length;
-      const remaining = summaryTargetText.length - currentLength;
-
-      if (remaining <= 0) {
-        summaryTypeTimer = null;
-        resolveSummaryTyping();
-        updateSummaryArticle();
-        return;
-      }
-
-      const step = remaining > 240 ? 18 : remaining > 80 ? 10 : 4;
-      state.lastSummary += summaryTargetText.slice(currentLength, currentLength + step);
-      updateSummaryArticle();
-      summaryTypeTimer = window.setTimeout(tick, 28);
-    };
-
-    summaryTypeTimer = window.setTimeout(tick, 18);
-  }
-
-  function clearSummaryTypeTimer() {
-    if (summaryTypeTimer) {
-      clearTimeout(summaryTypeTimer);
-      summaryTypeTimer = null;
-    }
-  }
-
-  function resolveSummaryTyping() {
-    if (summaryTypingResolve) {
-      summaryTypingResolve();
-      summaryTypingResolve = null;
-    }
+    state.summaryCollapsed = false;
+    cancelSummaryFollowScroll();
   }
 
   function updateSummaryArticle() {
@@ -1202,9 +1167,104 @@
     }
 
     article.innerHTML = markdownToHtml(state.lastSummary);
-    const shell = shadow?.querySelector(".vcs-summary-shell");
+    const details = shadow?.querySelector(".vcs-summary-details");
+    if (state.summaryStreaming && details && !details.hidden) {
+      placeSummaryCursor(article);
+      requestSummaryFollowScroll();
+    }
+  }
+
+  function revealSummaryOutput() {
+    const details = shadow?.querySelector(".vcs-summary-details");
+    if (!details) {
+      render();
+      return;
+    }
+
+    details.hidden = false;
+    details.open = !state.summaryCollapsed;
+    syncSummaryOutputState();
+  }
+
+  function syncSummaryOutputState() {
+    const details = shadow?.querySelector(".vcs-summary-details");
+    if (!details) {
+      return;
+    }
+
+    const hasSummaryOutput = Boolean(state.lastSummary || summaryTargetText);
+    details.hidden = !hasSummaryOutput;
+    details.classList.toggle("is-streaming", state.summaryStreaming);
+
+    const shell = details.querySelector(".vcs-summary-shell");
     if (shell) {
-      shell.scrollTop = shell.scrollHeight;
+      shell.classList.toggle("is-streaming", state.summaryStreaming);
+      shell.setAttribute("aria-busy", state.summaryStreaming ? "true" : "false");
+    }
+  }
+
+  function updateSummarizeButtonLabel() {
+    const label = shadow?.querySelector("#vcs-summarize .vcs-primary-label");
+    if (label) {
+      label.textContent = state.statusTone === "busy" ? t("content.label.summarizeBusy") : t("content.label.summarize");
+    }
+  }
+
+  function placeSummaryCursor(article) {
+    const cursor = article.ownerDocument.createElement("span");
+    cursor.className = "vcs-stream-cursor";
+    cursor.setAttribute("aria-hidden", "true");
+
+    findSummaryCursorTarget(article).appendChild(cursor);
+  }
+
+  function findSummaryCursorTarget(article) {
+    const lastBlock = article.lastElementChild;
+    if (!lastBlock) {
+      return article;
+    }
+
+    if (lastBlock.matches("ul, ol")) {
+      return lastBlock.querySelector("li:last-child") || lastBlock;
+    }
+
+    if (lastBlock.matches("p, li, h3, h4, h5")) {
+      return lastBlock;
+    }
+
+    return article;
+  }
+
+  function requestSummaryFollowScroll() {
+    cancelSummaryFollowScroll();
+    summaryScrollFrame = requestAnimationFrame(() => {
+      summaryScrollFrame = null;
+      const shell = shadow?.querySelector(".vcs-summary-shell");
+      const cursor = shadow?.querySelector(".vcs-stream-cursor");
+      if (!shell || !cursor) {
+        return;
+      }
+
+      const shellRect = shell.getBoundingClientRect();
+      const cursorRect = cursor.getBoundingClientRect();
+      const bottomPadding = 18;
+      const bottomOverflow = cursorRect.bottom - shellRect.bottom + bottomPadding;
+
+      if (bottomOverflow > 0) {
+        shell.scrollTop += bottomOverflow;
+        return;
+      }
+
+      if (cursorRect.top < shellRect.top) {
+        shell.scrollTop += cursorRect.top - shellRect.top - bottomPadding;
+      }
+    });
+  }
+
+  function cancelSummaryFollowScroll() {
+    if (summaryScrollFrame) {
+      cancelAnimationFrame(summaryScrollFrame);
+      summaryScrollFrame = null;
     }
   }
 
@@ -1212,10 +1272,19 @@
     state.status = message;
     state.statusTone = tone;
     state.progress = progress;
+    const panel = shadow?.querySelector(".vcs-panel");
+    if (panel) {
+      panel.dataset.tone = tone;
+    }
     const status = shadow?.querySelector("#vcs-status");
     if (status) {
       status.dataset.tone = tone;
       swapStatusText(status, message);
+    }
+    updateSummarizeButtonLabel();
+    const progressEl = shadow?.querySelector(".vcs-progress");
+    if (progressEl) {
+      progressEl.dataset.tone = tone;
     }
     const bar = shadow?.querySelector("#vcs-progress-bar");
     if (bar) {
@@ -1265,11 +1334,16 @@
   }
 
   function swapStatusText(element, nextText) {
-    if (!element || element.textContent === nextText) {
+    if (!element) {
       return;
     }
 
     clearTimeout(statusSwapTimer);
+    element.classList.remove("is-exit", "is-enter-start");
+    if (element.textContent === nextText) {
+      return;
+    }
+
     if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
       element.textContent = nextText;
       return;
@@ -1309,6 +1383,8 @@
     const previewContent = state.transcript
       ? renderTranscriptPreview(state.transcript)
       : `<span class="vcs-transcript-placeholder">${escapeHtml(previewPlaceholder)}</span>`;
+    const hasSummaryOutput = Boolean(state.lastSummary || summaryTargetText);
+    const summaryOpen = !state.summaryCollapsed;
 
     const trackCount = state.tracks.length
       ? t("content.label.trackCount", { count: state.tracks.length })
@@ -1358,26 +1434,25 @@
 
           <button id="vcs-summarize" class="vcs-primary" type="button">
             <span class="vcs-primary-icon">${sparkIcon()}</span>
-            <span>${escapeHtml(summarizeLabel)}</span>
+            <span class="vcs-primary-label">${escapeHtml(summarizeLabel)}</span>
           </button>
 
-          <section class="vcs-result ${state.summaryStreaming ? "is-streaming" : ""}" aria-live="polite" ${state.lastSummary || state.summaryStreaming ? "" : "hidden"}>
-            <div class="vcs-result-head">
+          <details class="vcs-result vcs-details vcs-summary-details ${state.summaryStreaming ? "is-streaming" : ""}" aria-live="polite" ${hasSummaryOutput ? "" : "hidden"} ${summaryOpen ? "open" : ""}>
+            <summary>
               <span class="vcs-result-title">${escapeHtml(t("content.label.summary"))}</span>
-              <button id="vcs-copy-summary" class="vcs-tool-button ${state.copyingSummary ? "is-busy" : ""}" type="button" title="${escapeHtml(t("content.title.copySummary"))}" aria-label="${escapeHtml(t("content.title.copySummary"))}">${state.copyingSummary ? loadingIcon() : copyIcon()}</button>
-            </div>
+              <button id="vcs-copy-summary" class="vcs-tool-button ${state.copyingSummary ? "is-busy" : ""}" type="button" title="${escapeHtml(t("content.title.copySummary"))}" aria-label="${escapeHtml(t("content.title.copySummary"))}">${copyButtonIcon(state.copyingSummary)}</button>
+            </summary>
             <div class="vcs-summary-shell ${state.summaryStreaming ? "is-streaming" : ""}" role="region" aria-label="${escapeHtml(t("content.label.markdownSummary"))}" aria-busy="${state.summaryStreaming ? "true" : "false"}" tabindex="0">
               <article id="vcs-summary" class="vcs-markdown">${markdownToHtml(state.lastSummary)}</article>
-              ${state.summaryStreaming ? `<span class="vcs-stream-cursor" aria-hidden="true"></span>` : ""}
             </div>
-          </section>
+          </details>
 
           <div class="vcs-track-row">
             <span class="vcs-track-label">${escapeHtml(trackCount)}</span>
             <select id="vcs-track" class="vcs-select" ${state.tracks.length ? "" : "disabled"}>
               ${trackOptions || `<option>${escapeHtml(t("content.label.noTrackOption"))}</option>`}
             </select>
-            <button id="vcs-copy-transcript" class="vcs-tool-button ${state.copyingTranscript ? "is-busy" : ""}" type="button" title="${escapeHtml(t("content.title.copyTranscript"))}" aria-label="${escapeHtml(t("content.title.copyTranscript"))}">${state.copyingTranscript ? loadingIcon() : copyIcon()}</button>
+            <button id="vcs-copy-transcript" class="vcs-tool-button ${state.copyingTranscript ? "is-busy" : ""}" type="button" title="${escapeHtml(t("content.title.copyTranscript"))}" aria-label="${escapeHtml(t("content.title.copyTranscript"))}">${copyButtonIcon(state.copyingTranscript)}</button>
           </div>
 
           <details class="vcs-details vcs-transcript-details" open>
@@ -1388,6 +1463,7 @@
       </aside>
     `;
 
+    updateSummaryArticle();
     bindEvents();
     applyTheme();
     bindVideoSync();
@@ -1415,7 +1491,17 @@
     });
     shadow.querySelector("#vcs-summarize")?.addEventListener("click", summarize);
     shadow.querySelector("#vcs-copy-transcript")?.addEventListener("click", copyTranscript);
-    shadow.querySelector("#vcs-copy-summary")?.addEventListener("click", copySummary);
+    shadow.querySelector(".vcs-summary-details")?.addEventListener("toggle", (event) => {
+      state.summaryCollapsed = !event.currentTarget.open;
+      if (event.currentTarget.open) {
+        updateSummaryArticle();
+      }
+    });
+    shadow.querySelector("#vcs-copy-summary")?.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      copySummary();
+    });
     shadow.querySelector("#vcs-preview")?.addEventListener("click", handleTranscriptClick);
   }
 
@@ -1597,7 +1683,7 @@
 
     state.copyingTranscript = true;
     setStatus(t("content.status.copyingTranscript"), "busy");
-    render();
+    setCopyButtonBusy("#vcs-copy-transcript", true);
 
     try {
       const text = state.transcript || await hydrateTranscriptPreview();
@@ -1612,7 +1698,7 @@
       setStatus(t("content.status.copyFailed", { message: error.message }), "error");
     } finally {
       state.copyingTranscript = false;
-      render();
+      setCopyButtonBusy("#vcs-copy-transcript", false);
     }
   }
 
@@ -1623,7 +1709,7 @@
 
     state.copyingSummary = true;
     setStatus(t("content.status.copyingSummary"), "busy");
-    render();
+    setCopyButtonBusy("#vcs-copy-summary", true);
 
     try {
       const text = (state.lastSummary || "").trim();
@@ -1636,7 +1722,7 @@
       setStatus(t("content.status.copyFailed", { message: error.message }), "error");
     } finally {
       state.copyingSummary = false;
-      render();
+      setCopyButtonBusy("#vcs-copy-summary", false);
     }
   }
 
@@ -2254,6 +2340,24 @@
     return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3a9 9 0 1 0 9 9'/></svg>";
   }
 
+  function copyButtonIcon(isBusy) {
+    return `
+      <span class="t-icon-swap" data-state="${isBusy ? "b" : "a"}">
+        <span class="t-icon" data-icon="a">${copyIcon()}</span>
+        <span class="t-icon" data-icon="b">${loadingIcon()}</span>
+      </span>
+    `;
+  }
+
+  function setCopyButtonBusy(selector, isBusy) {
+    const button = shadow?.querySelector(selector);
+    if (!button) {
+      return;
+    }
+    button.classList.toggle("is-busy", isBusy);
+    button.querySelector(".t-icon-swap")?.setAttribute("data-state", isBusy ? "b" : "a");
+  }
+
   function getYouTubePageCss() {
     return `
       ytd-engagement-panel-section-list-renderer[target-id*="transcript" i],
@@ -2373,6 +2477,10 @@
         --text-swap-translate-y: 8px;
         --text-swap-blur: 2px;
         --text-swap-ease: ease-out;
+        --icon-swap-dur: 200ms;
+        --icon-swap-blur: 2px;
+        --icon-swap-start-scale: 0.25;
+        --icon-swap-ease: ease-in-out;
 
         --sans: -apple-system, BlinkMacSystemFont, "Roboto", "Arial", "PingFang SC", "Hiragino Sans", "Microsoft YaHei", sans-serif;
         --serif: var(--sans);
@@ -2524,7 +2632,7 @@
         animation: vcs-spin 720ms cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
         transform-origin: 50% 50%;
       }
-      .vcs-tool-button.is-busy svg {
+      .vcs-tool-button.is-busy .t-icon[data-icon="b"] svg {
         animation: vcs-spin 760ms linear infinite;
         transform-origin: 50% 50%;
       }
@@ -2600,6 +2708,31 @@
         filter: blur(var(--text-swap-blur));
         opacity: 0;
         transition: none;
+      }
+
+      .t-icon-swap {
+        position: relative;
+        display: inline-grid;
+      }
+      .t-icon-swap .t-icon {
+        grid-area: 1 / 1;
+        transition:
+          opacity   var(--icon-swap-dur) var(--icon-swap-ease),
+          filter    var(--icon-swap-dur) var(--icon-swap-ease),
+          transform var(--icon-swap-dur) var(--icon-swap-ease);
+        will-change: opacity, filter, transform;
+      }
+      .t-icon-swap[data-state="a"] .t-icon[data-icon="a"],
+      .t-icon-swap[data-state="b"] .t-icon[data-icon="b"] {
+        opacity: 1;
+        filter: blur(0);
+        transform: scale(1);
+      }
+      .t-icon-swap[data-state="a"] .t-icon[data-icon="b"],
+      .t-icon-swap[data-state="b"] .t-icon[data-icon="a"] {
+        opacity: 0;
+        filter: blur(var(--icon-swap-blur));
+        transform: scale(var(--icon-swap-start-scale));
       }
 
       .vcs-body {
@@ -2691,9 +2824,9 @@
         align-items: center;
         justify-content: center;
         gap: 7px;
-        justify-self: end;
-        width: auto;
-        min-width: 126px;
+        justify-self: stretch;
+        width: 100%;
+        min-width: 0;
         height: 34px;
         padding: 0 14px;
         color: #fffaf1;
@@ -2817,6 +2950,9 @@
       .vcs-details[open] summary::after { transform: rotate(90deg); }
       .vcs-details summary:hover { color: var(--sumi); }
       .vcs-details summary:hover::after { color: var(--sumi); }
+      .vcs-details[open] > :not(summary) {
+        animation: vcs-details-reveal 260ms var(--panel-ease) both;
+      }
 
       .vcs-transcript-box {
         display: block;
@@ -2937,6 +3073,28 @@
         letter-spacing: 0;
         color: var(--sumi);
       }
+      .vcs-summary-details summary {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto 18px;
+        align-items: center;
+        gap: 8px;
+        min-height: 28px;
+        padding: 0;
+        justify-content: initial;
+      }
+      .vcs-summary-details summary::after {
+        grid-column: 3;
+        grid-row: 1;
+      }
+      .vcs-summary-details .vcs-result-title {
+        min-width: 0;
+        line-height: 1.3;
+      }
+      .vcs-summary-details #vcs-copy-summary {
+        grid-column: 2;
+        grid-row: 1;
+        justify-self: end;
+      }
 
       .vcs-summary-shell {
         width: 100%;
@@ -3004,13 +3162,18 @@
       }
       .vcs-stream-cursor {
         display: inline-block;
-        width: 2px;
-        height: 1.2em;
-        margin-left: 2px;
-        background: var(--sumi);
+        width: 0.42em;
+        min-width: 5px;
+        height: 0.78em;
+        margin-left: 3px;
+        background: color-mix(in srgb, var(--sumi) 92%, var(--paper));
         border-radius: 1px;
-        vertical-align: -0.18em;
-        animation: vcs-caret-blink 900ms steps(1, end) infinite;
+        vertical-align: -0.12em;
+        box-shadow:
+          inset 0 -2px 0 color-mix(in srgb, var(--paper) 18%, transparent),
+          0 0 0 1px color-mix(in srgb, var(--sumi) 18%, transparent);
+        transform-origin: center bottom;
+        animation: vcs-caret-blink 1050ms steps(1, end) infinite;
       }
       .vcs-collapsed-toggle {
         display: none;
@@ -3149,9 +3312,22 @@
         100% { opacity: 1; transform: translateX(0); }
       }
 
+      @keyframes vcs-details-reveal {
+        0% {
+          opacity: 0;
+          transform: translateY(8px);
+          filter: blur(2px);
+        }
+        100% {
+          opacity: 1;
+          transform: translateY(0);
+          filter: blur(0);
+        }
+      }
+
       @keyframes vcs-caret-blink {
-        0%, 49% { opacity: 1; }
-        50%, 100% { opacity: 0; }
+        0%, 46% { opacity: 1; transform: translateY(0) scaleY(0.92); }
+        47%, 100% { opacity: 0.24; transform: translateY(0) scaleY(0.92); }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -3159,11 +3335,12 @@
         .vcs-icon-button.is-spinning svg { animation: none; }
         .vcs-tool-button.is-busy svg { animation: none; }
         .vcs-stream-cursor { animation: none; }
-        .vcs-panel, .vcs-collapsed-toggle { animation: none; }
+        .vcs-panel, .vcs-collapsed-toggle, .vcs-details[open] > :not(summary) { animation: none; }
         .vcs-primary, .vcs-icon-button, .vcs-tool-button, .vcs-collapsed-toggle { transition: none; }
         .t-resize { transition: none !important; }
         .t-panel-slide { transition: none !important; }
         .t-text-swap { transition: none !important; }
+        .t-icon-swap .t-icon { transition: none !important; }
       }
 
       @media (max-width: 1100px) {

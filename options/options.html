@@ -148,7 +148,7 @@
           <div class="button-row">
             <button id="saveProfile" class="button button--primary" type="button">保存当前 API 配置</button>
             <button id="testProfile" class="button button--ghost" type="button">测试连接</button>
-            <span id="apiStatus" class="status" role="status"></span>
+            <span id="apiStatus" class="status t-text-swap" role="status"></span>
           </div>
         </section>
 
@@ -238,7 +238,7 @@
           </label>
 
           <div class="history-head">
-            <span id="historyCount">0 / 30</span>
+            <span id="historyCount" class="t-digit-group is-animating">0 / 30</span>
           </div>
           <div id="historyList" class="history-list" aria-live="polite"></div>
         </section>
@@ -261,6 +261,11 @@
           </div>
 
           <label class="field">
+            <span>模型请求超时（秒）</span>
+            <input id="requestTimeoutSeconds" type="number" min="30" max="600" step="30">
+          </label>
+
+          <label class="field">
             <span>导入配置 JSON</span>
             <textarea id="importText" rows="5" placeholder="把导出的配置 JSON 粘贴到这里"></textarea>
           </label>
@@ -271,7 +276,7 @@
           <div class="button-row">
             <button id="importSettings" class="button button--ghost" type="button">导入配置</button>
             <button id="resetSettings" class="button button--danger" type="button">恢复默认</button>
-            <span id="saveStatus" class="status" role="status"></span>
+            <span id="saveStatus" class="status t-text-swap" role="status"></span>
           </div>
         </section>
       </div>

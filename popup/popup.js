@@ -1,6 +1,7 @@
 const statusEl = document.querySelector("#status");
 const platformEl = document.querySelector("#platform");
 const tracksEl = document.querySelector("#tracks");
+let statusSwapTimer = null;
 let popupSettings = {
   theme: "auto",
   uiLanguage: "zh-CN",
@@ -126,5 +127,35 @@ async function sendToTab(tabId, message) {
 }
 
 function setStatus(message) {
-  statusEl.textContent = message;
+  swapStatusText(statusEl, message);
+}
+
+function swapStatusText(element, nextText) {
+  if (!element) {
+    return;
+  }
+
+  clearTimeout(statusSwapTimer);
+  element.classList.remove("is-exit", "is-enter-start");
+  if (element.textContent === nextText) {
+    return;
+  }
+
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    element.textContent = nextText;
+    return;
+  }
+
+  const duration = parseFloat(getComputedStyle(element).getPropertyValue("--text-swap-dur")) || 200;
+  element.classList.add("is-exit");
+  statusSwapTimer = setTimeout(() => {
+    if (!element.isConnected) {
+      return;
+    }
+    element.textContent = nextText;
+    element.classList.remove("is-exit");
+    element.classList.add("is-enter-start");
+    void element.offsetHeight;
+    element.classList.remove("is-enter-start");
+  }, duration);
 }

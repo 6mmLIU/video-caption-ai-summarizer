@@ -4,7 +4,7 @@ const HISTORY_LIMIT = 30;
 const I18N = globalThis.VCS_I18N;
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 4,
+  settingsVersion: 5,
   theme: "auto",
   uiLanguage: "zh-CN",
   language: "中文（简体）",
@@ -40,6 +40,7 @@ const DEFAULT_SETTINGS = {
   ].join("\n"),
   chunkSize: 12000,
   chunkOverlap: 600,
+  requestTimeoutSeconds: 60,
   includeTimestamps: true,
   includeTitleAndUrl: true,
   redactTerms: "",
@@ -66,6 +67,7 @@ const fields = {
   redactTerms: document.querySelector("#redactTerms"),
   chunkSize: document.querySelector("#chunkSize"),
   chunkOverlap: document.querySelector("#chunkOverlap"),
+  requestTimeoutSeconds: document.querySelector("#requestTimeoutSeconds"),
   importText: document.querySelector("#importText"),
   importFile: document.querySelector("#importFile"),
   historyList: document.querySelector("#historyList"),
@@ -132,6 +134,7 @@ function bindEvents() {
   });
 
   fields.historyList.addEventListener("click", copyHistoryFromList);
+  initSectionNav();
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") {
@@ -170,6 +173,7 @@ function hydrateForm() {
   fields.redactTerms.value = settings.redactTerms || "";
   fields.chunkSize.value = settings.chunkSize || 12000;
   fields.chunkOverlap.value = settings.chunkOverlap || 600;
+  fields.requestTimeoutSeconds.value = settings.requestTimeoutSeconds || DEFAULT_SETTINGS.requestTimeoutSeconds;
   applyTheme();
   applyTranslations();
   renderProfileFields();
@@ -221,6 +225,7 @@ async function saveAll(message = t("options.status.settingsSaved")) {
   settings.redactTerms = fields.redactTerms.value;
   settings.chunkSize = Number(fields.chunkSize.value || 12000);
   settings.chunkOverlap = Number(fields.chunkOverlap.value || 600);
+  settings.requestTimeoutSeconds = Number(fields.requestTimeoutSeconds.value || DEFAULT_SETTINGS.requestTimeoutSeconds);
   saveCurrentProfileValuesOnly();
   settings = normalizeSettings(settings);
 
@@ -419,7 +424,8 @@ async function testProfile() {
 
   const response = await chrome.runtime.sendMessage({
     type: "VCS_TEST_API",
-    profile: getActiveProfile()
+    profile: getActiveProfile(),
+    stream: true
   });
 
   if (response?.ok) {
@@ -478,7 +484,7 @@ async function importSettingsFile() {
 async function renderHistory() {
   const result = await chrome.storage.local.get(HISTORY_KEY);
   const history = normalizeHistory(result[HISTORY_KEY]);
-  fields.historyCount.textContent = `${history.length} / ${HISTORY_LIMIT}`;
+  setDigits(fields.historyCount, `${history.length} / ${HISTORY_LIMIT}`);
 
   if (!history.length) {
     fields.historyList.innerHTML = `<div class="history-empty">${escapeHtml(t("options.history.empty"))}</div>`;
@@ -578,6 +584,12 @@ function normalizeSettings(input) {
   normalized.redactTerms = String(normalized.redactTerms || "");
   normalized.chunkSize = clampNumber(normalized.chunkSize, 12000, 2000, 50000);
   normalized.chunkOverlap = clampNumber(normalized.chunkOverlap, 600, 0, 5000);
+  normalized.requestTimeoutSeconds = clampNumber(
+    normalized.requestTimeoutSeconds,
+    DEFAULT_SETTINGS.requestTimeoutSeconds,
+    30,
+    600
+  );
 
   if (!Array.isArray(normalized.profiles) || !normalized.profiles.length) {
     normalized.profiles = structuredClone(DEFAULT_SETTINGS.profiles);
@@ -693,6 +705,7 @@ function applyTranslations() {
   setText("#advanced .section__head p", locale.t("options.advanced.description"));
   setFieldLabel(fields.chunkSize, locale.t("options.advanced.chunkSize"));
   setFieldLabel(fields.chunkOverlap, locale.t("options.advanced.chunkOverlap"));
+  setFieldLabel(fields.requestTimeoutSeconds, locale.t("options.advanced.requestTimeoutSeconds"));
   setFieldLabel(fields.importText, locale.t("options.advanced.importJson"));
   fields.importText.placeholder = locale.t("options.advanced.importJsonPlaceholder");
   setFieldLabel(fields.importFile, locale.t("options.advanced.importFile"));
@@ -808,16 +821,116 @@ function setTemplateText(name, title, body) {
 }
 
 function setStatus(element, message, tone) {
-  element.textContent = message;
+  const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  element.dataset.statusToken = token;
   element.dataset.tone = tone || "";
+  swapText(element, message);
   if (message) {
     window.setTimeout(() => {
-      if (element.textContent === message) {
-        element.textContent = "";
+      if (element.dataset.statusToken === token) {
+        element.dataset.statusToken = "";
         element.dataset.tone = "";
+        swapText(element, "");
       }
     }, 5000);
   }
+}
+
+function swapText(element, nextText) {
+  if (!element) {
+    return;
+  }
+
+  element.classList.remove("is-exit", "is-enter-start");
+  if (element.textContent === nextText) {
+    return;
+  }
+
+  element.textContent = nextText;
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    return;
+  }
+
+  element.classList.add("is-enter-start");
+  void element.offsetHeight;
+  element.classList.remove("is-enter-start");
+}
+
+function setDigits(group, value) {
+  const text = String(value);
+  if (!group || (group.textContent === text && group.children.length)) {
+    return;
+  }
+
+  group.setAttribute("aria-label", text);
+  group.classList.remove("is-animating");
+  group.replaceChildren();
+
+  [...text].forEach((character, index, characters) => {
+    const digit = document.createElement("span");
+    digit.className = "t-digit";
+    digit.textContent = character;
+    if (index === characters.length - 2) {
+      digit.dataset.stagger = "1";
+    } else if (index === characters.length - 1) {
+      digit.dataset.stagger = "2";
+    }
+    group.appendChild(digit);
+  });
+
+  void group.offsetHeight;
+  group.classList.add("is-animating");
+}
+
+function initSectionNav() {
+  const links = [...document.querySelectorAll(".sidebar a[href^='#']")];
+  const sections = links
+    .map((link) => document.querySelector(link.getAttribute("href")))
+    .filter(Boolean);
+
+  if (!links.length || !sections.length) {
+    return;
+  }
+
+  const setCurrent = (id) => {
+    links.forEach((link) => {
+      const isCurrent = link.getAttribute("href") === `#${id}`;
+      if (isCurrent) {
+        link.setAttribute("aria-current", "true");
+      } else {
+        link.removeAttribute("aria-current");
+      }
+    });
+  };
+
+  setCurrent(location.hash.slice(1) || sections[0].id);
+
+  if (!("IntersectionObserver" in window)) {
+    window.addEventListener("scroll", () => {
+      let current = sections[0];
+      for (const section of sections) {
+        if (section.getBoundingClientRect().top <= 140) {
+          current = section;
+        }
+      }
+      setCurrent(current.id);
+    }, { passive: true });
+    return;
+  }
+
+  const observer = new IntersectionObserver((entries) => {
+    const visible = entries
+      .filter((entry) => entry.isIntersecting)
+      .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+    if (visible?.target?.id) {
+      setCurrent(visible.target.id);
+    }
+  }, {
+    rootMargin: "-18% 0px -62% 0px",
+    threshold: [0, 0.1, 0.35, 0.7]
+  });
+
+  sections.forEach((section) => observer.observe(section));
 }
 
 function deepMerge(base, extra) {

@@ -1,7 +1,7 @@
 import "./i18n.js";
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 4,
+  settingsVersion: 5,
   theme: "auto",
   uiLanguage: "zh-CN",
   language: "中文（简体）",
@@ -42,12 +42,13 @@ const DEFAULT_SETTINGS = {
   ].join("\n"),
   chunkSize: 12000,
   chunkOverlap: 600,
+  requestTimeoutSeconds: 60,
   includeTimestamps: true,
   includeTitleAndUrl: true,
   redactTerms: "",
   saveHistory: true
 };
-const MODEL_REQUEST_TIMEOUT_MS = 60000;
+const DEFAULT_REQUEST_TIMEOUT_MS = DEFAULT_SETTINGS.requestTimeoutSeconds * 1000;
 const HISTORY_LIMIT = 30;
 
 function i18n(settings) {
@@ -88,7 +89,15 @@ async function handleMessage(message, sender) {
 
   if (message.type === "VCS_TEST_API") {
     const settings = await getSettings();
+    const locale = i18n(settings);
     const profile = message.profile || getActiveProfile(settings);
+    const testOptions = {
+      i18n: locale,
+      timeoutMs: getRequestTimeoutMs(settings)
+    };
+    if (message.stream) {
+      testOptions.onDelta = () => {};
+    }
     const text = await callModel(profile, [
       {
         role: "system",
@@ -98,7 +107,7 @@ async function handleMessage(message, sender) {
         role: "user",
         content: "Reply with exactly: OK"
       }
-    ], { i18n: i18n(settings) });
+    ], testOptions);
     return { text };
   }
 
@@ -165,10 +174,12 @@ async function summarizeTranscript(payload, sender, options = {}) {
     Number(settings.chunkSize) || DEFAULT_SETTINGS.chunkSize,
     Number(settings.chunkOverlap) || DEFAULT_SETTINGS.chunkOverlap
   );
+  const timeoutMs = getRequestTimeoutMs(settings);
+  const timeoutSeconds = Math.round(timeoutMs / 1000);
 
   if (chunks.length === 1) {
     await notifyProgress(sender, {
-      label: locale.t("background.progress.requestModel"),
+      label: locale.t("background.progress.requestModel", { seconds: timeoutSeconds }),
       current: 1,
       total: 1
     });
@@ -178,7 +189,7 @@ async function summarizeTranscript(payload, sender, options = {}) {
       url,
       transcript: chunks[0],
       chunkLabel: ""
-    }), { onDelta: streamDelta, i18n: locale });
+    }), { onDelta: streamDelta, i18n: locale, timeoutMs });
     streamNotifier?.flush();
     await maybeSaveHistory(settings, { title, platform, url, summary: text, model: profile.model, provider: profile.provider });
     return {
@@ -221,7 +232,7 @@ async function summarizeTranscript(payload, sender, options = {}) {
           ].join("\n")
         })
       }
-    ], { i18n: locale });
+    ], { i18n: locale, timeoutMs });
     chunkSummaries.push(`### ${locale.language === "en" ? "Chunk" : "分段"} ${index + 1}/${chunks.length}\n${chunkSummary}`);
   }
 
@@ -251,7 +262,7 @@ async function summarizeTranscript(payload, sender, options = {}) {
         outputTemplate: settings.outputTemplate
       })
     }
-  ], { onDelta: streamDelta, i18n: locale });
+  ], { onDelta: streamDelta, i18n: locale, timeoutMs });
   streamNotifier?.flush();
 
   await maybeSaveHistory(settings, { title, platform, url, summary: finalText, model: profile.model, provider: profile.provider });
@@ -354,7 +365,7 @@ async function callOpenAICompatible(profile, messages, options = {}) {
     method: "POST",
     headers,
     body: JSON.stringify(body)
-  }, profile, locale);
+  }, profile, locale, { timeoutMs: options.timeoutMs });
 
   if (wantsStream) {
     return readOpenAICompatibleStream(response, profile, options.onDelta, locale);
@@ -396,7 +407,7 @@ async function callAnthropic(profile, messages, options = {}) {
       system: systemMessage,
       messages: userMessages.length ? userMessages : [{ role: "user", content: "OK" }]
     })
-  }, profile, locale);
+  }, profile, locale, { timeoutMs: options.timeoutMs });
 
   if (wantsStream) {
     return readAnthropicStream(response, profile, options.onDelta, locale);
@@ -446,7 +457,7 @@ async function callGemini(profile, messages, options = {}) {
         maxOutputTokens: toNumber(profile.maxTokens, 4096)
       }
     })
-  }, profile, locale);
+  }, profile, locale, { timeoutMs: options.timeoutMs });
 
   if (wantsStream) {
     return readGeminiStream(response, profile, options.onDelta, locale);
@@ -630,9 +641,9 @@ function parseStreamJson(data, profile, endpoint, locale = i18n(DEFAULT_SETTINGS
   }
 }
 
-async function fetchModel(url, options, profile, locale = i18n(DEFAULT_SETTINGS)) {
+async function fetchModel(url, options, profile, locale = i18n(DEFAULT_SETTINGS), requestOptions = {}) {
   const controller = new AbortController();
-  const timeoutMs = MODEL_REQUEST_TIMEOUT_MS;
+  const timeoutMs = normalizeTimeoutMs(requestOptions.timeoutMs);
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -688,6 +699,14 @@ function shouldDisableKimiThinking(profile) {
   const model = String(profile?.model || "").toLowerCase();
   const endpoint = String(profile?.endpoint || "").toLowerCase();
   return endpoint.includes("moonshot") && (model === "kimi-k2.6" || model === "kimi-k2.5");
+}
+
+function getRequestTimeoutMs(settings) {
+  return normalizeTimeoutMs(Number(settings?.requestTimeoutSeconds) * 1000);
+}
+
+function normalizeTimeoutMs(value) {
+  return clampNumber(value, DEFAULT_REQUEST_TIMEOUT_MS, 30000, 600000);
 }
 
 function getApiTargetLabel(profile, endpoint) {
@@ -792,7 +811,7 @@ function createSummaryStreamNotifier(sender, streamId) {
     push(delta) {
       buffer += String(delta || "");
       if (!timer) {
-        timer = setTimeout(flush, 45);
+        timer = setTimeout(flush, 16);
       }
     },
     flush
@@ -847,6 +866,12 @@ function normalizeSettings(input) {
   normalized.redactTerms = String(normalized.redactTerms || "");
   normalized.chunkSize = clampNumber(normalized.chunkSize, DEFAULT_SETTINGS.chunkSize, 2000, 50000);
   normalized.chunkOverlap = clampNumber(normalized.chunkOverlap, DEFAULT_SETTINGS.chunkOverlap, 0, 5000);
+  normalized.requestTimeoutSeconds = clampNumber(
+    normalized.requestTimeoutSeconds,
+    DEFAULT_SETTINGS.requestTimeoutSeconds,
+    30,
+    600
+  );
 
   if (!Array.isArray(normalized.profiles) || !normalized.profiles.length) {
     normalized.profiles = structuredClone(DEFAULT_SETTINGS.profiles);

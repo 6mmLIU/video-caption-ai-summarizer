@@ -22,6 +22,10 @@ const chromeCandidates = [
 const chromePath = await firstExisting(chromeCandidates);
 const debugPort = Number(process.env.VCS_DEBUG_PORT || 9227);
 const modelRequests = [];
+const streamStats = {
+  chunksWritten: 0,
+  completions: 0
+};
 
 class Cdp {
   static async connect(url) {
@@ -122,8 +126,10 @@ const server = createServer(async (request, response) => {
         response.flushHeaders?.();
         for (const chunk of chunkText(summaryText, 9)) {
           response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: chunk } }] })}\n\n`);
+          streamStats.chunksWritten += 1;
           await delay(35);
         }
+        streamStats.completions += 1;
         response.end("data: [DONE]\n\n");
         return;
       }
@@ -326,7 +332,8 @@ try {
       settingsProfileCount: result.vcsSettings?.profiles?.length || 0,
       profileName: document.querySelector("#profileName")?.value || "",
       model: document.querySelector("#model")?.value || "",
-      temperature: document.querySelector("#temperature")?.value || ""
+      temperature: document.querySelector("#temperature")?.value || "",
+      requestTimeoutSeconds: document.querySelector("#requestTimeoutSeconds")?.value || ""
     }));
   `);
   if (optionsState.language !== "中文（简体）") {
@@ -345,8 +352,14 @@ try {
   if (optionsState.activeProfileExists) {
     throw new Error(`API profile selector should be removed: ${JSON.stringify(optionsState)}`);
   }
-  if (!optionsState.settingsProfileCount || !optionsState.profileName || optionsState.model || optionsState.temperature !== "1") {
-    throw new Error(`API defaults should expose an editable name, blank model, and temperature 1: ${JSON.stringify(optionsState)}`);
+  if (
+    !optionsState.settingsProfileCount ||
+    !optionsState.profileName ||
+    optionsState.model ||
+    optionsState.temperature !== "1" ||
+    optionsState.requestTimeoutSeconds !== "60"
+  ) {
+    throw new Error(`API defaults should expose an editable name, blank model, temperature 1, and timeout 60: ${JSON.stringify(optionsState)}`);
   }
 
   await evaluate(optionsPage, `
@@ -405,6 +418,22 @@ try {
   ) {
     throw new Error(`Preset buttons should only update provider and endpoint: ${JSON.stringify(presetState)}`);
   }
+
+  modelRequests.length = 0;
+  await evaluate(optionsPage, `
+    document.querySelector("#endpoint").value = ${JSON.stringify(`${baseUrl}/mock-chat`)};
+    document.querySelector("#apiKey").value = "test-key";
+    document.querySelector("#model").value = "mock-model";
+    document.querySelector("#testProfile").click();
+    return true;
+  `);
+  await waitForExpression(optionsPage, `
+    document.querySelector("#apiStatus")?.textContent.includes("流式连接成功")
+  `, 5000);
+  if (modelRequests.length !== 1 || modelRequests[0].body?.stream !== true) {
+    throw new Error(`API test should verify the streaming request path: ${JSON.stringify(modelRequests)}`);
+  }
+  modelRequests.length = 0;
 
   await evaluate(optionsPage, `
     document.querySelector("input[name='theme'][value='dark']").click();
@@ -538,6 +567,47 @@ async function waitForExtensionId(cdp) {
 
 async function waitForPageReady(cdp) {
   await waitForExpression(cdp, `document.readyState === "complete" || document.readyState === "interactive"`, 10000);
+}
+
+async function waitForLiveStreamPaint(cdp, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const state = await evaluate(cdp, `
+      const shadow = document.querySelector("#vcs-root")?.shadowRoot;
+      const text = shadow?.querySelector("#vcs-summary")?.textContent || "";
+      const summary = shadow?.querySelector("#vcs-summary");
+      const shell = shadow?.querySelector(".vcs-summary-shell");
+      const cursor = shadow?.querySelector(".vcs-stream-cursor");
+      const shellRect = shell?.getBoundingClientRect();
+      const cursorRect = cursor?.getBoundingClientRect();
+      const status = shadow?.querySelector("#vcs-status")?.textContent || "";
+      return cursor && text.length > 0 && !text.includes("支持有序列表")
+        ? {
+            hasCursor: true,
+            partialLength: text.length,
+            text,
+            status,
+            cursorInsideSummary: summary?.contains(cursor) || false,
+            cursorParentTag: cursor.parentElement?.tagName || "",
+            cursorVisibleInShell: Boolean(
+              shellRect &&
+              cursorRect &&
+              cursorRect.top >= shellRect.top - 1 &&
+              cursorRect.bottom <= shellRect.bottom + 1
+            )
+          }
+        : null;
+    `);
+    if (state && streamStats.completions === 0) {
+      return {
+        ...state,
+        streamChunksWritten: streamStats.chunksWritten,
+        streamCompletions: streamStats.completions
+      };
+    }
+    await delay(50);
+  }
+  throw new Error(`Timed out waiting for live stream paint before stream completion: ${JSON.stringify(streamStats)}`);
 }
 
 async function waitForExpression(cdp, expression, timeoutMs) {
@@ -674,24 +744,17 @@ async function assertPromptTemplateReachesModel({
   await waitForExpression(videoPage, `
     !document.querySelector("#vcs-root")?.shadowRoot?.querySelector("#vcs-refresh")?.classList.contains("is-spinning")
   `, waitTimeout);
+  streamStats.chunksWritten = 0;
+  streamStats.completions = 0;
   await evaluate(videoPage, `
     document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-summarize").click();
     return true;
   `, { userGesture: true });
 
-  const streamingUiState = await waitForExpression(videoPage, `
-    (() => {
-      const shadow = document.querySelector("#vcs-root")?.shadowRoot;
-      const text = shadow?.querySelector("#vcs-summary")?.textContent || "";
-      return shadow?.querySelector(".vcs-stream-cursor") && text.length > 0 && !text.includes("支持有序列表")
-        ? {
-            hasCursor: true,
-            partialLength: text.length,
-            text
-          }
-        : null;
-    })()
-  `, 5000);
+  const streamingUiState = await waitForLiveStreamPaint(videoPage, 5000);
+  if (!streamingUiState.cursorInsideSummary || !streamingUiState.cursorVisibleInShell) {
+    throw new Error(`Streaming cursor should stay attached to the generated text and visible: ${JSON.stringify(streamingUiState)}`);
+  }
 
   await waitForExpression(videoPage, `
     (() => {
@@ -733,12 +796,18 @@ async function assertPromptTemplateReachesModel({
 
   const summaryLayoutState = await evaluate(videoPage, `
     const shadow = document.querySelector("#vcs-root")?.shadowRoot;
+    const panel = shadow?.querySelector(".vcs-panel");
     const summarizeButton = shadow?.querySelector("#vcs-summarize");
     const result = shadow?.querySelector(".vcs-result");
     const trackRow = shadow?.querySelector(".vcs-track-row");
     const shell = shadow?.querySelector(".vcs-summary-shell");
     const shellStyle = shell ? getComputedStyle(shell) : null;
     return {
+      panelTone: panel?.dataset.tone || "",
+      progressTone: shadow?.querySelector(".vcs-progress")?.dataset.tone || "",
+      summaryBusy: shell?.getAttribute("aria-busy") || "",
+      summaryStillStreaming: result?.classList.contains("is-streaming") || false,
+      summarizeLabel: summarizeButton?.textContent || "",
       resultAfterButton: summarizeButton?.nextElementSibling === result,
       resultBeforeTrack: result?.nextElementSibling === trackRow,
       strongText: shadow?.querySelector("#vcs-summary strong")?.textContent || "",
@@ -749,6 +818,11 @@ async function assertPromptTemplateReachesModel({
     };
   `);
   if (
+    summaryLayoutState.panelTone !== "done" ||
+    summaryLayoutState.progressTone !== "done" ||
+    summaryLayoutState.summaryBusy !== "false" ||
+    summaryLayoutState.summaryStillStreaming ||
+    !summaryLayoutState.summarizeLabel.includes("解析") ||
     !summaryLayoutState.resultAfterButton ||
     !summaryLayoutState.resultBeforeTrack ||
     !summaryLayoutState.strongText.includes("MOCK SUMMARY CUSTOM PROMPT OK") ||
@@ -760,6 +834,33 @@ async function assertPromptTemplateReachesModel({
     throw new Error(`Summary Markdown block should render below the parse button in a scrollable area: ${JSON.stringify(summaryLayoutState)}`);
   }
 
+  await evaluate(videoPage, `
+    document.querySelector("#vcs-root").shadowRoot.querySelector(".vcs-summary-details > summary").click();
+    return true;
+  `);
+  await waitForExpression(videoPage, `
+    !document.querySelector("#vcs-root")?.shadowRoot?.querySelector(".vcs-summary-details")?.open
+  `, 5000);
+  const summaryCollapseState = await evaluate(videoPage, `
+    const shadow = document.querySelector("#vcs-root")?.shadowRoot;
+    const details = shadow?.querySelector(".vcs-summary-details");
+    const copyButton = shadow?.querySelector("#vcs-copy-summary");
+    return {
+      closed: details?.open === false,
+      copyButtonVisible: Boolean(copyButton)
+    };
+  `);
+  if (!summaryCollapseState.closed || !summaryCollapseState.copyButtonVisible) {
+    throw new Error(`Summary block should collapse while keeping header tools visible: ${JSON.stringify(summaryCollapseState)}`);
+  }
+  await evaluate(videoPage, `
+    document.querySelector("#vcs-root").shadowRoot.querySelector(".vcs-summary-details > summary").click();
+    return true;
+  `);
+  await waitForExpression(videoPage, `
+    document.querySelector("#vcs-root")?.shadowRoot?.querySelector(".vcs-summary-details")?.open
+  `, 5000);
+
   await capture(videoPage, join(outputDir, "video-panel-summary.png"));
 
   return {
@@ -767,7 +868,8 @@ async function assertPromptTemplateReachesModel({
     customPromptInUserMessage: userMessage.includes("PROMPT_EFFECT_MARKER"),
     outputTemplateInUserMessage: userMessage.includes("OUTPUT_EFFECT_MARKER"),
     markdownSummaryRendered: summaryLayoutState.strongText.includes("MOCK SUMMARY CUSTOM PROMPT OK"),
-    streamingCursorShown: streamingUiState.hasCursor
+    streamingCursorShown: streamingUiState.hasCursor,
+    summaryCollapseWorks: summaryCollapseState.closed
   };
 }
 
@@ -810,6 +912,7 @@ function mockSettings({ endpoint, promptTemplate, outputTemplate }) {
     outputTemplate,
     chunkSize: 12000,
     chunkOverlap: 600,
+    requestTimeoutSeconds: 60,
     includeTimestamps: true,
     includeTitleAndUrl: true,
     redactTerms: "",
