@@ -57,7 +57,17 @@
   let summaryScrollFrame = null;
   let summaryTargetText = "";
 
-  init();
+  if (globalThis.__VCS_TEST_MODE__) {
+    globalThis.__VCS_TEST_HOOKS__ = {
+      parseYouTubeTranscriptSegment,
+      normalizeTranscriptPanelText,
+      cleanTranscriptSegmentContent,
+      transcriptMatchesTrackLanguage,
+      detectTranscriptLanguageFamily
+    };
+  } else {
+    init();
+  }
 
   function i18n() {
     return globalThis.VCS_I18N.create(state.settings);
@@ -965,7 +975,7 @@
     }
 
     const transcriptPanelText = await loadYouTubeTranscriptPanelText();
-    if (transcriptPanelText && transcriptMatchesTrackLanguage(track, transcriptPanelText)) {
+    if (transcriptPanelText) {
       return transcriptPanelText;
     }
 
@@ -1146,6 +1156,9 @@
   function transcriptMatchesTrackLanguage(track, transcript) {
     const expected = getTrackLanguageFamily(track);
     const actual = detectTranscriptLanguageFamily(transcript);
+    if (actual === "mixed") {
+      return true;
+    }
     return !expected || !actual || expected === actual;
   }
 
@@ -1166,6 +1179,11 @@
       .join(" ");
     const cjkCount = (sample.match(/[\u3400-\u9fff]/g) || []).length;
     const latinWordCount = (sample.match(/[a-z][a-z']+/gi) || []).length;
+    const latinCharCount = (sample.match(/[a-z]/gi) || []).length;
+
+    if (cjkCount >= 8 && latinWordCount >= 8 && latinCharCount >= cjkCount * 0.35) {
+      return "mixed";
+    }
 
     if (cjkCount >= 8 && cjkCount >= latinWordCount) {
       return "zh";
@@ -1433,7 +1451,6 @@
     const segments = [...document.querySelectorAll([
       "ytd-transcript-segment-renderer",
       "ytd-transcript-segment-list-renderer [role='button']",
-      "ytd-transcript-segment-list-renderer yt-formatted-string",
       "[target-id*='transcript' i] [role='button']"
     ].join(","))]
       .map(parseYouTubeTranscriptSegment)
@@ -1466,6 +1483,12 @@
   }
 
   function parseYouTubeTranscriptSegment(segment) {
+    const structuredTime = getYouTubeTranscriptSegmentTime(segment);
+    const structuredContent = getYouTubeTranscriptSegmentContent(segment, structuredTime);
+    if (structuredContent) {
+      return formatTranscriptCue(structuredTime, structuredContent);
+    }
+
     const lines = getTranscriptTextLines(segment.innerText || segment.textContent || "");
 
     if (!lines.length) {
@@ -1474,23 +1497,55 @@
 
     const inline = lines.map(parseTimeContentLine).find((item) => item);
     if (inline) {
-      return `[${inline.time}] ${inline.content}`;
+      return formatTranscriptCue(inline.time, inline.content);
     }
 
     const timeIndex = lines.findIndex((line) => isTimeLabel(line));
     const time = timeIndex >= 0 ? lines[timeIndex] : "";
     const content = lines
       .filter((_line, index) => index !== timeIndex)
-      .filter((line) => !/^(转写文稿|搜索转写内容|Transcript|Search transcript)$/i.test(line))
+      .filter((line) => !isTranscriptPanelChromeLine(line))
       .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
+      .replace(/\s+/g, " ");
 
-    if (!content) {
-      return "";
+    return formatTranscriptCue(time, content);
+  }
+
+  function getYouTubeTranscriptSegmentTime(segment) {
+    const selectors = [
+      ".segment-timestamp",
+      "#timestamp",
+      "[class*='timestamp' i]",
+      "[id*='timestamp' i]"
+    ];
+    for (const selector of selectors) {
+      const value = segment.querySelector?.(selector)?.textContent || "";
+      const time = getTranscriptTextLines(value).find(isTimeLabel);
+      if (time) {
+        return time;
+      }
     }
+    return getTranscriptTextLines(segment.getAttribute?.("aria-label") || "").find(isTimeLabel) || "";
+  }
 
-    return time ? `[${time}] ${content}` : content;
+  function getYouTubeTranscriptSegmentContent(segment, time = "") {
+    const selectors = [
+      "#segment-text",
+      "yt-formatted-string#segment-text",
+      "[class*='segment-text' i]",
+      "[id*='segment-text' i]"
+    ];
+    for (const selector of selectors) {
+      const element = segment.querySelector?.(selector);
+      if (!element) {
+        continue;
+      }
+      const content = cleanTranscriptSegmentContent(element.innerText || element.textContent || "", time);
+      if (content) {
+        return content;
+      }
+    }
+    return "";
   }
 
   function normalizeTranscriptPanelText(text) {
@@ -1500,7 +1555,10 @@
     for (let index = 0; index < lines.length; index += 1) {
       const inline = parseTimeContentLine(lines[index]);
       if (inline) {
-        output.push(`[${inline.time}] ${inline.content}`);
+        const cue = formatTranscriptCue(inline.time, inline.content);
+        if (cue) {
+          output.push(cue);
+        }
         continue;
       }
 
@@ -1513,16 +1571,42 @@
         contentParts.push(lines[next]);
       }
       const content = contentParts
-        .filter((line) => !/^(转写文稿|搜索转写内容|Transcript|Search transcript)$/i.test(line))
+        .filter((line) => !isTranscriptPanelChromeLine(line))
         .join(" ")
-        .replace(/\s+/g, " ")
-        .trim();
-      if (content) {
-        output.push(`[${time}] ${content}`);
+        .replace(/\s+/g, " ");
+      const cue = formatTranscriptCue(time, content);
+      if (cue) {
+        output.push(cue);
       }
     }
 
     return uniqueValues(output).join("\n");
+  }
+
+  function formatTranscriptCue(time, content) {
+    const clean = cleanTranscriptSegmentContent(content, time);
+    if (!clean) {
+      return "";
+    }
+    return time ? `[${time}] ${clean}` : clean;
+  }
+
+  function cleanTranscriptSegmentContent(content, time = "") {
+    const value = String(content || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!value || isTranscriptPanelChromeLine(value)) {
+      return "";
+    }
+    return stripLeadingSpokenTimestamp(value, time)
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function isTranscriptPanelChromeLine(value) {
+    return /^(转写文稿|搜索转写内容|Transcript|Search transcript|正在播放|当前正在播放|currently playing)$/i
+      .test(String(value || "").trim());
   }
 
   function isTimeLabel(value) {
@@ -1541,6 +1625,35 @@
       .replace(/\s+/g, " ")
       .trim();
     return content ? { time: match[1], content } : null;
+  }
+
+  function stripLeadingSpokenTimestamp(value, time = "") {
+    const prefix = parseSpokenTimestampPrefix(value);
+    if (!prefix || !time) {
+      return value;
+    }
+
+    const cueSeconds = time ? Math.floor(parseTimestamp(time)) : Number.NaN;
+    if (Number.isFinite(cueSeconds) && Math.abs(prefix.seconds - cueSeconds) > 1) {
+      return value;
+    }
+
+    return value.slice(prefix.length).trim();
+  }
+
+  function parseSpokenTimestampPrefix(value) {
+    const match = String(value || "").match(
+      /^((?:(\d+)\s*(?:小时|小時|hours?\b|hrs?\b|h\b)\s*)?(?:(\d+)\s*(?:分钟|分鐘|分|minutes?\b|mins?\b|m\b)\s*)?(\d+)\s*(?:秒钟|秒鐘|秒|seconds?\b|secs?\b|sec\.?\b|s\b)[\s:：，,.\-]*)/i
+    );
+    if (!match) {
+      return null;
+    }
+    return {
+      length: match[1].length,
+      seconds: (Number(match[2]) || 0) * 3600
+        + (Number(match[3]) || 0) * 60
+        + (Number(match[4]) || 0)
+    };
   }
 
   function getTranscriptTextLines(text) {
