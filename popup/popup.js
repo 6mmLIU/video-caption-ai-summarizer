@@ -1,10 +1,24 @@
 const statusEl = document.querySelector("#status");
 const platformEl = document.querySelector("#platform");
 const tracksEl = document.querySelector("#tracks");
-const DEFAULT_SETTINGS = {
+let popupSettings = {
   theme: "auto",
+  uiLanguage: "zh-CN",
   language: "中文（简体）"
 };
+const DEFAULT_SETTINGS = {
+  theme: "auto",
+  uiLanguage: "zh-CN",
+  language: "中文（简体）"
+};
+
+function i18n() {
+  return globalThis.VCS_I18N.create(popupSettings);
+}
+
+function t(key, variables) {
+  return i18n().t(key, variables);
+}
 
 document.querySelector("#openOptions").addEventListener("click", () => {
   chrome.runtime.openOptionsPage();
@@ -13,15 +27,15 @@ document.querySelector("#openOptions").addEventListener("click", () => {
 document.querySelector("#togglePanel").addEventListener("click", async () => {
   const tab = await getActiveTab();
   const response = await sendToTab(tab.id, { type: "VCS_TOGGLE_PANEL" });
-  setStatus(response?.ok ? "已切换面板状态" : response?.error || "当前页面不可用");
+  setStatus(response?.ok ? t("popup.status.panelToggled") : response?.error || t("popup.status.currentPageUnavailable"));
 });
 
 document.querySelector("#summarize").addEventListener("click", async () => {
   const tab = await getActiveTab();
-  setStatus("已发送总结请求");
+  setStatus(t("popup.status.summarySent"));
   const response = await sendToTab(tab.id, { type: "VCS_SUMMARIZE_NOW" });
   if (!response?.ok) {
-    setStatus(response?.error || "请求失败，请打开视频页后重试");
+    setStatus(response?.error || t("popup.status.summaryFailed"));
   }
 });
 
@@ -33,31 +47,37 @@ async function init() {
   const response = await sendToTab(tab.id, { type: "VCS_GET_STATUS" });
 
   if (!response?.ok) {
-    setStatus("请打开支持的视频页面");
+    setStatus(t("popup.status.openVideo"));
     platformEl.textContent = "-";
     tracksEl.textContent = "-";
     return;
   }
 
   const payload = response.payload;
-  setStatus(payload.title || "已连接页面面板");
+  setStatus(payload.title || t("popup.status.connected"));
   platformEl.textContent = payload.platform || "-";
   tracksEl.textContent = String(payload.tracks ?? "-");
 }
 
 async function initTheme() {
   const result = await chrome.storage.local.get("vcsSettings");
-  applyTheme({
+  popupSettings = {
     ...DEFAULT_SETTINGS,
     ...(result.vcsSettings || {})
-  });
+  };
+  popupSettings.uiLanguage = globalThis.VCS_I18N.normalizeUiLanguage(popupSettings.uiLanguage);
+  applyTheme(popupSettings);
+  applyTranslations();
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === "local" && changes.vcsSettings) {
-      applyTheme({
+      popupSettings = {
         ...DEFAULT_SETTINGS,
         ...(changes.vcsSettings.newValue || {})
-      });
+      };
+      popupSettings.uiLanguage = globalThis.VCS_I18N.normalizeUiLanguage(popupSettings.uiLanguage);
+      applyTheme(popupSettings);
+      applyTranslations();
     }
   });
 
@@ -75,6 +95,21 @@ function applyTheme(settings) {
     : mode;
   document.documentElement.dataset.themeMode = mode;
   document.documentElement.dataset.theme = resolved;
+}
+
+function applyTranslations() {
+  const locale = i18n();
+  document.documentElement.lang = locale.language === "en" ? "en" : "zh-CN";
+  document.title = locale.t("popup.documentTitle");
+  document.querySelector("h1").textContent = locale.t("popup.heading");
+  document.querySelector(".info > div:nth-child(1) span").textContent = locale.t("popup.platform");
+  document.querySelector(".info > div:nth-child(3) span").textContent = locale.t("popup.tracks");
+  document.querySelector("#summarize").textContent = locale.t("popup.summarize");
+  document.querySelector("#togglePanel").textContent = locale.t("popup.togglePanel");
+  document.querySelector("#openOptions").textContent = locale.t("popup.settings");
+  if (statusEl.textContent === "正在读取当前页面" || statusEl.textContent === "Reading current page") {
+    setStatus(locale.t("popup.status.reading"));
+  }
 }
 
 async function getActiveTab() {

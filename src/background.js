@@ -1,6 +1,9 @@
+import "./i18n.js";
+
 const DEFAULT_SETTINGS = {
-  settingsVersion: 3,
+  settingsVersion: 4,
   theme: "auto",
+  uiLanguage: "zh-CN",
   language: "中文（简体）",
   panelEnabled: true,
   activeProfileId: "custom",
@@ -47,6 +50,10 @@ const DEFAULT_SETTINGS = {
 const MODEL_REQUEST_TIMEOUT_MS = 60000;
 const HISTORY_LIMIT = 30;
 
+function i18n(settings) {
+  return globalThis.VCS_I18N.create(settings);
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   const existing = await chrome.storage.local.get("vcsSettings");
   if (!existing.vcsSettings) {
@@ -88,7 +95,7 @@ async function handleMessage(message, sender) {
         role: "user",
         content: "Reply with exactly: OK"
       }
-    ]);
+    ], { i18n: i18n(settings) });
     return { text };
   }
 
@@ -101,8 +108,9 @@ async function handleMessage(message, sender) {
 }
 
 async function fetchText(url) {
+  const locale = i18n(await getSettings());
   if (!url || typeof url !== "string") {
-    throw new Error("Missing fetch URL.");
+    throw new Error(locale.t("background.error.fetchUrlMissing"));
   }
 
   const response = await fetch(url, {
@@ -114,7 +122,10 @@ async function fetchText(url) {
   });
 
   if (!response.ok) {
-    throw new Error(`Fetch failed: ${response.status} ${response.statusText}`);
+    throw new Error(locale.t("background.error.fetchFailed", {
+      status: response.status,
+      statusText: response.statusText
+    }));
   }
 
   return {
@@ -126,8 +137,9 @@ async function fetchText(url) {
 
 async function summarizeTranscript(payload, sender) {
   const settings = await getSettings();
+  const locale = i18n(settings);
   const profile = getActiveProfile(settings);
-  validateProfile(profile);
+  validateProfile(profile, locale);
 
   const title = payload?.title || "Untitled video";
   const platform = payload?.platform || "Unknown platform";
@@ -135,7 +147,7 @@ async function summarizeTranscript(payload, sender) {
   const transcript = sanitizeTranscript(payload?.transcript || "", settings);
 
   if (!transcript.trim()) {
-    throw new Error("No transcript text was found.");
+    throw new Error(locale.t("background.error.noTranscript"));
   }
 
   const chunks = chunkTranscript(
@@ -146,7 +158,7 @@ async function summarizeTranscript(payload, sender) {
 
   if (chunks.length === 1) {
     await notifyProgress(sender, {
-      label: "正在请求模型（最多 60 秒）",
+      label: locale.t("background.progress.requestModel"),
       current: 1,
       total: 1
     });
@@ -156,7 +168,7 @@ async function summarizeTranscript(payload, sender) {
       url,
       transcript: chunks[0],
       chunkLabel: ""
-    }));
+    }), { i18n: locale });
     await maybeSaveHistory(settings, { title, platform, url, summary: text, model: profile.model, provider: profile.provider });
     return {
       text,
@@ -169,7 +181,7 @@ async function summarizeTranscript(payload, sender) {
   const chunkSummaries = [];
   for (let index = 0; index < chunks.length; index += 1) {
     await notifyProgress(sender, {
-      label: `正在提炼第 ${index + 1}/${chunks.length} 段字幕`,
+      label: locale.t("background.progress.extractChunk", { current: index + 1, total: chunks.length }),
       current: index + 1,
       total: chunks.length + 1
     });
@@ -190,6 +202,7 @@ async function summarizeTranscript(payload, sender) {
           platform,
           url,
           language: settings.language,
+          uiLanguage: settings.uiLanguage,
           transcript: chunks[index],
           outputTemplate: [
             `这是第 ${index + 1}/${chunks.length} 段字幕。`,
@@ -197,12 +210,12 @@ async function summarizeTranscript(payload, sender) {
           ].join("\n")
         })
       }
-    ]);
-    chunkSummaries.push(`### 分段 ${index + 1}/${chunks.length}\n${chunkSummary}`);
+    ], { i18n: locale });
+    chunkSummaries.push(`### ${locale.language === "en" ? "Chunk" : "分段"} ${index + 1}/${chunks.length}\n${chunkSummary}`);
   }
 
   await notifyProgress(sender, {
-    label: "正在合并分段总结",
+    label: locale.t("background.progress.mergeChunks"),
     current: chunks.length + 1,
     total: chunks.length + 1
   });
@@ -222,11 +235,12 @@ async function summarizeTranscript(payload, sender) {
         platform,
         url,
         language: settings.language,
+        uiLanguage: settings.uiLanguage,
         transcript: chunkSummaries.join("\n\n"),
         outputTemplate: settings.outputTemplate
       })
     }
-  ]);
+  ], { i18n: locale });
 
   await maybeSaveHistory(settings, { title, platform, url, summary: finalText, model: profile.model, provider: profile.provider });
   return {
@@ -251,6 +265,7 @@ function buildSummaryMessages(settings, variables) {
       content: renderTemplate(settings.promptTemplate, {
         ...variables,
         language: settings.language,
+        uiLanguage: settings.uiLanguage,
         outputTemplate: settings.outputTemplate
       })
     }
@@ -267,38 +282,40 @@ function getActiveProfile(settings) {
   return profiles.find((profile) => profile.id === settings.activeProfileId) || profiles[0];
 }
 
-function validateProfile(profile) {
+function validateProfile(profile, locale = i18n(DEFAULT_SETTINGS)) {
   if (!profile) {
-    throw new Error("No API profile is configured.");
+    throw new Error(locale.t("background.error.noProfile"));
   }
   if (!profile.provider) {
-    throw new Error("The active API profile has no provider.");
+    throw new Error(locale.t("background.error.noProvider"));
   }
   if (!profile.apiKey && profile.provider !== "ollama") {
-    throw new Error("The active API profile has no API key.");
+    throw new Error(locale.t("background.error.noApiKey"));
   }
   if (!profile.model) {
-    throw new Error("The active API profile has no model.");
+    throw new Error(locale.t("background.error.noModel"));
   }
   if (!profile.endpoint && profile.provider !== "gemini") {
-    throw new Error("The active API profile has no endpoint.");
+    throw new Error(locale.t("background.error.noEndpoint"));
   }
 }
 
-async function callModel(profile, messages) {
+async function callModel(profile, messages, options = {}) {
   if (profile.provider === "openai-compatible" || profile.provider === "ollama") {
-    return callOpenAICompatible(profile, messages);
+    return callOpenAICompatible(profile, messages, options);
   }
   if (profile.provider === "anthropic") {
-    return callAnthropic(profile, messages);
+    return callAnthropic(profile, messages, options);
   }
   if (profile.provider === "gemini") {
-    return callGemini(profile, messages);
+    return callGemini(profile, messages, options);
   }
-  throw new Error(`Unsupported provider: ${profile.provider}`);
+  const locale = options.i18n || i18n(DEFAULT_SETTINGS);
+  throw new Error(locale.t("background.error.unsupportedProvider", { provider: profile.provider }));
 }
 
-async function callOpenAICompatible(profile, messages) {
+async function callOpenAICompatible(profile, messages, options = {}) {
+  const locale = options.i18n || i18n(DEFAULT_SETTINGS);
   const headers = {
     "Content-Type": "application/json"
   };
@@ -324,17 +341,18 @@ async function callOpenAICompatible(profile, messages) {
     method: "POST",
     headers,
     body: JSON.stringify(body)
-  }, profile);
+  }, profile, locale);
 
-  const data = await readJsonResponse(response, profile);
+  const data = await readJsonResponse(response, profile, locale);
   const content = data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text;
   if (!content) {
-    throw new Error("The OpenAI-compatible response did not contain text.");
+    throw new Error(locale.t("background.error.openaiNoText"));
   }
   return content.trim();
 }
 
-async function callAnthropic(profile, messages) {
+async function callAnthropic(profile, messages, options = {}) {
+  const locale = options.i18n || i18n(DEFAULT_SETTINGS);
   const systemMessage = messages.find((message) => message.role === "system")?.content || "";
   const userMessages = messages
     .filter((message) => message.role !== "system")
@@ -359,19 +377,20 @@ async function callAnthropic(profile, messages) {
       system: systemMessage,
       messages: userMessages.length ? userMessages : [{ role: "user", content: "OK" }]
     })
-  }, profile);
+  }, profile, locale);
 
-  const data = await readJsonResponse(response, profile);
+  const data = await readJsonResponse(response, profile, locale);
   const content = Array.isArray(data?.content)
     ? data.content.map((part) => part.text || "").join("")
     : "";
   if (!content) {
-    throw new Error("The Anthropic response did not contain text.");
+    throw new Error(locale.t("background.error.anthropicNoText"));
   }
   return content.trim();
 }
 
-async function callGemini(profile, messages) {
+async function callGemini(profile, messages, options = {}) {
+  const locale = options.i18n || i18n(DEFAULT_SETTINGS);
   const base = profile.endpoint || `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(profile.model)}:generateContent`;
   const url = new URL(base);
   if (profile.apiKey && !url.searchParams.has("key")) {
@@ -399,19 +418,19 @@ async function callGemini(profile, messages) {
         maxOutputTokens: toNumber(profile.maxTokens, 4096)
       }
     })
-  }, profile);
+  }, profile, locale);
 
-  const data = await readJsonResponse(response, profile);
+  const data = await readJsonResponse(response, profile, locale);
   const content = data?.candidates?.[0]?.content?.parts
     ?.map((part) => part.text || "")
     .join("");
   if (!content) {
-    throw new Error("The Gemini response did not contain text.");
+    throw new Error(locale.t("background.error.geminiNoText"));
   }
   return content.trim();
 }
 
-async function fetchModel(url, options, profile) {
+async function fetchModel(url, options, profile, locale = i18n(DEFAULT_SETTINGS)) {
   const controller = new AbortController();
   const timeoutMs = MODEL_REQUEST_TIMEOUT_MS;
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -424,10 +443,16 @@ async function fetchModel(url, options, profile) {
   } catch (error) {
     const target = getApiTargetLabel(profile, url);
     if (error?.name === "AbortError") {
-      throw new Error(`模型请求超时（${Math.round(timeoutMs / 1000)} 秒，${target}）。请检查接口地址、模型名/API Key，或换用更快的模型。`);
+      throw new Error(locale.t("background.error.timeout", {
+        seconds: Math.round(timeoutMs / 1000),
+        target
+      }));
     }
     if (error instanceof TypeError || error?.name === "TypeError") {
-      throw new Error(`模型网络请求失败（${target}）：${error.message || "Failed to fetch"}。通常是接口地址无法连接、证书/CORS 被拦截，或当前网络访问不了该服务。`);
+      throw new Error(locale.t("background.error.network", {
+        target,
+        message: error.message || "Failed to fetch"
+      }));
     }
     throw error;
   } finally {
@@ -435,18 +460,25 @@ async function fetchModel(url, options, profile) {
   }
 }
 
-async function readJsonResponse(response, profile) {
+async function readJsonResponse(response, profile, locale = i18n(DEFAULT_SETTINGS)) {
   const text = await response.text();
   let data = null;
   try {
     data = text ? JSON.parse(text) : null;
   } catch (error) {
-    throw new Error(`模型接口返回了非 JSON 内容（${getApiTargetLabel(profile, response.url)}）：${text.slice(0, 240)}`);
+    throw new Error(locale.t("background.error.nonJson", {
+      target: getApiTargetLabel(profile, response.url),
+      text: text.slice(0, 240)
+    }));
   }
 
   if (!response.ok) {
     const message = data?.error?.message || data?.message || response.statusText;
-    throw new Error(`模型接口返回错误（${getApiTargetLabel(profile, response.url)}）：HTTP ${response.status} ${message}`);
+    throw new Error(locale.t("background.error.http", {
+      target: getApiTargetLabel(profile, response.url),
+      status: response.status,
+      message
+    }));
   }
 
   return data;
@@ -502,7 +534,7 @@ function sanitizeTranscript(text, settings) {
     .filter(Boolean);
 
   for (const term of terms) {
-    output = output.split(term).join("[已隐藏]");
+    output = output.split(term).join(i18n(settings).t("background.redacted"));
   }
 
   if (!settings.includeTimestamps) {
@@ -513,10 +545,11 @@ function sanitizeTranscript(text, settings) {
 }
 
 function renderTemplate(template, variables) {
+  const locale = i18n({ uiLanguage: variables?.uiLanguage });
   const source = template || DEFAULT_SETTINGS.promptTemplate;
   const withOutput = source.includes("{{outputTemplate}}")
     ? source
-    : `${source}\n\n输出格式要求：\n{{outputTemplate}}`;
+    : `${source}\n\n${locale.t("background.render.outputRequirement")}\n{{outputTemplate}}`;
 
   return withOutput.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, key) => {
     return variables[key] == null ? "" : String(variables[key]);
@@ -559,6 +592,7 @@ function normalizeSettings(input) {
   const importedVersion = Number(input?.settingsVersion || 0);
   normalized.settingsVersion = DEFAULT_SETTINGS.settingsVersion;
   normalized.theme = ["auto", "light", "dark"].includes(normalized.theme) ? normalized.theme : DEFAULT_SETTINGS.theme;
+  normalized.uiLanguage = globalThis.VCS_I18N.normalizeUiLanguage(normalized.uiLanguage);
   normalized.language = String(normalized.language || "").trim() || DEFAULT_SETTINGS.language;
   normalized.panelEnabled = normalized.panelEnabled !== false;
   normalized.includeTimestamps = normalized.includeTimestamps !== false;

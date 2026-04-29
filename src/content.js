@@ -3,8 +3,9 @@
   const PAGE_STYLE_ID = "vcs-page-polish";
   const AI_MARK_URL = chrome.runtime.getURL("icons/ai-mark.png");
   const DEFAULT_SETTINGS = {
-    settingsVersion: 2,
+    settingsVersion: 4,
     theme: "auto",
+    uiLanguage: "zh-CN",
     language: "中文（简体）",
     activeProfileId: "custom",
     panelEnabled: true,
@@ -23,7 +24,7 @@
     selectedTrackId: "",
     transcript: "",
     lastSummary: "",
-    status: "正在读取字幕",
+    status: "",
     statusTone: "neutral",
     progress: null,
     refreshing: false,
@@ -44,8 +45,17 @@
 
   init();
 
+  function i18n() {
+    return globalThis.VCS_I18N.create(state.settings);
+  }
+
+  function t(key, variables) {
+    return i18n().t(key, variables);
+  }
+
   async function init() {
     state.settings = await loadSettings();
+    state.status = t("content.status.readingCaptions");
     if (state.settings.panelEnabled === false) {
       return;
     }
@@ -68,7 +78,7 @@
 
       if (message?.type === "VCS_TOGGLE_PANEL") {
         if (!shouldShowPanel()) {
-          sendResponse({ ok: false, error: "当前不是视频播放页，面板不会自动显示。" });
+          sendResponse({ ok: false, error: t("content.status.currentNotVideoPanel") });
           return true;
         }
         if (!state.mounted) {
@@ -82,7 +92,7 @@
 
       if (message?.type === "VCS_SUMMARIZE_NOW") {
         if (!shouldShowPanel()) {
-          sendResponse({ ok: false, error: "当前不是视频播放页。" });
+          sendResponse({ ok: false, error: t("content.status.currentNotVideo") });
           return true;
         }
         if (!state.mounted) {
@@ -97,7 +107,8 @@
 
       if (message?.type === "VCS_PROGRESS") {
         const progress = message.progress;
-        setStatus(progress?.label || "正在处理", "busy", progress);
+        setStatus(progress?.label || t("content.status.processing"), "busy", progress);
+        sendResponse({ ok: true });
         return false;
       }
 
@@ -260,7 +271,7 @@
     }
     state.title = getVideoTitle();
     state.transcript = "";
-    state.status = "正在读取字幕轨道";
+    state.status = t("content.status.readingTracks");
     state.statusTone = "busy";
     state.progress = null;
     state.refreshing = true;
@@ -272,12 +283,12 @@
       state.tracks = tracks;
       state.selectedTrackId = chooseDefaultTrackId(tracks);
       state.status = tracks.length
-        ? `已发现 ${tracks.length} 条字幕轨道`
-        : "没有发现可直接读取的字幕，可打开平台转写文稿后重试";
+        ? t("content.status.foundTracks", { count: tracks.length })
+        : t("content.status.noTracks");
       state.statusTone = tracks.length ? "done" : "neutral";
     } catch (error) {
       state.tracks = [];
-      state.status = `字幕读取失败：${error.message}`;
+      state.status = t("content.status.trackReadFailed", { message: error.message });
       state.statusTone = "error";
     } finally {
       const remainingAnimationMs = 650 - (performance.now() - refreshStartedAt);
@@ -362,7 +373,7 @@
       return [
         {
           id: "visible-transcript",
-          label: "页面可见字幕 / Transcript",
+          label: t("content.label.pageVisibleTranscript"),
           language: "auto",
           source: "visible",
           text: visibleTranscript
@@ -510,7 +521,7 @@
       if (visibleTranscript) {
         return visibleTranscript;
       }
-      throw new Error("没有可用字幕。请打开视频平台的转写文稿后重试。");
+      throw new Error(t("content.error.noCaptions"));
     }
 
     if (track.text) {
@@ -536,7 +547,7 @@
         return visibleTranscript;
       }
 
-      throw new Error("已找到字幕轨道，但 YouTube 返回了空字幕内容。请换一条字幕轨，或打开 YouTube 转写文稿后再试。");
+      throw new Error(t("content.error.emptyYouTube"));
     }
 
     if (track.source === "bilibili") {
@@ -553,7 +564,7 @@
       return track.text;
     }
 
-    throw new Error(`不支持的字幕来源：${track.source}`);
+    throw new Error(t("content.error.unsupportedTrack", { source: track.source }));
   }
 
   async function loadYouTubeTrackTranscript(track) {
@@ -1044,10 +1055,10 @@
 
   async function summarize() {
     try {
-      setStatus("正在准备字幕", "busy");
+      setStatus(t("content.status.preparing"), "busy");
       const transcript = await hydrateTranscriptPreview();
 
-      setStatus("正在请求 AI 总结", "busy");
+      setStatus(t("content.status.requestingSummary"), "busy");
       const response = await chrome.runtime.sendMessage({
         type: "VCS_SUMMARIZE",
         payload: {
@@ -1059,11 +1070,14 @@
       });
 
       if (!response?.ok) {
-        throw new Error(response?.error || "总结失败。");
+        throw new Error(response?.error || t("content.status.summaryFailed"));
       }
 
       state.lastSummary = response.payload.text;
-      setStatus(`完成：${response.payload.provider} / ${response.payload.model}`, "done");
+      setStatus(t("content.status.complete", {
+        provider: response.payload.provider,
+        model: response.payload.model
+      }), "done");
       render();
     } catch (error) {
       setStatus(error.message, "error");
@@ -1095,7 +1109,7 @@
 
     state.previewLoading = true;
     if (!silent) {
-      setStatus("正在读取转写文稿", "busy");
+      setStatus(t("content.status.readingTranscript"), "busy");
     }
     render();
 
@@ -1103,18 +1117,18 @@
       .then((transcript) => {
         const cleanText = String(transcript || "").trim();
         if (!cleanText) {
-          throw new Error("没有读取到字幕内容。");
+          throw new Error(t("content.error.noTranscript"));
         }
         state.transcript = cleanText;
         lastActiveTranscriptIndex = -1;
         if (!silent) {
-          setStatus(`字幕已读取（${cleanText.length} 字符）`, "done");
+          setStatus(t("content.status.transcriptRead", { count: cleanText.length }), "done");
         }
         return cleanText;
       })
       .catch((error) => {
         if (!silent) {
-          setStatus(`读取失败：${error.message}`, "error");
+          setStatus(t("content.status.readFailed", { message: error.message }), "error");
         }
         throw error;
       })
@@ -1165,30 +1179,30 @@
     const progressWidth = state.progress?.total
       ? Math.round((state.progress.current / state.progress.total) * 100)
       : 0;
-    const summarizeLabel = state.statusTone === "busy" ? "正在解析…" : "解析字幕";
+    const summarizeLabel = state.statusTone === "busy" ? t("content.label.summarizeBusy") : t("content.label.summarize");
     const previewPlaceholder = state.previewLoading
-      ? "正在读取字幕或转写文稿…"
-      : "自动读取到的字幕和 YouTube 转写文稿会显示在这里。";
+      ? t("content.label.previewLoading")
+      : t("content.label.previewPlaceholder");
     const previewContent = state.transcript
       ? renderTranscriptPreview(state.transcript)
       : `<span class="vcs-transcript-placeholder">${escapeHtml(previewPlaceholder)}</span>`;
 
     const trackCount = state.tracks.length
-      ? `字幕 · ${state.tracks.length}`
-      : "无字幕轨";
+      ? t("content.label.trackCount", { count: state.tracks.length })
+      : t("content.label.noTrack");
     const platformLabel = state.platform?.name || "video";
     const collapsedMeta = state.tracks.length
-      ? `${platformLabel} · ${state.tracks.length} 条字幕`
+      ? t("content.label.collapsedTracks", { platform: platformLabel, count: state.tracks.length })
       : `${platformLabel} · ${state.status}`;
     const embedClass = state.embedded ? "is-embedded" : "is-floating";
 
     shadow.innerHTML = `
       <style>${getPanelCss()}</style>
       <aside class="vcs-panel t-resize ${state.collapsed ? "is-collapsed" : ""} ${embedClass}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
-        <button id="vcs-expand" class="vcs-collapsed-toggle" type="button" title="展开字幕摘要" aria-label="展开字幕摘要">
+        <button id="vcs-expand" class="vcs-collapsed-toggle" type="button" title="${escapeHtml(t("content.title.expand"))}" aria-label="${escapeHtml(t("content.title.expand"))}">
           <span class="vcs-collapsed-icon"><img src="${escapeHtml(AI_MARK_URL)}" alt=""></span>
           <span class="vcs-collapsed-copy">
-            <span class="vcs-collapsed-title">字幕摘要</span>
+            <span class="vcs-collapsed-title">${escapeHtml(t("content.title"))}</span>
             <span class="vcs-collapsed-meta">${escapeHtml(collapsedMeta)}</span>
           </span>
           <span class="vcs-collapsed-arrow">${chevronRightIcon()}</span>
@@ -1198,20 +1212,20 @@
           <div class="vcs-brand">
             <div class="vcs-seal" aria-hidden="true"><img src="${escapeHtml(AI_MARK_URL)}" alt=""></div>
             <div class="vcs-brand-text">
-              <div class="vcs-title">字幕摘要</div>
+              <div class="vcs-title">${escapeHtml(t("content.title"))}</div>
               <div class="vcs-subtitle">${escapeHtml(platformLabel)} · ${escapeHtml(activeProfile)}</div>
             </div>
           </div>
           <div class="vcs-actions">
-            <button id="vcs-refresh" class="vcs-icon-button ${state.refreshing ? "is-spinning" : ""}" data-motion="spin" title="重新检测字幕" aria-label="重新检测">${refreshIcon()}</button>
-            <button id="vcs-options" class="vcs-icon-button" data-motion="gear" title="打开设置" aria-label="设置">${settingsIcon()}</button>
-            <button id="vcs-collapse" class="vcs-icon-button vcs-collapse-button" title="折叠面板" aria-label="折叠面板">${chevronRightIcon()}</button>
+            <button id="vcs-refresh" class="vcs-icon-button ${state.refreshing ? "is-spinning" : ""}" data-motion="spin" title="${escapeHtml(t("content.title.refresh"))}" aria-label="${escapeHtml(t("content.title.refresh"))}">${refreshIcon()}</button>
+            <button id="vcs-options" class="vcs-icon-button" data-motion="gear" title="${escapeHtml(t("content.title.options"))}" aria-label="${escapeHtml(t("content.title.settings"))}">${settingsIcon()}</button>
+            <button id="vcs-collapse" class="vcs-icon-button vcs-collapse-button" title="${escapeHtml(t("content.title.collapse"))}" aria-label="${escapeHtml(t("content.title.collapse"))}">${chevronRightIcon()}</button>
           </div>
         </header>
 
         <section class="vcs-body t-panel-slide" data-open="${state.collapsed ? "false" : "true"}">
           <div class="vcs-meta-line">
-            <span class="vcs-meta-title" title="${escapeHtml(state.title)}">${escapeHtml(state.title || "未命名视频")}</span>
+            <span class="vcs-meta-title" title="${escapeHtml(state.title)}">${escapeHtml(state.title || t("content.label.unnamedVideo"))}</span>
           </div>
 
           <div class="vcs-status-wrap">
@@ -1226,10 +1240,10 @@
 
           <section class="vcs-result" aria-live="polite" ${state.lastSummary ? "" : "hidden"}>
             <div class="vcs-result-head">
-              <span class="vcs-result-title">摘要</span>
-              <button id="vcs-copy-summary" class="vcs-tool-button ${state.copyingSummary ? "is-busy" : ""}" type="button" title="复制摘要" aria-label="复制摘要">${state.copyingSummary ? loadingIcon() : copyIcon()}</button>
+              <span class="vcs-result-title">${escapeHtml(t("content.label.summary"))}</span>
+              <button id="vcs-copy-summary" class="vcs-tool-button ${state.copyingSummary ? "is-busy" : ""}" type="button" title="${escapeHtml(t("content.title.copySummary"))}" aria-label="${escapeHtml(t("content.title.copySummary"))}">${state.copyingSummary ? loadingIcon() : copyIcon()}</button>
             </div>
-            <div class="vcs-summary-shell" role="region" aria-label="Markdown 摘要" tabindex="0">
+            <div class="vcs-summary-shell" role="region" aria-label="${escapeHtml(t("content.label.markdownSummary"))}" tabindex="0">
               <article id="vcs-summary" class="vcs-markdown">${markdownToHtml(state.lastSummary)}</article>
             </div>
           </section>
@@ -1237,14 +1251,14 @@
           <div class="vcs-track-row">
             <span class="vcs-track-label">${escapeHtml(trackCount)}</span>
             <select id="vcs-track" class="vcs-select" ${state.tracks.length ? "" : "disabled"}>
-              ${trackOptions || "<option>未发现字幕轨道</option>"}
+              ${trackOptions || `<option>${escapeHtml(t("content.label.noTrackOption"))}</option>`}
             </select>
-            <button id="vcs-copy-transcript" class="vcs-tool-button ${state.copyingTranscript ? "is-busy" : ""}" type="button" title="复制字幕" aria-label="复制字幕">${state.copyingTranscript ? loadingIcon() : copyIcon()}</button>
+            <button id="vcs-copy-transcript" class="vcs-tool-button ${state.copyingTranscript ? "is-busy" : ""}" type="button" title="${escapeHtml(t("content.title.copyTranscript"))}" aria-label="${escapeHtml(t("content.title.copyTranscript"))}">${state.copyingTranscript ? loadingIcon() : copyIcon()}</button>
           </div>
 
           <details class="vcs-details vcs-transcript-details" open>
-            <summary>字幕预览 / 转写文稿</summary>
-            <div id="vcs-preview" class="vcs-transcript-box" role="region" aria-label="字幕预览" data-empty="${state.transcript ? "false" : "true"}">${previewContent}</div>
+            <summary>${escapeHtml(t("content.label.transcriptPreview"))}</summary>
+            <div id="vcs-preview" class="vcs-transcript-box" role="region" aria-label="${escapeHtml(t("content.label.transcriptPreviewAria"))}" data-empty="${state.transcript ? "false" : "true"}">${previewContent}</div>
           </details>
         </section>
       </aside>
@@ -1288,7 +1302,7 @@
     }
 
     return `
-      <ol class="vcs-transcript-list" aria-label="字幕时间轴">
+      <ol class="vcs-transcript-list" aria-label="${escapeHtml(t("content.label.transcriptTimeline"))}">
         ${items.map(renderTranscriptItem).join("")}
       </ol>
     `;
@@ -1308,7 +1322,7 @@
 
     return `
       <li class="vcs-transcript-item">
-        <button class="vcs-transcript-row" type="button" data-index="${item.index}" data-seconds="${item.seconds}" aria-label="跳转到 ${escapeHtml(item.time)}">
+        <button class="vcs-transcript-row" type="button" data-index="${item.index}" data-seconds="${item.seconds}" aria-label="${escapeHtml(t("content.label.jumpToTime", { time: item.time }))}">
           <span class="vcs-cue-time">${escapeHtml(item.time)}</span>
           <span class="vcs-cue-text">${content}</span>
         </button>
@@ -1458,20 +1472,20 @@
     }
 
     state.copyingTranscript = true;
-    setStatus("正在复制字幕", "busy");
+    setStatus(t("content.status.copyingTranscript"), "busy");
     render();
 
     try {
       const text = state.transcript || await hydrateTranscriptPreview();
       const cleanText = text.trim();
       if (!cleanText) {
-        throw new Error("没有可复制的字幕内容。");
+        throw new Error(t("content.error.noCopyableTranscript"));
       }
       state.transcript = cleanText;
       await copyTextToClipboard(cleanText);
-      setStatus(`字幕已复制（${cleanText.length} 字符）`, "done");
+      setStatus(t("content.status.transcriptCopied", { count: cleanText.length }), "done");
     } catch (error) {
-      setStatus(`复制失败：${error.message}`, "error");
+      setStatus(t("content.status.copyFailed", { message: error.message }), "error");
     } finally {
       state.copyingTranscript = false;
       render();
@@ -1484,18 +1498,18 @@
     }
 
     state.copyingSummary = true;
-    setStatus("正在复制摘要", "busy");
+    setStatus(t("content.status.copyingSummary"), "busy");
     render();
 
     try {
       const text = (state.lastSummary || "").trim();
       if (!text) {
-        throw new Error("还没有可复制的摘要。");
+        throw new Error(t("content.error.noCopyableSummary"));
       }
       await copyTextToClipboard(text);
-      setStatus("摘要已复制", "done");
+      setStatus(t("content.status.summaryCopied"), "done");
     } catch (error) {
-      setStatus(`复制失败：${error.message}`, "error");
+      setStatus(t("content.status.copyFailed", { message: error.message }), "error");
     } finally {
       state.copyingSummary = false;
       render();
@@ -1530,7 +1544,7 @@
     textarea.remove();
 
     if (!copied) {
-      throw new Error("浏览器拒绝写入剪贴板。");
+      throw new Error(t("content.error.clipboardDenied"));
     }
   }
 
@@ -1571,6 +1585,7 @@
     const importedVersion = Number(input?.settingsVersion || 0);
     normalized.settingsVersion = DEFAULT_SETTINGS.settingsVersion;
     normalized.theme = ["auto", "light", "dark"].includes(normalized.theme) ? normalized.theme : DEFAULT_SETTINGS.theme;
+    normalized.uiLanguage = globalThis.VCS_I18N.normalizeUiLanguage(normalized.uiLanguage);
     normalized.language = String(normalized.language || "").trim() || DEFAULT_SETTINGS.language;
     normalized.panelEnabled = normalized.panelEnabled !== false;
     normalized.includeTimestamps = normalized.includeTimestamps !== false;
@@ -2860,7 +2875,6 @@
         background: var(--haijiro-soft);
         border: 0;
       }
-
       .vcs-collapsed-toggle {
         display: none;
         grid-template-columns: 34px minmax(0, 1fr) 22px;

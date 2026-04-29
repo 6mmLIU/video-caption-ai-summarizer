@@ -299,6 +299,9 @@ try {
   const optionsState = await evaluate(optionsPage, `
     return chrome.storage.local.get("vcsSettings").then((result) => ({
       language: document.querySelector("#language")?.value || "",
+      uiLanguage: document.querySelector("#uiLanguage")?.value || "",
+      uiLanguageOptions: [...document.querySelectorAll("#uiLanguage option")].map((option) => option.value),
+      appearanceHeading: document.querySelector("#appearance h2")?.textContent || "",
       saveHistory: document.querySelector("#saveHistory")?.checked || false,
       themeMode: document.documentElement.dataset.themeMode || "",
       theme: document.documentElement.dataset.theme || "",
@@ -312,6 +315,13 @@ try {
   if (optionsState.language !== "中文（简体）") {
     throw new Error(`Expected default summary language, got: ${optionsState.language}`);
   }
+  if (
+    optionsState.uiLanguage !== "zh-CN" ||
+    !optionsState.uiLanguageOptions.includes("en") ||
+    optionsState.appearanceHeading !== "外观"
+  ) {
+    throw new Error(`Expected default Chinese UI with an English option: ${JSON.stringify(optionsState)}`);
+  }
   if (!optionsState.saveHistory) {
     throw new Error("Summary history should be enabled by default after settings migration.");
   }
@@ -321,6 +331,41 @@ try {
   if (!optionsState.settingsProfileCount || !optionsState.profileName || optionsState.model || optionsState.temperature !== "1") {
     throw new Error(`API defaults should expose an editable name, blank model, and temperature 1: ${JSON.stringify(optionsState)}`);
   }
+
+  await evaluate(optionsPage, `
+    document.querySelector("#uiLanguage").value = "en";
+    document.querySelector("#uiLanguage").dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  `);
+  await waitForExpression(optionsPage, `
+    document.documentElement.lang === "en" &&
+      document.querySelector("#appearance h2")?.textContent === "Appearance" &&
+      document.querySelector("#saveStatus")?.textContent.includes("Interface language saved")
+  `, 5000);
+  const englishUiState = await evaluate(optionsPage, `
+    return chrome.storage.local.get("vcsSettings").then((result) => ({
+      storedUiLanguage: result.vcsSettings?.uiLanguage || "",
+      summaryLanguageLabel: document.querySelector("#language")?.closest(".field")?.querySelector("span")?.textContent || "",
+      saveButton: document.querySelector("#saveAll")?.textContent || ""
+    }));
+  `);
+  if (
+    englishUiState.storedUiLanguage !== "en" ||
+    englishUiState.summaryLanguageLabel !== "Summary Output Language" ||
+    englishUiState.saveButton !== "Save Settings"
+  ) {
+    throw new Error(`English UI option should translate and persist: ${JSON.stringify(englishUiState)}`);
+  }
+  await evaluate(optionsPage, `
+    document.querySelector("#uiLanguage").value = "zh-CN";
+    document.querySelector("#uiLanguage").dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  `);
+  await waitForExpression(optionsPage, `
+    document.documentElement.lang === "zh-CN" &&
+      document.querySelector("#appearance h2")?.textContent === "外观" &&
+      document.querySelector("#saveStatus")?.textContent.includes("界面语言已保存")
+  `, 5000);
 
   const presetState = await evaluate(optionsPage, `
     document.querySelector("#profileName").value = "自定义配置";
@@ -616,12 +661,14 @@ async function assertPromptTemplateReachesModel({
     document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-summarize").click();
     return true;
   `, { userGesture: true });
+
   await waitForExpression(videoPage, `
     (() => {
       const shadow = document.querySelector("#vcs-root")?.shadowRoot;
       const status = shadow?.querySelector("#vcs-status")?.textContent || "";
       const summary = shadow?.querySelector("#vcs-summary")?.textContent || "";
-      return status.includes("完成：") && summary.includes("MOCK SUMMARY CUSTOM PROMPT OK");
+      const completed = status.includes("完成：") || status.includes("Done:");
+      return completed && summary.includes("MOCK SUMMARY CUSTOM PROMPT OK");
     })()
   `, waitTimeout);
 
@@ -708,6 +755,7 @@ async function setExtensionSettings(cdp, settings) {
 function mockSettings({ endpoint, promptTemplate, outputTemplate }) {
   return {
     theme: "auto",
+    uiLanguage: "zh-CN",
     language: "中文（简体）",
     panelEnabled: true,
     activeProfileId: "deepseek",

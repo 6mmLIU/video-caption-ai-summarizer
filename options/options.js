@@ -1,10 +1,12 @@
 const SETTINGS_KEY = "vcsSettings";
 const HISTORY_KEY = "vcsHistory";
 const HISTORY_LIMIT = 30;
+const I18N = globalThis.VCS_I18N;
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 3,
+  settingsVersion: 4,
   theme: "auto",
+  uiLanguage: "zh-CN",
   language: "中文（简体）",
   panelEnabled: true,
   activeProfileId: "custom",
@@ -47,6 +49,7 @@ const DEFAULT_SETTINGS = {
 let settings = structuredClone(DEFAULT_SETTINGS);
 
 const fields = {
+  uiLanguage: document.querySelector("#uiLanguage"),
   language: document.querySelector("#language"),
   panelEnabled: document.querySelector("#panelEnabled"),
   profileName: document.querySelector("#profileName"),
@@ -72,6 +75,14 @@ const fields = {
 };
 
 init();
+
+function i18n() {
+  return I18N.create(settings);
+}
+
+function t(key, variables) {
+  return i18n().t(key, variables);
+}
 
 async function init() {
   const result = await chrome.storage.local.get(SETTINGS_KEY);
@@ -101,8 +112,15 @@ function bindEvents() {
     input.addEventListener("change", async () => {
       settings.theme = input.value;
       applyTheme();
-      await saveAll("主题已保存");
+      await saveAll(t("options.status.themeSaved"));
     });
+  });
+
+  fields.uiLanguage.addEventListener("change", async () => {
+    settings.uiLanguage = fields.uiLanguage.value;
+    applyTranslations();
+    await renderHistory();
+    await saveAll(t("options.status.uiLanguageSaved"));
   });
 
   document.querySelectorAll(".preset").forEach((button) => {
@@ -125,6 +143,7 @@ function bindEvents() {
     if (changes[SETTINGS_KEY] && changes[SETTINGS_KEY].newValue) {
       settings = normalizeSettings(changes[SETTINGS_KEY].newValue);
       hydrateForm();
+      renderHistory();
     }
   });
 
@@ -141,6 +160,7 @@ function hydrateForm() {
   if (themeInput) {
     themeInput.checked = true;
   }
+  fields.uiLanguage.value = settings.uiLanguage || DEFAULT_SETTINGS.uiLanguage;
   fields.language.value = settings.language || DEFAULT_SETTINGS.language;
   fields.panelEnabled.checked = settings.panelEnabled !== false;
   fields.promptTemplate.value = settings.promptTemplate || "";
@@ -151,6 +171,7 @@ function hydrateForm() {
   fields.chunkSize.value = settings.chunkSize || 12000;
   fields.chunkOverlap.value = settings.chunkOverlap || 600;
   applyTheme();
+  applyTranslations();
   renderProfileFields();
 }
 
@@ -182,14 +203,15 @@ function saveCurrentProfile() {
   profile.model = fields.model.value.trim();
   profile.temperature = Number(fields.temperature.value || 1);
   profile.maxTokens = Number(fields.maxTokens.value || 4096);
-  saveAll("API 配置已保存");
+  saveAll(t("options.status.profileSaved"));
 }
 
-async function saveAll(message = "设置已保存") {
+async function saveAll(message = t("options.status.settingsSaved")) {
   if (typeof message !== "string") {
-    message = "设置已保存";
+    message = t("options.status.settingsSaved");
   }
   settings.theme = document.querySelector("input[name='theme']:checked")?.value || "auto";
+  settings.uiLanguage = I18N.normalizeUiLanguage(fields.uiLanguage.value);
   settings.language = fields.language.value.trim() || "中文（简体）";
   settings.panelEnabled = fields.panelEnabled.checked;
   settings.promptTemplate = fields.promptTemplate.value;
@@ -224,7 +246,7 @@ function saveCurrentProfileValuesOnly() {
 function addProfile() {
   const profile = {
     id: `custom-${Date.now()}`,
-    name: "新配置",
+    name: settings.uiLanguage === "en" ? "New Profile" : "新配置",
     provider: "openai-compatible",
     endpoint: "",
     apiKey: "",
@@ -239,7 +261,7 @@ function addProfile() {
 
 function deleteProfile() {
   if (settings.profiles.length <= 1) {
-    setStatus(fields.apiStatus, "至少保留一个 API 配置。", "error");
+    setStatus(fields.apiStatus, t("options.status.keepOneProfile"), "error");
     return;
   }
 
@@ -258,7 +280,7 @@ function applyPreset(name) {
   profile.endpoint = preset.endpoint;
   fields.provider.value = profile.provider;
   fields.endpoint.value = profile.endpoint;
-  setStatus(fields.apiStatus, "已切换服务商和接口地址，配置名称与模型名称保持不变。", "ok");
+  setStatus(fields.apiStatus, t("options.status.presetApplied"), "ok");
 }
 
 function profilePreset(name) {
@@ -393,7 +415,7 @@ function applyTemplate(name) {
 
 async function testProfile() {
   saveCurrentProfileValuesOnly();
-  setStatus(fields.apiStatus, "正在测试连接...", "");
+  setStatus(fields.apiStatus, t("options.status.testing"), "");
 
   const response = await chrome.runtime.sendMessage({
     type: "VCS_TEST_API",
@@ -401,14 +423,14 @@ async function testProfile() {
   });
 
   if (response?.ok) {
-    setStatus(fields.apiStatus, `连接成功：${response.payload.text}`, "ok");
+    setStatus(fields.apiStatus, t("options.status.connectionSuccess", { text: response.payload.text }), "ok");
   } else {
-    setStatus(fields.apiStatus, response?.error || "连接失败。", "error");
+    setStatus(fields.apiStatus, response?.error || t("options.status.connectionFailed"), "error");
   }
 }
 
 async function exportSettings() {
-  await saveAll("设置已保存，可导出");
+  await saveAll(t("options.status.savedForExport"));
   const payload = {
     type: "video-caption-ai-settings",
     version: 1,
@@ -418,7 +440,7 @@ async function exportSettings() {
   const json = JSON.stringify(payload, null, 2);
   downloadJson(json, `video-caption-ai-settings-${formatDateForFilename(new Date())}.json`);
   const copied = await writeClipboard(json);
-  setStatus(fields.saveStatus, copied ? "配置 JSON 已下载，并已复制到剪贴板。" : "配置 JSON 已下载。", "ok");
+  setStatus(fields.saveStatus, copied ? t("options.status.settingsExportedCopied") : t("options.status.settingsExported"), "ok");
 }
 
 async function importSettings() {
@@ -427,16 +449,16 @@ async function importSettings() {
     settings = normalizeSettings(imported);
     hydrateForm();
     await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
-    setStatus(fields.saveStatus, "配置已导入。", "ok");
+    setStatus(fields.saveStatus, t("options.status.settingsImported"), "ok");
   } catch (error) {
-    setStatus(fields.saveStatus, `导入失败：${error.message}`, "error");
+    setStatus(fields.saveStatus, t("options.status.importFailed", { message: error.message }), "error");
   }
 }
 
 async function resetSettings() {
   settings = structuredClone(DEFAULT_SETTINGS);
   hydrateForm();
-  setStatus(fields.saveStatus, "已恢复默认设置，点击保存设置后才会生效。", "ok");
+  setStatus(fields.saveStatus, t("options.status.resetRequiresSave"), "ok");
 }
 
 async function importSettingsFile() {
@@ -459,13 +481,13 @@ async function renderHistory() {
   fields.historyCount.textContent = `${history.length} / ${HISTORY_LIMIT}`;
 
   if (!history.length) {
-    fields.historyList.innerHTML = `<div class="history-empty">还没有保存的总结历史。</div>`;
+    fields.historyList.innerHTML = `<div class="history-empty">${escapeHtml(t("options.history.empty"))}</div>`;
     return;
   }
 
   fields.historyList.innerHTML = history.map((item, index) => {
     const summary = item.summary || item.text || "";
-    const title = item.title || "未命名视频";
+    const title = item.title || t("options.history.untitled");
     const createdAt = formatDate(item.createdAt);
     const meta = [item.platform, item.model, createdAt].filter(Boolean).join(" · ");
     return `
@@ -473,11 +495,11 @@ async function renderHistory() {
         <div class="history-item__head">
           <div>
             <div class="history-item__title" title="${escapeHtml(title)}">${escapeHtml(title)}</div>
-            <div class="history-item__meta">${escapeHtml(meta || "本机历史")}</div>
+            <div class="history-item__meta">${escapeHtml(meta || t("options.history.local"))}</div>
           </div>
-          <button class="button button--ghost history-copy" type="button" data-history-index="${index}">复制</button>
+          <button class="button button--ghost history-copy" type="button" data-history-index="${index}">${escapeHtml(t("options.history.copy"))}</button>
         </div>
-        <div class="history-item__summary">${escapeHtml(summary || "无摘要内容")}</div>
+        <div class="history-item__summary">${escapeHtml(summary || t("options.history.noSummary"))}</div>
       </article>
     `;
   }).join("");
@@ -498,18 +520,18 @@ async function copyHistoryFromList(event) {
   const item = history[Number(button.dataset.historyIndex)];
   const text = item?.summary || item?.text || "";
   if (!text.trim()) {
-    setStatus(fields.saveStatus, "这条历史没有可复制的摘要。", "error");
+    setStatus(fields.saveStatus, t("options.status.noCopyableHistory"), "error");
     return;
   }
 
   const copied = await writeClipboard(text);
-  setStatus(fields.saveStatus, copied ? "历史摘要已复制。" : "浏览器拒绝写入剪贴板。", copied ? "ok" : "error");
+  setStatus(fields.saveStatus, copied ? t("options.status.historyCopied") : t("options.status.clipboardDenied"), copied ? "ok" : "error");
 }
 
 async function clearHistory() {
   await chrome.storage.local.set({ [HISTORY_KEY]: [] });
   await renderHistory();
-  setStatus(fields.saveStatus, "总结历史已清空。", "ok");
+  setStatus(fields.saveStatus, t("options.status.historyCleared"), "ok");
 }
 
 async function exportHistory() {
@@ -524,18 +546,18 @@ async function exportHistory() {
   };
   const json = JSON.stringify(payload, null, 2);
   downloadJson(json, `video-caption-ai-history-${formatDateForFilename(new Date())}.json`);
-  setStatus(fields.saveStatus, history.length ? "总结历史 JSON 已下载。" : "历史为空，已下载空历史 JSON。", "ok");
+  setStatus(fields.saveStatus, history.length ? t("options.status.historyExported") : t("options.status.emptyHistoryExported"), "ok");
 }
 
 function parseImportedSettings(text) {
   if (!text.trim()) {
-    throw new Error("请先粘贴或选择配置 JSON。");
+    throw new Error(t("options.error.emptyImport"));
   }
 
   const parsed = JSON.parse(text);
   const imported = parsed?.settings || parsed;
   if (!imported || typeof imported !== "object" || Array.isArray(imported)) {
-    throw new Error("JSON 中没有有效的 settings 对象。");
+    throw new Error(t("options.error.invalidSettings"));
   }
   return imported;
 }
@@ -545,6 +567,7 @@ function normalizeSettings(input) {
   const importedVersion = Number(input?.settingsVersion || 0);
   normalized.settingsVersion = DEFAULT_SETTINGS.settingsVersion;
   normalized.theme = ["auto", "light", "dark"].includes(normalized.theme) ? normalized.theme : DEFAULT_SETTINGS.theme;
+  normalized.uiLanguage = I18N.normalizeUiLanguage(normalized.uiLanguage);
   normalized.language = String(normalized.language || "").trim() || DEFAULT_SETTINGS.language;
   normalized.panelEnabled = normalized.panelEnabled !== false;
   normalized.includeTimestamps = normalized.includeTimestamps !== false;
@@ -591,6 +614,92 @@ function normalizeHistory(value) {
     .slice(0, HISTORY_LIMIT);
 }
 
+function applyTranslations() {
+  const locale = i18n();
+  document.documentElement.lang = locale.language === "en" ? "en" : "zh-CN";
+  document.title = locale.t("options.documentTitle");
+
+  setText(".topbar h1", locale.t("common.appName"));
+  setText(".topbar p", locale.t("options.brandTagline"));
+  setText("#exportSettings", locale.t("options.exportSettings"));
+  setText("#saveAll", locale.t("options.saveAll"));
+
+  setText(".sidebar a[href='#appearance']", locale.t("options.nav.appearance"));
+  setText(".sidebar a[href='#api']", locale.t("options.nav.api"));
+  setText(".sidebar a[href='#prompt']", locale.t("options.nav.prompt"));
+  setText(".sidebar a[href='#platforms']", locale.t("options.nav.platforms"));
+  setText(".sidebar a[href='#history']", locale.t("options.nav.history"));
+  setText(".sidebar a[href='#advanced']", locale.t("options.nav.advanced"));
+
+  setText("#appearance .section__head h2", locale.t("options.nav.appearance"));
+  setText("#appearance .section__head p", locale.t("options.appearance.description"));
+  setText("#appearance > .field > label", locale.t("options.appearance.theme"));
+  document.querySelector("#appearance .segmented")?.setAttribute("aria-label", locale.t("options.appearance.theme"));
+  setRadioLabel("auto", locale.t("options.appearance.theme.auto"));
+  setRadioLabel("light", locale.t("options.appearance.theme.light"));
+  setRadioLabel("dark", locale.t("options.appearance.theme.dark"));
+  setFieldLabel(fields.uiLanguage, locale.t("options.appearance.uiLanguage"));
+  setOptionText(fields.uiLanguage, "zh-CN", locale.t("ui.zh-CN"));
+  setOptionText(fields.uiLanguage, "en", locale.t("ui.en"));
+  setFieldLabel(fields.language, locale.t("options.appearance.summaryLanguage"));
+  fields.language.placeholder = locale.t("options.appearance.summaryLanguagePlaceholder");
+  setFieldLabel(fields.panelEnabled, locale.t("options.appearance.panelEnabled"));
+
+  setText("#api .section__head h2", locale.t("options.nav.api"));
+  setText("#api .section__head p", locale.t("options.api.description"));
+  setText("#addProfile", locale.t("options.api.add"));
+  setText("#deleteProfile", locale.t("options.api.delete"));
+  setFieldLabel(fields.profileName, locale.t("options.api.profileName"));
+  fields.profileName.placeholder = locale.t("options.api.profileNamePlaceholder");
+  setFieldLabel(fields.provider, locale.t("options.api.provider"));
+  setOptionText(fields.provider, "openai-compatible", locale.t("options.api.provider.openai"));
+  setOptionText(fields.provider, "anthropic", locale.t("options.api.provider.anthropic"));
+  setOptionText(fields.provider, "gemini", locale.t("options.api.provider.gemini"));
+  setOptionText(fields.provider, "ollama", locale.t("options.api.provider.ollama"));
+  setFieldLabel(fields.endpoint, locale.t("options.api.endpoint"));
+  setFieldLabel(fields.apiKey, locale.t("options.api.apiKey"));
+  setFieldLabel(fields.model, locale.t("options.api.model"));
+  fields.model.placeholder = locale.t("options.api.modelPlaceholder");
+  setFieldLabel(fields.temperature, locale.t("options.api.temperature"));
+  setFieldLabel(fields.maxTokens, locale.t("options.api.maxTokens"));
+  setText("#saveProfile", locale.t("options.api.saveProfile"));
+  setText("#testProfile", locale.t("options.api.testProfile"));
+
+  setText("#prompt .section__head h2", locale.t("options.nav.prompt"));
+  setText("#prompt .section__head p", locale.t("options.prompt.description"));
+  setFieldLabel(fields.promptTemplate, locale.t("options.prompt.promptTemplate"));
+  setFieldLabel(fields.outputTemplate, locale.t("options.prompt.outputTemplate"));
+  setTemplateText("study", locale.t("options.prompt.study.title"), locale.t("options.prompt.study.body"));
+  setTemplateText("meeting", locale.t("options.prompt.meeting.title"), locale.t("options.prompt.meeting.body"));
+  setTemplateText("research", locale.t("options.prompt.research.title"), locale.t("options.prompt.research.body"));
+
+  setText("#platforms .section__head h2", locale.t("options.nav.platforms"));
+  setText("#platforms .section__head p", locale.t("options.platforms.description"));
+  setText("#platforms .support-list > div:nth-child(1) span", locale.t("options.platforms.youtube"));
+  setText("#platforms .support-list > div:nth-child(2) span", locale.t("options.platforms.bilibili"));
+  setText("#platforms .support-list > div:nth-child(3) span", locale.t("options.platforms.html5"));
+  setText("#platforms .support-list > div:nth-child(4) span", locale.t("options.platforms.transcript"));
+  setFieldLabel(fields.includeTimestamps, locale.t("options.platforms.includeTimestamps"));
+  setFieldLabel(fields.redactTerms, locale.t("options.platforms.redactTerms"));
+  fields.redactTerms.placeholder = locale.t("options.platforms.redactTermsPlaceholder");
+
+  setText("#history .section__head h2", locale.t("options.nav.history"));
+  setText("#history .section__head p", locale.t("options.history.description"));
+  setText("#exportHistory", locale.t("options.history.export"));
+  setText("#clearHistory", locale.t("options.history.clear"));
+  setFieldLabel(fields.saveHistory, locale.t("options.history.saveHistory"));
+
+  setText("#advanced .section__head h2", locale.t("options.nav.advanced"));
+  setText("#advanced .section__head p", locale.t("options.advanced.description"));
+  setFieldLabel(fields.chunkSize, locale.t("options.advanced.chunkSize"));
+  setFieldLabel(fields.chunkOverlap, locale.t("options.advanced.chunkOverlap"));
+  setFieldLabel(fields.importText, locale.t("options.advanced.importJson"));
+  fields.importText.placeholder = locale.t("options.advanced.importJsonPlaceholder");
+  setFieldLabel(fields.importFile, locale.t("options.advanced.importFile"));
+  setText("#importSettings", locale.t("options.advanced.importSettings"));
+  setText("#resetSettings", locale.t("options.advanced.resetSettings"));
+}
+
 function applyTheme() {
   const mode = settings.theme || "auto";
   const resolved = mode === "auto"
@@ -633,7 +742,7 @@ function formatDate(value) {
   if (Number.isNaN(date.getTime())) {
     return "";
   }
-  return date.toLocaleString("zh-CN", {
+  return date.toLocaleString(i18n().locale, {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -652,6 +761,50 @@ function clampNumber(value, fallback, min, max) {
 
 function getActiveProfile() {
   return settings.profiles.find((profile) => profile.id === settings.activeProfileId) || settings.profiles[0];
+}
+
+function setText(selector, value) {
+  const element = document.querySelector(selector);
+  if (element) {
+    element.textContent = value;
+  }
+}
+
+function setFieldLabel(field, value) {
+  const label = field?.closest(".field")?.querySelector("span");
+  if (label) {
+    label.textContent = value;
+  }
+}
+
+function setRadioLabel(value, text) {
+  const input = document.querySelector(`input[name='theme'][value='${value}']`);
+  const label = input?.closest("label");
+  if (!label) {
+    return;
+  }
+  let textNode = [...label.childNodes].find((node) => node.nodeType === Node.TEXT_NODE && node.textContent.trim());
+  if (!textNode) {
+    textNode = document.createTextNode("");
+    label.appendChild(textNode);
+  }
+  textNode.textContent = ` ${text}`;
+}
+
+function setOptionText(select, value, text) {
+  const option = select?.querySelector(`option[value='${value}']`);
+  if (option) {
+    option.textContent = text;
+  }
+}
+
+function setTemplateText(name, title, body) {
+  const template = document.querySelector(`.template[data-template='${name}']`);
+  if (!template) {
+    return;
+  }
+  template.querySelector("strong").textContent = title;
+  template.querySelector("span").textContent = body;
 }
 
 function setStatus(element, message, tone) {
