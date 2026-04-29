@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Video Caption AI Settings</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar__inner">
+        <div>
+          <h1>Video Caption AI</h1>
+          <p>为 YouTube、Bilibili 和其他视频网站总结字幕内容。</p>
+        </div>
+        <div class="topbar__actions">
+          <button id="exportSettings" class="button button--ghost" type="button">导出配置</button>
+          <button id="saveAll" class="button button--primary" type="button">保存设置</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <nav class="sidebar" aria-label="Settings sections">
+        <a href="#appearance">外观</a>
+        <a href="#api">API 模型</a>
+        <a href="#prompt">提示词</a>
+        <a href="#platforms">平台与隐私</a>
+        <a href="#advanced">高级</a>
+      </nav>
+
+      <div class="content">
+        <section id="appearance" class="section">
+          <div class="section__head">
+            <h2>外观</h2>
+            <p>控制视频页面上的总结面板显示方式。</p>
+          </div>
+
+          <div class="field">
+            <label>主题</label>
+            <div class="segmented" role="radiogroup" aria-label="主题">
+              <label><input type="radio" name="theme" value="auto"> 自动</label>
+              <label><input type="radio" name="theme" value="light"> 浅色</label>
+              <label><input type="radio" name="theme" value="dark"> 深色</label>
+            </div>
+          </div>
+
+          <div class="grid two">
+            <label class="field">
+              <span>总结输出语言</span>
+              <input id="language" type="text" list="languageList" placeholder="中文（简体）">
+              <datalist id="languageList">
+                <option value="中文（简体）"></option>
+                <option value="中文（繁體）"></option>
+                <option value="English"></option>
+                <option value="日本語"></option>
+                <option value="한국어"></option>
+              </datalist>
+            </label>
+
+            <label class="field field--switch">
+              <span>自动显示视频页浮动面板</span>
+              <input id="panelEnabled" type="checkbox">
+            </label>
+          </div>
+        </section>
+
+        <section id="api" class="section">
+          <div class="section__head section__head--row">
+            <div>
+              <h2>API 模型</h2>
+              <p>支持 OpenAI 兼容接口、DeepSeek、Claude、Gemini、Ollama 和其他自定义服务。</p>
+            </div>
+            <div class="button-row">
+              <button id="addProfile" class="button button--ghost" type="button">新增</button>
+              <button id="deleteProfile" class="button button--danger" type="button">删除</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="activeProfile">当前使用的配置</label>
+            <select id="activeProfile"></select>
+          </div>
+
+          <div class="grid two">
+            <label class="field">
+              <span>配置名称</span>
+              <input id="profileName" type="text" placeholder="DeepSeek">
+            </label>
+            <label class="field">
+              <span>服务商类型</span>
+              <select id="provider">
+                <option value="openai-compatible">OpenAI 兼容接口</option>
+                <option value="anthropic">Anthropic Claude</option>
+                <option value="gemini">Google Gemini</option>
+                <option value="ollama">Ollama / 本地 OpenAI 兼容</option>
+              </select>
+            </label>
+          </div>
+
+          <label class="field">
+            <span>接口地址</span>
+            <input id="endpoint" type="url" placeholder="https://api.deepseek.com/v1/chat/completions">
+          </label>
+
+          <div class="grid two">
+            <label class="field">
+              <span>API Key</span>
+              <input id="apiKey" type="password" autocomplete="off" placeholder="sk-...">
+            </label>
+            <label class="field">
+              <span>模型名称</span>
+              <input id="model" type="text" placeholder="deepseek-chat">
+            </label>
+          </div>
+
+          <div class="grid two">
+            <label class="field">
+              <span>Temperature</span>
+              <input id="temperature" type="number" min="0" max="2" step="0.1">
+            </label>
+            <label class="field">
+              <span>最大输出 Token</span>
+              <input id="maxTokens" type="number" min="256" max="32000" step="256">
+            </label>
+          </div>
+
+          <div class="preset-row">
+            <button class="preset" data-preset="deepseek" type="button">DeepSeek</button>
+            <button class="preset" data-preset="openai" type="button">ChatGPT</button>
+            <button class="preset" data-preset="claude" type="button">Claude</button>
+            <button class="preset" data-preset="gemini" type="button">Gemini</button>
+            <button class="preset" data-preset="ollama" type="button">Ollama</button>
+          </div>
+
+          <div class="button-row">
+            <button id="saveProfile" class="button button--primary" type="button">保存当前 API 配置</button>
+            <button id="testProfile" class="button button--ghost" type="button">测试连接</button>
+            <span id="apiStatus" class="status" role="status"></span>
+          </div>
+        </section>
+
+        <section id="prompt" class="section">
+          <div class="section__head">
+            <h2>提示词</h2>
+            <p>可用变量：{{title}}、{{platform}}、{{url}}、{{language}}、{{transcript}}、{{outputTemplate}}。</p>
+          </div>
+
+          <label class="field">
+            <span>总结 Prompt</span>
+            <textarea id="promptTemplate" rows="12"></textarea>
+          </label>
+
+          <label class="field">
+            <span>输出模板</span>
+            <textarea id="outputTemplate" rows="8"></textarea>
+          </label>
+
+          <div class="template-grid">
+            <button class="template" data-template="study" type="button">
+              <strong>学习笔记</strong>
+              <span>适合课程、讲座、知识视频。</span>
+            </button>
+            <button class="template" data-template="meeting" type="button">
+              <strong>会议纪要</strong>
+              <span>提炼决策、行动项、风险。</span>
+            </button>
+            <button class="template" data-template="research" type="button">
+              <strong>研究卡片</strong>
+              <span>输出术语、论点、证据和反问。</span>
+            </button>
+          </div>
+        </section>
+
+        <section id="platforms" class="section">
+          <div class="section__head">
+            <h2>平台与隐私</h2>
+            <p>不同视频网站的字幕接口差异很大，插件会优先读官方字幕轨道，失败时允许手动粘贴。</p>
+          </div>
+
+          <div class="support-list">
+            <div>
+              <strong>YouTube</strong>
+              <span>读取页面播放器里的 captionTracks。</span>
+            </div>
+            <div>
+              <strong>Bilibili</strong>
+              <span>读取视频 cid/bvid 后请求字幕列表。</span>
+            </div>
+            <div>
+              <strong>通用 HTML5</strong>
+              <span>读取 video track、VTT/SRT 字幕和页面可见 transcript。</span>
+            </div>
+            <div>
+              <strong>兜底模式</strong>
+              <span>无法自动读取时，在浮动面板粘贴字幕再总结。</span>
+            </div>
+          </div>
+
+          <div class="grid two">
+            <label class="field field--switch">
+              <span>发送字幕中的时间戳</span>
+              <input id="includeTimestamps" type="checkbox">
+            </label>
+            <label class="field field--switch">
+              <span>保存最近 30 条总结历史</span>
+              <input id="saveHistory" type="checkbox">
+            </label>
+          </div>
+
+          <label class="field">
+            <span>发送前自动隐藏的敏感词</span>
+            <textarea id="redactTerms" rows="4" placeholder="每行一个词，或用英文逗号分隔"></textarea>
+          </label>
+        </section>
+
+        <section id="advanced" class="section">
+          <div class="section__head">
+            <h2>高级</h2>
+            <p>长视频会先分段提炼，再合并成最终总结。</p>
+          </div>
+
+          <div class="grid two">
+            <label class="field">
+              <span>每段最大字符数</span>
+              <input id="chunkSize" type="number" min="2000" max="50000" step="1000">
+            </label>
+            <label class="field">
+              <span>分段重叠字符数</span>
+              <input id="chunkOverlap" type="number" min="0" max="5000" step="100">
+            </label>
+          </div>
+
+          <label class="field">
+            <span>导入配置 JSON</span>
+            <textarea id="importText" rows="5" placeholder="把导出的配置 JSON 粘贴到这里"></textarea>
+          </label>
+          <div class="button-row">
+            <button id="importSettings" class="button button--ghost" type="button">导入配置</button>
+            <button id="resetSettings" class="button button--danger" type="button">恢复默认</button>
+            <span id="saveStatus" class="status" role="status"></span>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <script src="options.js"></script>
+  </body>
+</html>

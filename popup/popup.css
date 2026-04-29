@@ -1,0 +1,148 @@
+:root {
+  --bg: #f4f7fb;
+  --surface: rgba(255, 255, 255, 0.88);
+  --surface-strong: #ffffff;
+  --text: #111827;
+  --muted: #647084;
+  --line: rgba(137, 150, 171, 0.38);
+  --primary: #5b5ff5;
+  --primary-strong: #4238c9;
+  --green: #0e9f9a;
+  --shadow: 0 16px 44px rgba(15, 23, 42, 0.16);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 330px;
+  margin: 0;
+  color: var(--text);
+  background:
+    linear-gradient(rgba(91, 95, 245, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(14, 159, 154, 0.05) 1px, transparent 1px),
+    var(--bg);
+  background-size: 34px 34px;
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.popup {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+  animation: popup-in 220ms ease;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mark {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  color: #fff;
+  background:
+    linear-gradient(145deg, rgba(255,255,255,.22), transparent 42%),
+    linear-gradient(135deg, var(--primary), var(--green));
+  border: 1px solid rgba(255,255,255,.42);
+  border-radius: 12px;
+  box-shadow: 0 10px 28px rgba(91, 95, 245, 0.24);
+  font-weight: 780;
+}
+
+h1,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 15px;
+  line-height: 1.2;
+}
+
+p,
+span {
+  color: var(--muted);
+}
+
+.actions {
+  display: grid;
+  gap: 8px;
+}
+
+button {
+  min-height: 38px;
+  color: var(--text);
+  background: var(--surface-strong);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 150ms ease, border-color 150ms ease, box-shadow 150ms ease, background 150ms ease;
+}
+
+button:hover {
+  border-color: var(--primary);
+  transform: translateY(-1px);
+}
+
+button.primary {
+  color: #fff;
+  background: linear-gradient(135deg, var(--primary), var(--primary-strong) 58%, var(--green));
+  border-color: var(--primary);
+  box-shadow: 0 12px 28px rgba(91, 95, 245, 0.22);
+}
+
+button.primary:hover {
+  box-shadow: 0 16px 32px rgba(91, 95, 245, 0.3);
+}
+
+.info {
+  display: grid;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.info div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 34px;
+  padding: 0 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05);
+}
+
+strong {
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes popup-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .popup,
+  button {
+    animation: none;
+    transition: none;
+  }
+}

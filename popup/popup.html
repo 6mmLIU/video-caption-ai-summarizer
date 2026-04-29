@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Video Caption AI</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="popup">
+      <header>
+        <div class="mark">AI</div>
+        <div>
+          <h1>Video Caption AI</h1>
+          <p id="status">正在检测当前页面</p>
+        </div>
+      </header>
+
+      <div class="actions">
+        <button id="summarize" class="primary" type="button">总结当前视频</button>
+        <button id="togglePanel" type="button">显示 / 折叠面板</button>
+        <button id="openOptions" type="button">打开设置</button>
+      </div>
+
+      <section class="info">
+        <div>
+          <span>平台</span>
+          <strong id="platform">-</strong>
+        </div>
+        <div>
+          <span>字幕轨道</span>
+          <strong id="tracks">-</strong>
+        </div>
+      </section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

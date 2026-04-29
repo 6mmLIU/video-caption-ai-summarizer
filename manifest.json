@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Video Caption AI Summarizer",
+  "version": "0.1.0",
+  "description": "Summarize captions from YouTube, Bilibili, and other video sites with your own AI API.",
+  "action": {
+    "default_title": "Video Caption AI",
+    "default_popup": "popup/popup.html"
+  },
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "options_page": "options/options.html",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "src/content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

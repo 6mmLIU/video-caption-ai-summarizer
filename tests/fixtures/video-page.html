@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Modern AI Video Demo</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0f141f;
+        --panel: rgba(18, 25, 39, .78);
+        --text: #f6f8fb;
+        --muted: #a8b3c4;
+        --line: rgba(148, 163, 184, .22);
+        --accent: #28d7cb;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        background:
+          linear-gradient(rgba(91, 95, 245, .08) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(40, 215, 203, .06) 1px, transparent 1px),
+          var(--bg);
+        background-size: 44px 44px;
+        font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      main {
+        width: min(1080px, calc(100vw - 40px));
+        margin: 0 auto;
+        padding: 72px 0;
+      }
+
+      h1 {
+        margin: 0 0 12px;
+        font-size: clamp(34px, 6vw, 64px);
+        line-height: 1.02;
+        letter-spacing: 0;
+      }
+
+      p {
+        max-width: 680px;
+        margin: 0 0 28px;
+        color: var(--muted);
+        font-size: 17px;
+      }
+
+      .stage {
+        display: grid;
+        gap: 18px;
+        padding: 18px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        box-shadow: 0 28px 90px rgba(0, 0, 0, .34);
+        backdrop-filter: blur(18px);
+      }
+
+      video {
+        display: block;
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        background:
+          linear-gradient(135deg, rgba(91, 95, 245, .24), transparent 44%),
+          linear-gradient(315deg, rgba(40, 215, 203, .2), transparent 42%),
+          #111827;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+      }
+
+      .transcript {
+        color: var(--muted);
+      }
+
+      .transcript strong {
+        color: var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Modern AI Video Demo</h1>
+      <p>本页用于测试扩展在普通 HTML5 视频页上的字幕轨道识别、浮动面板注入和视觉表现。</p>
+      <section class="stage">
+        <video controls crossorigin="anonymous">
+          <track kind="subtitles" srclang="zh" label="中文测试字幕" src="/captions.zh.vtt" default>
+        </video>
+        <div class="transcript">
+          <strong>Transcript fallback:</strong>
+          这段可见文本用于模拟页面 transcript 区域，扩展应优先读取视频 track 字幕。
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
