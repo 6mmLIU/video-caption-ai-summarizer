@@ -1,4 +1,9 @@
 (() => {
+  if (window.__VCS_CONTENT_LOADED__) {
+    return;
+  }
+  window.__VCS_CONTENT_LOADED__ = true;
+
   const PANEL_ID = "vcs-root";
   const PAGE_STYLE_ID = "vcs-page-polish";
   const AI_MARK_URL = chrome.runtime.getURL("icons/ai-mark.png");
@@ -39,6 +44,9 @@
   let root = null;
   let shadow = null;
   let lastUrl = location.href;
+  let lastPageKey = getPageKey();
+  let refreshRunId = 0;
+  let transcriptRunId = 0;
   let refreshTimer = null;
   let statusSwapTimer = null;
   let previewPromise = null;
@@ -156,8 +164,7 @@
 
   function observeNavigation() {
     const observer = new MutationObserver(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
+      if (hasPageContextChanged()) {
         scheduleRefresh();
       } else if (!state.mounted && shouldShowPanel()) {
         scheduleRefresh();
@@ -167,17 +174,43 @@
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
     setInterval(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
+      if (hasPageContextChanged()) {
         scheduleRefresh();
       }
     }, 1000);
   }
 
+  function hasPageContextChanged() {
+    const nextUrl = location.href;
+    const nextPageKey = getPageKey();
+    if (nextUrl !== lastUrl || nextPageKey !== lastPageKey) {
+      lastUrl = nextUrl;
+      lastPageKey = nextPageKey;
+      return true;
+    }
+    return false;
+  }
+
+  function getPageKey() {
+    const host = location.hostname.replace(/^www\./, "");
+    if (host.includes("youtube.com") || host === "youtu.be") {
+      return `youtube:${getYouTubeVideoId() || location.pathname}`;
+    }
+    if (host.includes("bilibili.com")) {
+      const pageNumber = new URLSearchParams(location.search).get("p") || "1";
+      return `bilibili:${getBvidFromUrl() || location.pathname}:${pageNumber}`;
+    }
+    return `${location.origin}${location.pathname}${location.search}`;
+  }
+
   function scheduleRefresh() {
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => {
+      refreshRunId += 1;
+      transcriptRunId += 1;
+      previewPromise = null;
       state.tracks = [];
+      state.selectedTrackId = "";
       state.transcript = "";
       state.lastSummary = "";
       resetSummaryStream();
@@ -240,14 +273,15 @@
 
   function placeRoot() {
     const target = findEmbedTarget();
-    if (target && target !== document.documentElement && (root.parentElement !== target || target.firstElementChild !== root)) {
-      target.insertBefore(root, target.firstChild);
+    const before = target ? getRootInsertBefore(target) : null;
+    if (target && target !== document.documentElement && (root.parentElement !== target || root.nextSibling !== before)) {
+      target.insertBefore(root, before);
       state.embedded = true;
     } else if (target && root.parentElement !== target) {
       if (target === document.documentElement) {
         target.appendChild(root);
       } else {
-        target.insertBefore(root, target.firstChild);
+        target.insertBefore(root, before);
       }
       state.embedded = target !== document.documentElement;
     } else if (!root.parentElement) {
@@ -272,8 +306,51 @@
     return document.documentElement;
   }
 
+  function getRootInsertBefore(target) {
+    if (!target || target === document.documentElement) {
+      return null;
+    }
+    if (isBilibiliPage()) {
+      return getBilibiliPanelInsertBefore(target);
+    }
+    return target.firstElementChild === root ? root.nextSibling : target.firstChild;
+  }
+
+  function getBilibiliPanelInsertBefore(target) {
+    const children = [...target.children].filter((child) => child !== root);
+    const authorCard = children.find(isBilibiliAuthorCard) || children[0];
+    let next = authorCard?.nextSibling || null;
+    while (next === root) {
+      next = next.nextSibling;
+    }
+    return next;
+  }
+
+  function isBilibiliAuthorCard(element) {
+    const value = `${element.id || ""} ${element.className || ""}`.toLowerCase();
+    if (/(^|\s)(up|owner|author|user|member|staff)(-|_|$|\s)/i.test(value)) {
+      return true;
+    }
+    return Boolean(element.querySelector?.([
+      "[class*='up-info' i]",
+      "[class*='up-name' i]",
+      "[class*='owner' i]",
+      "[class*='author' i]",
+      "[class*='avatar' i]",
+      "[data-v-][class*='up' i]"
+    ].join(",")));
+  }
+
+  function isBilibiliPage() {
+    return location.hostname.replace(/^www\./, "").includes("bilibili.com");
+  }
+
   async function refreshTracks() {
+    const refreshId = ++refreshRunId;
+    const pageKey = getPageKey();
     const refreshStartedAt = performance.now();
+    transcriptRunId += 1;
+    previewPromise = null;
     state.platform = detectPlatform() || {
       id: "generic",
       name: "Generic Video",
@@ -283,6 +360,8 @@
       scheduleCloseYouTubeTranscriptPanel({ attempts: 4, delayMs: 120 });
     }
     state.title = getVideoTitle();
+    state.tracks = [];
+    state.selectedTrackId = "";
     state.transcript = "";
     state.status = t("content.status.readingTracks");
     state.statusTone = "busy";
@@ -293,6 +372,9 @@
 
     try {
       const tracks = await getTracksForPlatform(state.platform);
+      if (!isCurrentRefresh(refreshId, pageKey)) {
+        return;
+      }
       state.tracks = tracks;
       state.selectedTrackId = chooseDefaultTrackId(tracks);
       state.status = tracks.length
@@ -300,7 +382,11 @@
         : t("content.status.noTracks");
       state.statusTone = tracks.length ? "done" : "neutral";
     } catch (error) {
+      if (!isCurrentRefresh(refreshId, pageKey)) {
+        return;
+      }
       state.tracks = [];
+      state.selectedTrackId = "";
       state.status = t("content.status.trackReadFailed", { message: error.message });
       state.statusTone = "error";
     } finally {
@@ -308,13 +394,19 @@
       if (remainingAnimationMs > 0) {
         await delay(remainingAnimationMs);
       }
+      if (!isCurrentRefresh(refreshId, pageKey)) {
+        return;
+      }
       state.refreshing = false;
+      render();
+      if (state.tracks.length) {
+        hydrateTranscriptPreview({ silent: true, pageKey }).catch(() => {});
+      }
     }
+  }
 
-    render();
-    if (state.tracks.length) {
-      hydrateTranscriptPreview({ silent: true }).catch(() => {});
-    }
+  function isCurrentRefresh(refreshId, pageKey) {
+    return refreshId === refreshRunId && pageKey === getPageKey();
   }
 
   function delay(ms) {
@@ -422,17 +514,19 @@
   }
 
   async function getYouTubeTracks() {
-    const scriptsText = getPageScriptsText();
-    const response = getJsonAssignment("ytInitialPlayerResponse") || await fetchYouTubePlayerResponse();
-    let captionTracks = response?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    const videoId = getYouTubeVideoId();
+    const response = getCurrentYouTubePlayerResponse(videoId)
+      || await fetchYouTubePlayerResponse(videoId)
+      || getJsonAssignment("ytInitialPlayerResponse", (value) => isYouTubePlayerResponseForVideo(value, videoId));
+    let captionTracks = getYouTubeCaptionTracksFromResponse(response, videoId);
 
     if (!captionTracks.length) {
-      captionTracks = extractYouTubeCaptionTracks(scriptsText);
+      captionTracks = extractYouTubeCaptionTracks(getPageScriptsText(), videoId);
     }
 
     if (!captionTracks.length) {
-      const watchHtml = await fetchYouTubeWatchHtml();
-      captionTracks = extractYouTubeCaptionTracks(watchHtml);
+      const watchHtml = await fetchYouTubeWatchHtml(videoId);
+      captionTracks = extractYouTubeCaptionTracks(watchHtml, videoId);
     }
 
     return captionTracks
@@ -446,13 +540,34 @@
       }));
   }
 
-  async function fetchYouTubePlayerResponse() {
-    const html = await fetchYouTubeWatchHtml();
-    return getJsonAssignmentFromText(html, "ytInitialPlayerResponse");
+  function getCurrentYouTubePlayerResponse(videoId) {
+    const candidates = [
+      () => globalThis.ytInitialPlayerResponse,
+      () => document.querySelector("ytd-watch-flexy")?.playerResponse,
+      () => document.querySelector("ytd-watch-flexy")?.playerData?.playerResponse,
+      () => document.querySelector("#movie_player")?.getPlayerResponse?.()
+    ];
+
+    for (const readCandidate of candidates) {
+      try {
+        const value = readCandidate();
+        if (isYouTubePlayerResponseForVideo(value, videoId)) {
+          return value;
+        }
+      } catch (_error) {
+        // Page-owned player objects are not always accessible from the content script.
+      }
+    }
+    return null;
   }
 
-  async function fetchYouTubeWatchHtml() {
-    const videoId = getYouTubeVideoId();
+  async function fetchYouTubePlayerResponse(videoId = getYouTubeVideoId()) {
+    const html = await fetchYouTubeWatchHtml(videoId);
+    const response = getJsonAssignmentFromText(html, "ytInitialPlayerResponse");
+    return isYouTubePlayerResponseForVideo(response, videoId) ? response : null;
+  }
+
+  async function fetchYouTubeWatchHtml(videoId = getYouTubeVideoId()) {
     if (!videoId) {
       return "";
     }
@@ -470,6 +585,33 @@
     }
   }
 
+  function getYouTubeCaptionTracksFromResponse(response, videoId) {
+    if (!isYouTubePlayerResponseForVideo(response, videoId)) {
+      return [];
+    }
+    return filterYouTubeCaptionTracksForVideo(
+      response?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [],
+      videoId
+    );
+  }
+
+  function isYouTubePlayerResponseForVideo(response, videoId) {
+    if (!response || typeof response !== "object") {
+      return false;
+    }
+    if (!videoId) {
+      return true;
+    }
+
+    const responseVideoId = response.videoDetails?.videoId || response.videoDetails?.externalVideoId || "";
+    if (responseVideoId && responseVideoId === videoId) {
+      return true;
+    }
+
+    const tracks = response?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    return filterYouTubeCaptionTracksForVideo(tracks, videoId).length > 0;
+  }
+
   function getYouTubeVideoId() {
     const host = location.hostname.replace(/^www\./, "");
     if (host === "youtu.be") {
@@ -483,36 +625,152 @@
 
   async function getBilibiliTracks() {
     const initialState = getJsonAssignment("__INITIAL_STATE__") || {};
-    const videoData = initialState.videoData || initialState.videoInfo || {};
-    const bvid = videoData.bvid || initialState.bvid || getBvidFromUrl();
-    const aid = videoData.aid || initialState.aid;
-    const cid = videoData.cid || initialState.cid || getCidFromPage(initialState);
+    const playInfo = getJsonAssignment("__playinfo__") || {};
+    const pageTracks = normalizeBilibiliSubtitleTracks([
+      ...collectBilibiliSubtitleItems(initialState),
+      ...collectBilibiliSubtitleItems(playInfo)
+    ]);
 
-    if (!cid || (!bvid && !aid)) {
-      return [];
+    if (pageTracks.length) {
+      return pageTracks;
     }
 
-    const api = new URL("https://api.bilibili.com/x/player/v2");
-    api.searchParams.set("cid", cid);
-    if (bvid) {
-      api.searchParams.set("bvid", bvid);
-    } else {
-      api.searchParams.set("aid", aid);
+    const identity = getBilibiliVideoIdentity(initialState);
+    const apiUrls = getBilibiliPlayerApiUrls(identity);
+    for (const url of apiUrls) {
+      try {
+        const response = await extensionFetch(url);
+        const data = JSON.parse(response.text);
+        const tracks = normalizeBilibiliSubtitleTracks(collectBilibiliSubtitleItems(data));
+        if (tracks.length) {
+          return tracks;
+        }
+      } catch (_error) {
+        // Bilibili may reject unsigned or stale player API URLs. Try the next source.
+      }
     }
 
-    const response = await extensionFetch(api.toString());
-    const data = JSON.parse(response.text);
-    const subtitles = data?.data?.subtitle?.subtitles || [];
+    return [];
+  }
 
-    return subtitles
-      .filter((item) => item.subtitle_url)
-      .map((item, index) => ({
+  function collectBilibiliSubtitleItems(value, depth = 0, output = []) {
+    if (!value || depth > 8) {
+      return output;
+    }
+
+    if (Array.isArray(value)) {
+      if (value.some(isBilibiliSubtitleItem)) {
+        output.push(...value.filter(isBilibiliSubtitleItem));
+        return output;
+      }
+      value.forEach((item) => collectBilibiliSubtitleItems(item, depth + 1, output));
+      return output;
+    }
+
+    if (typeof value !== "object") {
+      return output;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      if (/^(subtitle|subtitles|subtitleList|subtitle_list|list|data|result|videoData|videoInfo|epInfo)$/i.test(key)) {
+        collectBilibiliSubtitleItems(child, depth + 1, output);
+      } else if (depth < 3 && child && typeof child === "object") {
+        collectBilibiliSubtitleItems(child, depth + 1, output);
+      }
+    }
+
+    return output;
+  }
+
+  function isBilibiliSubtitleItem(item) {
+    return Boolean(
+      item
+      && typeof item === "object"
+      && (item.subtitle_url || item.url)
+      && (item.lan || item.lan_doc || item.id)
+    );
+  }
+
+  function normalizeBilibiliSubtitleTracks(items) {
+    const seen = new Set();
+    return items
+      .map((item, index) => {
+        const url = normalizeBilibiliSubtitleUrl(item.subtitle_url || item.url || "");
+        if (!url || seen.has(url)) {
+          return null;
+        }
+        seen.add(url);
+        return {
+          item,
+          index,
+          url
+        };
+      })
+      .filter(Boolean)
+      .map(({ item, index, url }) => ({
         id: `bilibili-${index}`,
         label: item.lan_doc || item.lan || `Subtitle ${index + 1}`,
         language: item.lan || "auto",
         source: "bilibili",
-        url: normalizeUrl(item.subtitle_url)
+        url
       }));
+  }
+
+  function normalizeBilibiliSubtitleUrl(url) {
+    const value = String(url || "").trim();
+    if (!value) {
+      return "";
+    }
+    return normalizeUrl(value);
+  }
+
+  function getBilibiliVideoIdentity(initialState) {
+    const videoData = initialState.videoData || initialState.videoInfo || {};
+    const epInfo = initialState.epInfo || {};
+    const idsFromText = getBilibiliIdsFromText(getPageScriptsText());
+    return {
+      bvid: videoData.bvid || initialState.bvid || idsFromText.bvid || getBvidFromUrl(),
+      aid: videoData.aid || initialState.aid || idsFromText.aid,
+      cid: videoData.cid || epInfo.cid || initialState.cid || getCidFromPage(initialState) || idsFromText.cid || getBilibiliCidFromRuntimeUrls()
+    };
+  }
+
+  function getBilibiliPlayerApiUrls(identity) {
+    const urls = [];
+    urls.push(...getBilibiliRuntimePlayerApiUrls(identity.cid));
+
+    if (identity.cid && (identity.bvid || identity.aid)) {
+      for (const pathname of ["/x/player/v2", "/x/player/wbi/v2"]) {
+        const api = new URL(`https://api.bilibili.com${pathname}`);
+        api.searchParams.set("cid", identity.cid);
+        if (identity.bvid) {
+          api.searchParams.set("bvid", identity.bvid);
+        } else {
+          api.searchParams.set("aid", identity.aid);
+        }
+        urls.push(api.toString());
+      }
+    }
+
+    return uniqueValues(urls);
+  }
+
+  function getBilibiliRuntimePlayerApiUrls(cid = "") {
+    return performance.getEntriesByType("resource")
+      .map((entry) => entry.name || "")
+      .filter(Boolean)
+      .filter((url) => {
+        const parsed = safeUrl(url);
+        if (!parsed || !parsed.hostname.includes("bilibili.com")) {
+          return false;
+        }
+        const isPlayerApi = parsed.pathname.includes("/x/player/v2")
+          || parsed.pathname.includes("/x/player/wbi/v2");
+        if (!isPlayerApi || !parsed.searchParams.has("cid")) {
+          return false;
+        }
+        return !cid || parsed.searchParams.get("cid") === String(cid);
+      });
   }
 
   function getHtml5Tracks() {
@@ -547,19 +805,6 @@
         return transcript;
       }
 
-      for (const fallbackTrack of state.tracks.filter((item) => item.source === "youtube" && item.id !== track.id)) {
-        const fallbackTranscript = await loadYouTubeTrackTranscript(fallbackTrack);
-        if (fallbackTranscript) {
-          state.selectedTrackId = fallbackTrack.id;
-          return fallbackTranscript;
-        }
-      }
-
-      const visibleTranscript = getVisibleTranscript();
-      if (visibleTranscript) {
-        return visibleTranscript;
-      }
-
       throw new Error(t("content.error.emptyYouTube"));
     }
 
@@ -582,11 +827,30 @@
 
   async function loadYouTubeTrackTranscript(track) {
     const sourceUrls = uniqueValues([
-      ...getYouTubeRuntimeTimedTextUrls(track),
-      track.url
+      track.url,
+      ...getYouTubeRuntimeTimedTextUrls(track)
     ]);
-    const formats = ["json3", "srv3", "vtt", ""];
 
+    const transcript = await fetchYouTubeTranscriptFromSourceUrls(sourceUrls);
+    if (transcript) {
+      return transcript;
+    }
+
+    const translatedTranscript = await loadYouTubeTranslatedTrackTranscript(track);
+    if (translatedTranscript) {
+      return translatedTranscript;
+    }
+
+    const transcriptPanelText = await loadYouTubeTranscriptPanelText();
+    if (transcriptPanelText && transcriptMatchesTrackLanguage(track, transcriptPanelText)) {
+      return transcriptPanelText;
+    }
+
+    return "";
+  }
+
+  async function fetchYouTubeTranscriptFromSourceUrls(sourceUrls) {
+    const formats = ["json3", "srv3", "vtt", ""];
     for (const sourceUrl of sourceUrls) {
       const candidateUrls = buildYouTubeTimedTextUrls(sourceUrl, formats);
       for (const { url, format } of candidateUrls) {
@@ -599,58 +863,200 @@
             return transcript.trim();
           }
         } catch (_error) {
-          // Try the next runtime URL, format, or fallback track.
+          // Try the next runtime URL or format.
         }
       }
-    }
-
-    const transcriptPanelText = await loadYouTubeTranscriptPanelText();
-    if (transcriptPanelText) {
-      return transcriptPanelText;
     }
 
     return "";
   }
 
+  async function loadYouTubeTranslatedTrackTranscript(track) {
+    const targetLanguage = getYouTubeTranslationTargetLanguage(track);
+    if (!targetLanguage) {
+      return "";
+    }
+
+    const sourceUrls = state.tracks
+      .filter((sourceTrack) => sourceTrack.source === "youtube" && sourceTrack.id !== track.id)
+      .flatMap((sourceTrack) => [
+        sourceTrack.url,
+        ...getYouTubeRuntimeTimedTextUrls(sourceTrack)
+      ])
+      .map((url) => addYouTubeTranslationParam(url, targetLanguage));
+    const transcript = await fetchYouTubeTranscriptFromSourceUrls(uniqueValues(sourceUrls));
+    return transcript && transcriptMatchesTrackLanguage(track, transcript) ? transcript : "";
+  }
+
+  function getYouTubeTranslationTargetLanguage(track) {
+    const trackUrl = safeUrl(track?.url);
+    return trackUrl?.searchParams.get("lang") || track?.language || "";
+  }
+
+  function addYouTubeTranslationParam(url, targetLanguage) {
+    const parsed = safeUrl(url);
+    if (!parsed || !targetLanguage) {
+      return "";
+    }
+    parsed.searchParams.set("tlang", targetLanguage);
+    return parsed.toString();
+  }
+
   function getYouTubeRuntimeTimedTextUrls(track) {
     const trackUrl = safeUrl(track?.url);
-    const wantedLanguage = trackUrl?.searchParams.get("lang") || track?.language || "";
-    const wantedName = trackUrl?.searchParams.get("name") || "";
+    const wantedTrack = getYouTubeTimedTextTrackIdentity(track, trackUrl);
+    const currentVideoId = getYouTubeVideoId();
     const resources = performance.getEntriesByType("resource")
       .filter((entry) => typeof entry.name === "string" && entry.name.includes("/api/timedtext"))
-      .map((entry, index) => ({
-        url: entry.name,
-        startTime: entry.startTime || index,
-        score: scoreYouTubeTimedTextUrl(entry.name, wantedLanguage, wantedName)
-      }))
-      .filter((entry) => entry.score > 0)
+      .map((entry, index) => {
+        const scopedUrl = scopeYouTubeRuntimeTimedTextUrlToTrack(entry.name, trackUrl);
+        return {
+          originalUrl: entry.name,
+          url: scopedUrl,
+          startTime: entry.startTime || index,
+          score: scoreYouTubeTimedTextUrl(scopedUrl, wantedTrack)
+        };
+      })
+      .filter((entry) => entry.score > 0
+        && isYouTubeTimedTextUrlForVideo(entry.originalUrl, currentVideoId)
+        && isYouTubeTimedTextUrlForVideo(entry.url, currentVideoId))
       .sort((a, b) => b.score - a.score || b.startTime - a.startTime);
 
     return resources.map((entry) => entry.url);
   }
 
-  function scoreYouTubeTimedTextUrl(url, wantedLanguage, wantedName) {
+  function getYouTubeTimedTextTrackIdentity(track, trackUrl = safeUrl(track?.url)) {
+    return {
+      language: trackUrl?.searchParams.get("lang") || track?.language || "",
+      name: trackUrl?.searchParams.get("name") || "",
+      kind: trackUrl?.searchParams.get("kind") || ""
+    };
+  }
+
+  function scopeYouTubeRuntimeTimedTextUrlToTrack(runtimeUrl, trackUrl) {
+    const runtime = safeUrl(runtimeUrl);
+    if (!runtime || !trackUrl) {
+      return runtimeUrl;
+    }
+
+    const scoped = new URL(trackUrl.toString());
+    const transferableParams = [
+      "pot",
+      "c",
+      "cver",
+      "cplayer",
+      "cplatform",
+      "cbrand",
+      "cbr",
+      "cos",
+      "cosver",
+      "xorb",
+      "xobt",
+      "xovt"
+    ];
+
+    for (const key of transferableParams) {
+      const value = runtime.searchParams.get(key);
+      if (value) {
+        scoped.searchParams.set(key, value);
+      }
+    }
+
+    const runtimeFormat = runtime.searchParams.get("fmt");
+    if (runtimeFormat) {
+      scoped.searchParams.set("fmt", runtimeFormat);
+    }
+
+    return scoped.toString();
+  }
+
+  function isYouTubeTimedTextUrlForVideo(url, videoId) {
+    const urlVideoId = getYouTubeUrlVideoId(url);
+    return !videoId || !urlVideoId || urlVideoId === videoId;
+  }
+
+  function scoreYouTubeTimedTextUrl(url, wantedTrack) {
     const parsed = safeUrl(url);
     if (!parsed) {
       return 0;
     }
 
     let score = 1;
-    const language = parsed.searchParams.get("lang") || "";
+    const language = normalizeYouTubeTimedTextParam(parsed.searchParams.get("lang") || "");
     const name = parsed.searchParams.get("name") || "";
+    const kind = normalizeYouTubeTimedTextParam(parsed.searchParams.get("kind") || "");
+    const wantedLanguage = normalizeYouTubeTimedTextParam(wantedTrack.language);
+    const wantedName = wantedTrack.name || "";
+    const wantedKind = normalizeYouTubeTimedTextParam(wantedTrack.kind);
+
+    if (wantedLanguage) {
+      if (language !== wantedLanguage) {
+        return 0;
+      }
+      score += 40;
+    }
+    if (wantedName) {
+      if (name !== wantedName) {
+        return 0;
+      }
+      score += 20;
+    }
+    if (wantedKind) {
+      if (kind !== wantedKind) {
+        return 0;
+      }
+      score += 8;
+    }
     if (parsed.searchParams.has("pot")) {
       score += 100;
     }
     if (parsed.searchParams.get("fmt") === "json3") {
       score += 20;
     }
-    if (wantedLanguage && language.toLowerCase() === wantedLanguage.toLowerCase()) {
-      score += 40;
-    }
-    if (wantedName && name === wantedName) {
-      score += 20;
-    }
     return score;
+  }
+
+  function normalizeYouTubeTimedTextParam(value) {
+    return String(value || "").trim().toLowerCase();
+  }
+
+  function transcriptMatchesTrackLanguage(track, transcript) {
+    const expected = getTrackLanguageFamily(track);
+    const actual = detectTranscriptLanguageFamily(transcript);
+    return !expected || !actual || expected === actual;
+  }
+
+  function getTrackLanguageFamily(track) {
+    const value = normalizeSearchText(`${track?.language || ""} ${track?.label || ""}`);
+    if (/(^|[^a-z])zh([^a-z]|$)|chinese|中文|汉语|漢語|普通话|國語|国语|简体|繁体|繁體/.test(value)) {
+      return "zh";
+    }
+    if (/(^|[^a-z])en([^a-z]|$)|english|英语|英文/.test(value)) {
+      return "en";
+    }
+    return "";
+  }
+
+  function detectTranscriptLanguageFamily(transcript) {
+    const sample = getTranscriptTextLines(transcript)
+      .slice(0, 40)
+      .join(" ");
+    const cjkCount = (sample.match(/[\u3400-\u9fff]/g) || []).length;
+    const latinWordCount = (sample.match(/[a-z][a-z']+/gi) || []).length;
+
+    if (cjkCount >= 8 && cjkCount >= latinWordCount) {
+      return "zh";
+    }
+    if (latinWordCount >= 10 && cjkCount < latinWordCount * 0.25) {
+      return "en";
+    }
+    if (cjkCount >= 4) {
+      return "zh";
+    }
+    if (latinWordCount >= 6) {
+      return "en";
+    }
+    return "";
   }
 
   function buildYouTubeTimedTextUrls(sourceUrl, formats) {
@@ -1299,6 +1705,8 @@
       return previewPromise;
     }
 
+    const loadId = ++transcriptRunId;
+    const pageKey = options.pageKey || getPageKey();
     state.previewLoading = true;
     if (!silent) {
       setStatus(t("content.status.readingTranscript"), "busy");
@@ -1307,7 +1715,10 @@
 
     previewPromise = loadSelectedTranscript()
       .then((transcript) => {
-        const cleanText = String(transcript || "").trim();
+        if (!isCurrentTranscriptLoad(loadId, pageKey)) {
+          throw new Error(t("content.error.transcriptChanged"));
+        }
+        const cleanText = normalizeLoadedTranscript(transcript);
         if (!cleanText) {
           throw new Error(t("content.error.noTranscript"));
         }
@@ -1319,18 +1730,82 @@
         return cleanText;
       })
       .catch((error) => {
-        if (!silent) {
+        if (isCurrentTranscriptLoad(loadId, pageKey)) {
           setStatus(t("content.status.readFailed", { message: error.message }), "error");
         }
         throw error;
       })
       .finally(() => {
+        if (!isCurrentTranscriptLoad(loadId, pageKey)) {
+          return;
+        }
         state.previewLoading = false;
         previewPromise = null;
         render();
       });
 
     return previewPromise;
+  }
+
+  function normalizeLoadedTranscript(transcript) {
+    const lines = getTranscriptTextLines(transcript);
+    if (!lines.length) {
+      return String(transcript || "").trim();
+    }
+    return removeDuplicateTranscriptLines(lines).join("\n").trim();
+  }
+
+  function removeDuplicateTranscriptLines(lines) {
+    const output = [];
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const current = parseTranscriptLineParts(lines[index]);
+      const previous = parseTranscriptLineParts(output[output.length - 1] || "");
+      const next = parseTranscriptLineParts(lines[index + 1] || "");
+
+      if (!current.time && current.key) {
+        if ((previous.time && previous.key === current.key) || (next.time && next.key === current.key)) {
+          continue;
+        }
+      }
+
+      if (current.time && current.key && !previous.time && previous.key === current.key) {
+        output.pop();
+      }
+
+      const last = parseTranscriptLineParts(output[output.length - 1] || "");
+      if (last.key && last.key === current.key && last.time === current.time) {
+        continue;
+      }
+
+      output.push(lines[index]);
+    }
+
+    return output;
+  }
+
+  function parseTranscriptLineParts(line) {
+    const value = String(line || "").trim();
+    const bracketed = value.match(/^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.*)$/);
+    const inline = bracketed ? null : parseTimeContentLine(value);
+    const time = bracketed?.[1] || inline?.time || "";
+    const content = (bracketed?.[2] || inline?.content || value).trim();
+    return {
+      time,
+      content,
+      key: normalizeTranscriptContent(content)
+    };
+  }
+
+  function normalizeTranscriptContent(content) {
+    return String(content || "")
+      .replace(/\s+/g, "")
+      .replace(/[，。！？、；：,.!?;:"“”'‘’()[\]【】]/g, "")
+      .toLowerCase();
+  }
+
+  function isCurrentTranscriptLoad(loadId, pageKey) {
+    return loadId === transcriptRunId && pageKey === getPageKey();
   }
 
   function swapStatusText(element, nextText) {
@@ -1433,7 +1908,6 @@
           </div>
 
           <button id="vcs-summarize" class="vcs-primary" type="button">
-            <span class="vcs-primary-icon">${sparkIcon()}</span>
             <span class="vcs-primary-label">${escapeHtml(summarizeLabel)}</span>
           </button>
 
@@ -1441,6 +1915,7 @@
             <summary>
               <span class="vcs-result-title">${escapeHtml(t("content.label.summary"))}</span>
               <button id="vcs-copy-summary" class="vcs-tool-button ${state.copyingSummary ? "is-busy" : ""}" type="button" title="${escapeHtml(t("content.title.copySummary"))}" aria-label="${escapeHtml(t("content.title.copySummary"))}">${copyButtonIcon(state.copyingSummary)}</button>
+              <span class="vcs-details-chevron" aria-hidden="true">${chevronRightIcon()}</span>
             </summary>
             <div class="vcs-summary-shell ${state.summaryStreaming ? "is-streaming" : ""}" role="region" aria-label="${escapeHtml(t("content.label.markdownSummary"))}" aria-busy="${state.summaryStreaming ? "true" : "false"}" tabindex="0">
               <article id="vcs-summary" class="vcs-markdown">${markdownToHtml(state.lastSummary)}</article>
@@ -1456,7 +1931,10 @@
           </div>
 
           <details class="vcs-details vcs-transcript-details" open>
-            <summary>${escapeHtml(t("content.label.transcriptPreview"))}</summary>
+            <summary>
+              <span class="vcs-details-title">${escapeHtml(t("content.label.transcriptPreview"))}</span>
+              <span class="vcs-details-chevron" aria-hidden="true">${chevronRightIcon()}</span>
+            </summary>
             <div id="vcs-preview" class="vcs-transcript-box" role="region" aria-label="${escapeHtml(t("content.label.transcriptPreviewAria"))}" data-empty="${state.transcript ? "false" : "true"}">${previewContent}</div>
           </details>
         </section>
@@ -1484,6 +1962,8 @@
       render();
     });
     shadow.querySelector("#vcs-track")?.addEventListener("change", (event) => {
+      transcriptRunId += 1;
+      previewPromise = null;
       state.selectedTrackId = event.target.value;
       state.transcript = "";
       lastActiveTranscriptIndex = -1;
@@ -1663,8 +2143,7 @@
     lastActiveTranscriptIndex = activeIndex;
 
     if (!isElementInsideContainer(activeRow, preview)) {
-      activeRow.scrollIntoView({
-        block: "nearest",
+      scrollElementInsideContainer(activeRow, preview, {
         behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
       });
     }
@@ -1674,6 +2153,31 @@
     const elementRect = element.getBoundingClientRect();
     const containerRect = container.getBoundingClientRect();
     return elementRect.top >= containerRect.top + 8 && elementRect.bottom <= containerRect.bottom - 8;
+  }
+
+  function scrollElementInsideContainer(element, container, options = {}) {
+    const elementRect = element.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    const padding = 14;
+    const topOverflow = elementRect.top - containerRect.top - padding;
+    const bottomOverflow = elementRect.bottom - containerRect.bottom + padding;
+    let nextScrollTop = container.scrollTop;
+
+    if (topOverflow < 0) {
+      nextScrollTop += topOverflow;
+    } else if (bottomOverflow > 0) {
+      nextScrollTop += bottomOverflow;
+    }
+
+    nextScrollTop = Math.max(0, Math.min(nextScrollTop, container.scrollHeight - container.clientHeight));
+    if (Math.abs(nextScrollTop - container.scrollTop) < 1) {
+      return;
+    }
+
+    container.scrollTo({
+      top: nextScrollTop,
+      behavior: options.behavior || "auto"
+    });
   }
 
   async function copyTranscript() {
@@ -1839,10 +2343,10 @@
     return document.querySelector("h1")?.textContent?.trim() || document.title.trim();
   }
 
-  function getJsonAssignment(name) {
+  function getJsonAssignment(name, validator = null) {
     for (const script of document.scripts) {
       const value = getJsonAssignmentFromText(script.textContent || "", name);
-      if (value) {
+      if (value && (!validator || validator(value))) {
         return value;
       }
     }
@@ -1856,7 +2360,7 @@
       .join("\n");
   }
 
-  function extractYouTubeCaptionTracks(text) {
+  function extractYouTubeCaptionTracks(text, videoId = "") {
     if (!text) {
       return [];
     }
@@ -1872,8 +2376,9 @@
       if (arrayText) {
         try {
           const tracks = JSON.parse(arrayText);
-          if (Array.isArray(tracks) && tracks.some((track) => track?.baseUrl)) {
-            return tracks;
+          const currentTracks = filterYouTubeCaptionTracksForVideo(tracks, videoId);
+          if (currentTracks.length) {
+            return currentTracks;
           }
         } catch (_error) {
           // Keep scanning in case the first match is not the player caption list.
@@ -1884,6 +2389,28 @@
     }
 
     return [];
+  }
+
+  function filterYouTubeCaptionTracksForVideo(tracks, videoId = "") {
+    if (!Array.isArray(tracks)) {
+      return [];
+    }
+
+    const usableTracks = tracks.filter((track) => track?.baseUrl);
+    if (!videoId) {
+      return usableTracks;
+    }
+
+    const tracksWithVideoId = usableTracks.filter((track) => getYouTubeUrlVideoId(track.baseUrl));
+    if (!tracksWithVideoId.length) {
+      return usableTracks;
+    }
+
+    return usableTracks.filter((track) => getYouTubeUrlVideoId(track.baseUrl) === videoId);
+  }
+
+  function getYouTubeUrlVideoId(url) {
+    return safeUrl(url)?.searchParams.get("v") || "";
   }
 
   function getJsonAssignmentFromText(text, name) {
@@ -2011,10 +2538,46 @@
     return match?.[1] || "";
   }
 
+  function getBilibiliIdsFromText(text) {
+    const source = String(text || "");
+    const bvid = source.match(/"bvid"\s*:\s*"(BV[^"]+)"/i)?.[1]
+      || source.match(/\b(BV[0-9A-Za-z]+)/)?.[1]
+      || "";
+    const aid = source.match(/"aid"\s*:\s*(\d+)/i)?.[1]
+      || source.match(/"aid"\s*:\s*"(\d+)"/i)?.[1]
+      || "";
+    const cid = source.match(/"cid"\s*:\s*(\d+)/i)?.[1]
+      || source.match(/"cid"\s*:\s*"(\d+)"/i)?.[1]
+      || "";
+    return { bvid, aid, cid };
+  }
+
+  function getBilibiliCidFromRuntimeUrls() {
+    const urls = [
+      location.href,
+      ...performance.getEntriesByType("resource").map((entry) => entry.name || "")
+    ];
+    for (const value of urls) {
+      const url = safeUrl(value);
+      const cid = url?.searchParams.get("cid");
+      if (cid) {
+        return cid;
+      }
+    }
+    return "";
+  }
+
   function getCidFromPage(initialState) {
-    const pages = initialState.videoData?.pages || [];
-    const page = pages.find((item) => String(item.page) === new URLSearchParams(location.search).get("p"));
-    return page?.cid || pages[0]?.cid || "";
+    const videoData = initialState.videoData || initialState.videoInfo || {};
+    const pages = videoData.pages || initialState.pages || [];
+    const pageNumber = new URLSearchParams(location.search).get("p") || "1";
+    const page = pages.find((item) => String(item.page) === pageNumber)
+      || pages[Number(pageNumber) - 1]
+      || pages[0];
+    return videoData.cid
+      || initialState.epInfo?.cid
+      || page?.cid
+      || "";
   }
 
   function getVisibleTranscript() {
@@ -2077,7 +2640,12 @@
 
   function parseBilibiliTranscript(text) {
     const json = JSON.parse(text);
-    const lines = (json.body || [])
+    const body = Array.isArray(json?.body)
+      ? json.body
+      : Array.isArray(json?.data?.body)
+        ? json.data.body
+        : [];
+    const lines = body
       .map((item) => {
         const start = formatSeconds(Number(item.from) || 0);
         const content = String(item.content || "").replace(/\s+/g, " ").trim();
@@ -2328,12 +2896,8 @@
     return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M9 6l6 6-6 6'/></svg>";
   }
 
-  function sparkIcon() {
-    return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3l1.7 5.1L19 10l-5.3 1.9L12 17l-1.7-5.1L5 10l5.3-1.9L12 3Z'/><path d='M18 16l.8 2.2L21 19l-2.2.8L18 22l-.8-2.2L15 19l2.2-.8L18 16Z'/></svg>";
-  }
-
   function copyIcon() {
-    return "<svg viewBox='0 0 24 24' aria-hidden='true'><rect x='9' y='9' width='13' height='13' rx='2'/><path d='M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'/></svg>";
+    return "<svg class='vcs-copy-icon' viewBox='0 0 24 24' aria-hidden='true'><rect x='8' y='8' width='14' height='14' rx='2'/><path d='M16 4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2'/></svg>";
   }
 
   function loadingIcon() {
@@ -2450,18 +3014,23 @@
       .vcs-panel {
         --washi: #f7f7f7;
         --washi-soft: #eeeeee;
-        --paper: #ffffff;
-        --paper-elevated: #ffffff;
+        --paper: #f1f1f1;
+        --paper-elevated: #f3f3f3;
         --sumi: #111111;
         --sumi-soft: #343434;
         --nezumi: #6b6b6b;
-        --haijiro: #d9d9d9;
-        --haijiro-soft: #ebebeb;
+        --haijiro: #e0e0e0;
+        --haijiro-soft: #e8e8e8;
         --rikyu: #111111;
         --shu: #111111;
         --clay: #767676;
         --button: #111111;
         --button-hover: #2a2a2a;
+        --neumo-surface: #ededed;
+        --neumo-text: #090909;
+        --neumo-muted: #666666;
+        --neumo-shadow-dark: #d1d1d1;
+        --neumo-shadow-light: #ffffff;
         --good: #111111;
         --bad: #b00020;
         --shadow: rgba(0, 0, 0, 0.12);
@@ -2492,12 +3061,12 @@
         margin: 0 0 14px;
         color: var(--sumi);
         background: var(--paper);
-        border: 1px solid var(--haijiro);
+        border: 1px solid color-mix(in srgb, var(--haijiro) 54%, transparent);
         border-radius: 8px;
         font: 13px/1.7 var(--sans);
         letter-spacing: 0;
         overflow: hidden;
-        box-shadow: 0 12px 32px var(--shadow);
+        box-shadow: 0 10px 26px color-mix(in srgb, var(--shadow) 72%, transparent);
         transform-origin: top right;
         animation: vcs-panel-in 180ms ease both;
       }
@@ -2532,6 +3101,11 @@
         --clay: #9a9a9a;
         --button: #f4f4f4;
         --button-hover: #ffffff;
+        --neumo-surface: #242424;
+        --neumo-text: #f4f4f4;
+        --neumo-muted: #a8a8a8;
+        --neumo-shadow-dark: #151515;
+        --neumo-shadow-light: #343434;
         --good: #f4f4f4;
         --bad: #ff6b7a;
         --shadow: rgba(0, 0, 0, 0.32);
@@ -2543,9 +3117,9 @@
         justify-content: space-between;
         gap: 10px;
         padding: 12px 14px 10px;
-        border-bottom: 1px solid color-mix(in srgb, var(--haijiro) 72%, transparent);
+        border-bottom: 1px solid color-mix(in srgb, var(--haijiro) 48%, transparent);
         background:
-          linear-gradient(90deg, color-mix(in srgb, var(--washi) 72%, transparent), transparent 58%),
+          linear-gradient(90deg, color-mix(in srgb, var(--washi) 64%, transparent), transparent 58%),
           var(--paper-elevated);
       }
 
@@ -2604,29 +3178,36 @@
       .vcs-icon-button, .vcs-tool-button {
         display: inline-grid;
         place-items: center;
-        width: 26px;
-        height: 26px;
+        width: 24px;
+        height: 24px;
         padding: 0;
-        color: var(--nezumi);
-        background: color-mix(in srgb, var(--paper) 74%, transparent);
-        border: 1px solid transparent;
-        border-radius: 5px;
+        color: var(--neumo-muted);
+        background: var(--neumo-surface);
+        border: 1px solid var(--neumo-surface);
+        border-radius: 999px;
         cursor: pointer;
+        box-shadow:
+          inset 1.5px 1.5px 3px color-mix(in srgb, var(--neumo-shadow-dark) 74%, transparent),
+          inset -1.5px -1.5px 3px color-mix(in srgb, var(--neumo-shadow-light) 76%, transparent);
         transition:
           color 180ms ease,
           background 180ms ease,
           border-color 180ms ease,
+          box-shadow 180ms ease,
           transform 180ms ease;
       }
       .vcs-icon-button:hover, .vcs-tool-button:hover {
-        color: var(--sumi);
-        background: var(--washi);
-        border-color: color-mix(in srgb, var(--haijiro) 70%, transparent);
-        transform: translateY(-1px);
+        color: var(--neumo-text);
+        box-shadow:
+          inset 1px 1px 2px color-mix(in srgb, var(--neumo-shadow-dark) 64%, transparent),
+          inset -1px -1px 2px color-mix(in srgb, var(--neumo-shadow-light) 70%, transparent);
       }
-      .vcs-icon-button:active, .vcs-tool-button:active,
-      .vcs-primary:active, .vcs-collapsed-toggle:active {
-        transform: translateY(0) scale(0.98);
+      .vcs-icon-button:active, .vcs-tool-button:active {
+        color: var(--neumo-muted);
+        transform: translateY(0);
+        box-shadow:
+          inset 2px 2px 4px color-mix(in srgb, var(--neumo-shadow-dark) 82%, transparent),
+          inset -2px -2px 4px color-mix(in srgb, var(--neumo-shadow-light) 76%, transparent);
       }
       .vcs-icon-button.is-spinning svg {
         animation: vcs-spin 720ms cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
@@ -2645,6 +3226,24 @@
       }
       .vcs-collapse-button:hover svg {
         transform: rotate(90deg) translateX(1px);
+      }
+      .vcs-track-row .vcs-tool-button {
+        width: 22px;
+        height: 22px;
+        justify-self: center;
+        align-self: center;
+      }
+      .vcs-track-row .vcs-tool-button svg {
+        width: 12px;
+        height: 12px;
+      }
+      .vcs-track-row .vcs-tool-button .t-icon-swap,
+      .vcs-track-row .vcs-tool-button .t-icon {
+        width: 14px;
+        height: 14px;
+      }
+      .vcs-track-row .vcs-copy-icon {
+        transform: translate(-0.5px, -0.5px);
       }
 
       svg {
@@ -2713,9 +3312,12 @@
       .t-icon-swap {
         position: relative;
         display: inline-grid;
+        place-items: center;
       }
       .t-icon-swap .t-icon {
         grid-area: 1 / 1;
+        display: grid;
+        place-items: center;
         transition:
           opacity   var(--icon-swap-dur) var(--icon-swap-ease),
           filter    var(--icon-swap-dur) var(--icon-swap-ease),
@@ -2767,13 +3369,16 @@
       }
 
       .vcs-meta-line {
-        padding: 8px 10px;
+        padding: 9px 11px;
         font-size: 12px;
         color: var(--sumi-soft);
         line-height: 1.5;
-        background: color-mix(in srgb, var(--washi) 72%, transparent);
-        border: 1px solid color-mix(in srgb, var(--haijiro-soft) 82%, transparent);
-        border-radius: 6px;
+        background: var(--neumo-surface);
+        border: 1px solid color-mix(in srgb, var(--neumo-surface) 86%, var(--haijiro-soft));
+        border-radius: 8px;
+        box-shadow:
+          inset 2px 2px 5px color-mix(in srgb, var(--neumo-shadow-dark) 54%, transparent),
+          inset -2px -2px 5px color-mix(in srgb, var(--neumo-shadow-light) 64%, transparent);
         min-width: 0;
       }
       .vcs-meta-title {
@@ -2823,61 +3428,56 @@
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        gap: 7px;
         justify-self: stretch;
         width: 100%;
         min-width: 0;
-        height: 34px;
-        padding: 0 14px;
-        color: #fffaf1;
-        background: linear-gradient(180deg, color-mix(in srgb, var(--button) 94%, #ffffff), var(--button));
-        border: 1px solid color-mix(in srgb, var(--button) 82%, var(--haijiro));
-        border-radius: 5px;
-        font: 680 12px/1 var(--sans);
+        min-height: 38px;
+        margin: 4px 0 8px;
+        padding: 0.55em 1.2em;
+        color: var(--neumo-text);
+        background: var(--neumo-surface);
+        border: 1px solid var(--neumo-surface);
+        border-radius: 0.5em;
+        font: 680 14px/1 var(--sans);
         letter-spacing: 0;
         cursor: pointer;
-        box-shadow: 0 5px 14px color-mix(in srgb, var(--shadow) 58%, transparent);
+        box-shadow:
+          2px 2px 5px color-mix(in srgb, var(--neumo-shadow-dark) 58%, transparent),
+          -2px -2px 5px color-mix(in srgb, var(--neumo-shadow-light) 70%, transparent),
+          inset 0 0 0 color-mix(in srgb, var(--neumo-shadow-dark) 0%, transparent);
         transition:
-          background 180ms ease,
-          border-color 180ms ease,
-          box-shadow 180ms ease,
+          color 180ms ease,
+          box-shadow 220ms ease,
           transform 180ms ease;
       }
-      .vcs-primary-icon {
-        display: grid;
-        place-items: center;
-        width: 14px;
-        height: 14px;
-      }
-      .vcs-primary-icon svg {
-        width: 13px;
-        height: 13px;
-        stroke-width: 1.7;
-      }
       .vcs-primary:hover {
-        background: linear-gradient(180deg, color-mix(in srgb, var(--button-hover) 92%, #ffffff), var(--button-hover));
-        border-color: color-mix(in srgb, var(--button-hover) 76%, var(--haijiro));
-        box-shadow: 0 7px 18px color-mix(in srgb, var(--shadow) 68%, transparent);
-        transform: translateY(-0.5px);
+        color: var(--neumo-text);
+        box-shadow:
+          2px 2px 4px color-mix(in srgb, var(--neumo-shadow-dark) 48%, transparent),
+          -2px -2px 4px color-mix(in srgb, var(--neumo-shadow-light) 62%, transparent);
       }
-      .vcs-panel[data-theme="dark"] .vcs-primary {
-        background: linear-gradient(180deg, #e8dccb, var(--button));
-        border-color: color-mix(in srgb, var(--button) 80%, var(--haijiro));
-        color: #24221e;
+      .vcs-primary:active {
+        color: var(--neumo-muted);
+        box-shadow:
+          inset 2px 2px 5px color-mix(in srgb, var(--neumo-shadow-dark) 72%, transparent),
+          inset -2px -2px 5px color-mix(in srgb, var(--neumo-shadow-light) 72%, transparent);
       }
-      .vcs-panel[data-theme="dark"] .vcs-primary:hover {
-        background: linear-gradient(180deg, #fff3df, var(--button-hover));
-        border-color: var(--button-hover);
-        color: #24221e;
+      .vcs-primary-label {
+        display: block;
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      .vcs-collapsed-toggle:active {
+        transform: none;
       }
 
       .vcs-track-row {
         display: grid;
-        grid-template-columns: auto minmax(0, 1fr) auto;
+        grid-template-columns: auto minmax(0, 1fr) 24px;
         align-items: center;
         gap: 8px;
-        padding: 8px 0 0;
-        border-top: 1px solid color-mix(in srgb, var(--haijiro-soft) 82%, transparent);
+        padding: 7px 0 0;
+        border-top: 0;
         min-width: 0;
       }
       .vcs-track-label {
@@ -2889,38 +3489,45 @@
       .vcs-select {
         width: 100%;
         min-width: 0;
-        height: 28px;
+        height: 30px;
         padding: 0 26px 0 8px;
         color: var(--sumi);
         background:
           linear-gradient(45deg, transparent 50%, var(--nezumi) 50%),
           linear-gradient(135deg, var(--nezumi) 50%, transparent 50%),
-          color-mix(in srgb, var(--paper) 78%, transparent);
+          var(--neumo-surface);
         background-position:
           calc(100% - 15px) 52%,
           calc(100% - 10px) 52%,
           0 0;
         background-size: 5px 5px, 5px 5px, 100% 100%;
         background-repeat: no-repeat;
-        border: 1px solid color-mix(in srgb, var(--haijiro) 76%, transparent);
-        border-radius: 5px;
+        border: 1px solid color-mix(in srgb, var(--neumo-surface) 86%, var(--haijiro-soft));
+        border-radius: 8px;
+        box-shadow:
+          inset 2px 2px 5px color-mix(in srgb, var(--neumo-shadow-dark) 54%, transparent),
+          inset -2px -2px 5px color-mix(in srgb, var(--neumo-shadow-light) 64%, transparent);
         outline: none;
         appearance: none;
         -webkit-appearance: none;
         font-family: var(--sans);
         font-size: 12px;
       }
-      .vcs-select:focus { border-color: var(--rikyu); }
+      .vcs-select:focus {
+        border-color: color-mix(in srgb, var(--rikyu) 22%, var(--neumo-surface));
+        box-shadow:
+          inset 2px 2px 5px color-mix(in srgb, var(--neumo-shadow-dark) 58%, transparent),
+          inset -2px -2px 5px color-mix(in srgb, var(--neumo-shadow-light) 68%, transparent);
+      }
 
       .vcs-details {
         border: 0;
-        border-top: 1px solid color-mix(in srgb, var(--haijiro-soft) 82%, transparent);
-        padding-top: 7px;
+        padding-top: 6px;
         background: transparent;
       }
       .vcs-details summary {
         min-height: 28px;
-        padding: 3px 0;
+        padding: 2px 0;
         color: var(--sumi-soft);
         font: 650 12px/1.5 var(--sans);
         letter-spacing: 0;
@@ -2929,27 +3536,45 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
+        gap: 8px;
       }
       .vcs-details summary::-webkit-details-marker { display: none; }
-      .vcs-details summary::after {
-        content: "›";
-        display: grid;
+      .vcs-details-title {
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      .vcs-details-chevron {
+        flex: 0 0 auto;
+        display: inline-grid;
         place-items: center;
-        width: 18px;
-        height: 18px;
-        color: var(--nezumi);
-        font-size: 19px;
-        line-height: 1;
-        font-weight: 500;
+        width: 24px;
+        height: 24px;
+        color: var(--neumo-muted);
+        background: var(--neumo-surface);
+        border: 1px solid var(--neumo-surface);
+        border-radius: 999px;
+        box-shadow:
+          inset 1.5px 1.5px 3px color-mix(in srgb, var(--neumo-shadow-dark) 74%, transparent),
+          inset -1.5px -1.5px 3px color-mix(in srgb, var(--neumo-shadow-light) 76%, transparent);
+        transition:
+          color 160ms ease,
+          box-shadow 180ms ease;
+      }
+      .vcs-details-chevron svg {
+        width: 13px;
+        height: 13px;
         transform: rotate(0deg);
         transform-origin: 50% 50%;
-        transition:
-          transform 190ms cubic-bezier(0.22, 1, 0.36, 1),
-          color 160ms ease;
+        transition: transform 190ms cubic-bezier(0.22, 1, 0.36, 1);
       }
-      .vcs-details[open] summary::after { transform: rotate(90deg); }
+      .vcs-details[open] .vcs-details-chevron svg { transform: rotate(90deg); }
       .vcs-details summary:hover { color: var(--sumi); }
-      .vcs-details summary:hover::after { color: var(--sumi); }
+      .vcs-details summary:hover .vcs-details-chevron {
+        color: var(--neumo-text);
+        box-shadow:
+          inset 1px 1px 2px color-mix(in srgb, var(--neumo-shadow-dark) 64%, transparent),
+          inset -1px -1px 2px color-mix(in srgb, var(--neumo-shadow-light) 70%, transparent);
+      }
       .vcs-details[open] > :not(summary) {
         animation: vcs-details-reveal 260ms var(--panel-ease) both;
       }
@@ -2959,12 +3584,15 @@
         width: 100%;
         height: 220px;
         margin-top: 6px;
-        padding: 8px;
+        padding: 10px;
         overflow: auto;
         color: var(--sumi);
-        background: color-mix(in srgb, var(--paper-elevated) 72%, var(--washi));
-        border: 1px solid color-mix(in srgb, var(--haijiro) 78%, transparent);
-        border-radius: 6px;
+        background: var(--neumo-surface);
+        border: 1px solid color-mix(in srgb, var(--neumo-surface) 86%, var(--haijiro-soft));
+        border-radius: 8px;
+        box-shadow:
+          inset 2px 2px 6px color-mix(in srgb, var(--neumo-shadow-dark) 58%, transparent),
+          inset -2px -2px 6px color-mix(in srgb, var(--neumo-shadow-light) 66%, transparent);
         outline: none;
         font: 400 11px/1.55 var(--sans);
         overscroll-behavior: contain;
@@ -2977,7 +3605,9 @@
       .vcs-transcript-placeholder {
         color: var(--nezumi);
       }
-      .vcs-transcript-box:focus { border-color: var(--rikyu); }
+      .vcs-transcript-box:focus {
+        border-color: color-mix(in srgb, var(--rikyu) 22%, var(--neumo-surface));
+      }
       .vcs-transcript-list {
         display: grid;
         gap: 2px;
@@ -3056,10 +3686,12 @@
         gap: 8px;
         width: min(100%, 720px);
         padding: 10px;
-        background: color-mix(in srgb, var(--paper-elevated) 88%, var(--washi));
-        border: 1px solid color-mix(in srgb, var(--haijiro) 86%, transparent);
-        border-radius: 7px;
-        box-shadow: inset 0 1px 0 color-mix(in srgb, #ffffff 48%, transparent);
+        background: var(--neumo-surface);
+        border: 1px solid color-mix(in srgb, var(--neumo-surface) 86%, var(--haijiro-soft));
+        border-radius: 8px;
+        box-shadow:
+          inset 2px 2px 6px color-mix(in srgb, var(--neumo-shadow-dark) 54%, transparent),
+          inset -2px -2px 6px color-mix(in srgb, var(--neumo-shadow-light) 62%, transparent);
       }
       .vcs-result[hidden] { display: none; }
 
@@ -3075,16 +3707,12 @@
       }
       .vcs-summary-details summary {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) auto 18px;
+        grid-template-columns: minmax(0, 1fr) auto 24px;
         align-items: center;
         gap: 8px;
         min-height: 28px;
         padding: 0;
         justify-content: initial;
-      }
-      .vcs-summary-details summary::after {
-        grid-column: 3;
-        grid-row: 1;
       }
       .vcs-summary-details .vcs-result-title {
         min-width: 0;
@@ -3092,6 +3720,11 @@
       }
       .vcs-summary-details #vcs-copy-summary {
         grid-column: 2;
+        grid-row: 1;
+        justify-self: end;
+      }
+      .vcs-summary-details .vcs-details-chevron {
+        grid-column: 3;
         grid-row: 1;
         justify-self: end;
       }
@@ -3162,18 +3795,17 @@
       }
       .vcs-stream-cursor {
         display: inline-block;
-        width: 0.42em;
-        min-width: 5px;
-        height: 0.78em;
-        margin-left: 3px;
+        width: 2px;
+        min-width: 2px;
+        height: 1.18em;
+        margin-left: 2px;
         background: color-mix(in srgb, var(--sumi) 92%, var(--paper));
-        border-radius: 1px;
-        vertical-align: -0.12em;
+        border-radius: 999px;
+        vertical-align: -0.22em;
         box-shadow:
-          inset 0 -2px 0 color-mix(in srgb, var(--paper) 18%, transparent),
-          0 0 0 1px color-mix(in srgb, var(--sumi) 18%, transparent);
+          0 0 0 1px color-mix(in srgb, var(--sumi) 8%, transparent);
         transform-origin: center bottom;
-        animation: vcs-caret-blink 1050ms steps(1, end) infinite;
+        animation: vcs-caret-blink 620ms steps(1, end) infinite;
       }
       .vcs-collapsed-toggle {
         display: none;
@@ -3184,28 +3816,21 @@
         min-height: 54px;
         padding: 8px 10px;
         color: var(--sumi);
-        background:
-          linear-gradient(90deg, color-mix(in srgb, var(--paper-elevated) 94%, var(--washi)), var(--paper));
-        border: 1px solid color-mix(in srgb, var(--haijiro) 86%, transparent);
-        border-radius: 7px;
+        background: transparent;
+        border: 0;
+        border-radius: 0;
         cursor: pointer;
         font: 650 12px/1.2 var(--sans);
         letter-spacing: 0;
-        box-shadow: 0 8px 20px var(--shadow);
+        box-shadow: none;
         transform-origin: top right;
-        animation: vcs-tab-in 180ms ease both;
+        animation: none;
         transition:
           border-color 180ms ease,
-          background 180ms ease,
-          transform 180ms ease,
-          box-shadow 180ms ease;
+          background 180ms ease;
       }
       .vcs-collapsed-toggle:hover {
-        border-color: color-mix(in srgb, var(--rikyu) 72%, var(--haijiro));
-        background:
-          linear-gradient(90deg, color-mix(in srgb, var(--paper-elevated) 86%, var(--washi-soft)), var(--paper-elevated));
-        transform: translateY(-1px);
-        box-shadow: 0 10px 24px var(--shadow);
+        background: transparent;
       }
       .vcs-collapsed-toggle:hover .vcs-collapsed-arrow svg {
         transform: translateX(1px);
@@ -3257,9 +3882,11 @@
 
       .vcs-panel.is-collapsed {
         width: 100%;
-        background: transparent;
-        border: 0;
-        overflow: visible;
+        background:
+          linear-gradient(90deg, color-mix(in srgb, var(--washi) 64%, transparent), transparent 58%),
+          var(--paper-elevated);
+        border: 1px solid color-mix(in srgb, var(--haijiro) 54%, transparent);
+        overflow: hidden;
         box-shadow: none;
         animation: none;
       }
@@ -3279,7 +3906,6 @@
         min-height: 48px;
         grid-template-columns: 30px minmax(0, 1fr) 18px;
         padding: 7px 9px;
-        border-radius: 9px;
       }
       .vcs-panel.is-floating.is-collapsed .vcs-collapsed-icon {
         width: 30px;
@@ -3326,8 +3952,8 @@
       }
 
       @keyframes vcs-caret-blink {
-        0%, 46% { opacity: 1; transform: translateY(0) scaleY(0.92); }
-        47%, 100% { opacity: 0.24; transform: translateY(0) scaleY(0.92); }
+        0%, 48% { opacity: 1; transform: translateY(0) scaleY(1); }
+        49%, 100% { opacity: 0.18; transform: translateY(0) scaleY(1); }
       }
 
       @media (prefers-reduced-motion: reduce) {

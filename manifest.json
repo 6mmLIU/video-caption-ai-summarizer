@@ -32,12 +32,29 @@
     "tabs"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "https://*.youtube.com/*",
+    "https://youtu.be/*",
+    "https://*.bilibili.com/*",
+    "https://*.hdslb.com/*",
+    "https://*.vimeo.com/*",
+    "https://*.vimeocdn.com/*",
+    "https://*.ted.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
   ],
   "content_scripts": [
     {
       "matches": [
-        "<all_urls>"
+        "*://*.youtube.com/*",
+        "*://youtu.be/*",
+        "*://*.bilibili.com/*",
+        "*://*.vimeo.com/*",
+        "*://*.ted.com/*"
       ],
       "js": [
         "src/i18n.js",

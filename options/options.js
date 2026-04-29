@@ -3,8 +3,72 @@ const HISTORY_KEY = "vcsHistory";
 const HISTORY_LIMIT = 30;
 const I18N = globalThis.VCS_I18N;
 
+const OLD_DEFAULT_PROMPT_TEMPLATE = [
+  "你是一个擅长处理视频字幕的中文研究助理。",
+  "请根据下面的视频字幕生成高质量总结。",
+  "",
+  "标题：{{title}}",
+  "平台：{{platform}}",
+  "链接：{{url}}",
+  "输出语言：{{language}}",
+  "",
+  "字幕：",
+  "{{transcript}}"
+].join("\n");
+
+const OLD_DEFAULT_OUTPUT_TEMPLATE = [
+  "请使用 Markdown 输出：",
+  "## 一句话结论",
+  "## 核心摘要",
+  "## 关键观点",
+  "- 每条观点尽量带上相关时间点",
+  "## 章节时间线",
+  "## 可执行事项 / 值得追问的问题"
+].join("\n");
+
+const DEFAULT_PROMPT_TEMPLATE = [
+  "你是一位视频内容提炼专家。请基于字幕文本，生成一份精炼、高信息密度的结构化总结。",
+  "",
+  "## 视频信息",
+  "📌 标题：{{title}}｜🌐 平台：{{platform}}｜🔗 链接：{{url}}",
+  "",
+  "## 核心原则",
+  "- 总结 ≠ 复述。你的任务是**压缩与重构**，不是逐段改写",
+  "- 保留硬信息（数据、人名、术语、方法论），砍掉软信息（过渡语、重复论证、情绪渲染）",
+  "- 每句话必须承载独立信息量，删掉后会造成信息缺失才有资格留下",
+  "- 仅基于字幕实际内容，不推测、不补充、不评价",
+  "",
+  "## 输出语言：{{language}}",
+  "",
+  "## 输出格式",
+  "{{outputTemplate}}",
+  "",
+  "## 字幕正文",
+  "{{transcript}}"
+].join("\n");
+
+const DEFAULT_OUTPUT_TEMPLATE = [
+  "请使用 Markdown 输出：",
+  "",
+  "## 💡 一句话结论",
+  "≤ 30字。视频最核心的一个判断或发现。",
+  "",
+  "## 📋 核心摘要",
+  "3~4句话覆盖完整逻辑链：什么问题 → 什么观点/方案 → 什么结论。不用条目，写成连贯段落。",
+  "",
+  "## 🎯 关键观点",
+  "3~7条，每条格式：",
+  "- ⏱️ [时间戳] **关键词**：一句话说明（无时间戳则省略⏱️）",
+  "",
+  "只保留\"删掉就损失信息\"的观点，不凑数。",
+  "",
+  "## 🗂️ 章节时间线",
+  "按叙事顺序分3~6段，每段格式：",
+  "- ⏱️ [起止时间] **章节名**：一句话概括（无时间戳则用 1️⃣2️⃣3️⃣ 编号）"
+].join("\n");
+
 const DEFAULT_SETTINGS = {
-  settingsVersion: 5,
+  settingsVersion: 7,
   theme: "auto",
   uiLanguage: "zh-CN",
   language: "中文（简体）",
@@ -17,34 +81,15 @@ const DEFAULT_SETTINGS = {
       name: "我的 API 配置"
     }
   ],
-  promptTemplate: [
-    "你是一个擅长处理视频字幕的中文研究助理。",
-    "请根据下面的视频字幕生成高质量总结。",
-    "",
-    "标题：{{title}}",
-    "平台：{{platform}}",
-    "链接：{{url}}",
-    "输出语言：{{language}}",
-    "",
-    "字幕：",
-    "{{transcript}}"
-  ].join("\n"),
-  outputTemplate: [
-    "请使用 Markdown 输出：",
-    "## 一句话结论",
-    "## 核心摘要",
-    "## 关键观点",
-    "- 每条观点尽量带上相关时间点",
-    "## 章节时间线",
-    "## 可执行事项 / 值得追问的问题"
-  ].join("\n"),
+  promptTemplate: DEFAULT_PROMPT_TEMPLATE,
+  outputTemplate: DEFAULT_OUTPUT_TEMPLATE,
   chunkSize: 12000,
   chunkOverlap: 600,
   requestTimeoutSeconds: 60,
   includeTimestamps: true,
   includeTitleAndUrl: true,
   redactTerms: "",
-  saveHistory: true
+  saveHistory: false
 };
 
 let settings = structuredClone(DEFAULT_SETTINGS);
@@ -56,7 +101,7 @@ const fields = {
   profileName: document.querySelector("#profileName"),
   provider: document.querySelector("#provider"),
   endpoint: document.querySelector("#endpoint"),
-  apiKey: document.querySelector("#apiKey"),
+  accessToken: document.querySelector("#accessToken"),
   model: document.querySelector("#model"),
   temperature: document.querySelector("#temperature"),
   maxTokens: document.querySelector("#maxTokens"),
@@ -99,7 +144,7 @@ async function init() {
 
 function bindEvents() {
   document.querySelector("#saveAll").addEventListener("click", () => saveAll());
-  document.querySelector("#saveProfile").addEventListener("click", saveCurrentProfile);
+  document.querySelector("#saveProfile").addEventListener("click", () => saveCurrentProfile());
   document.querySelector("#addProfile").addEventListener("click", addProfile);
   document.querySelector("#deleteProfile").addEventListener("click", deleteProfile);
   document.querySelector("#testProfile").addEventListener("click", testProfile);
@@ -129,10 +174,7 @@ function bindEvents() {
     button.addEventListener("click", () => applyPreset(button.dataset.preset));
   });
 
-  document.querySelectorAll(".template").forEach((button) => {
-    button.addEventListener("click", () => applyTemplate(button.dataset.template));
-  });
-
+  fields.provider.addEventListener("change", handleProviderChange);
   fields.historyList.addEventListener("click", copyHistoryFromList);
   initSectionNav();
 
@@ -186,15 +228,16 @@ function renderProfileFields() {
   }
 
   fields.profileName.value = profile.name || "";
-  fields.provider.value = profile.provider || "openai-compatible";
+  fields.provider.value = profile.provider || "proxy";
   fields.endpoint.value = profile.endpoint || "";
-  fields.apiKey.value = profile.apiKey || "";
+  fields.accessToken.value = getProfileSecret(profile);
   fields.model.value = profile.model || "";
   fields.temperature.value = profile.temperature ?? 1;
   fields.maxTokens.value = profile.maxTokens ?? 4096;
+  updateProviderHints();
 }
 
-function saveCurrentProfile() {
+async function saveCurrentProfile() {
   const profile = getActiveProfile();
   if (!profile) {
     return;
@@ -203,11 +246,11 @@ function saveCurrentProfile() {
   profile.name = fields.profileName.value.trim() || profile.id;
   profile.provider = fields.provider.value;
   profile.endpoint = fields.endpoint.value.trim();
-  profile.apiKey = fields.apiKey.value.trim();
+  setProfileSecret(profile, fields.accessToken.value.trim());
   profile.model = fields.model.value.trim();
   profile.temperature = Number(fields.temperature.value || 1);
   profile.maxTokens = Number(fields.maxTokens.value || 4096);
-  saveAll(t("options.status.profileSaved"));
+  await saveAll(t("options.status.profileSaved"));
 }
 
 async function saveAll(message = t("options.status.settingsSaved")) {
@@ -228,6 +271,10 @@ async function saveAll(message = t("options.status.settingsSaved")) {
   settings.requestTimeoutSeconds = Number(fields.requestTimeoutSeconds.value || DEFAULT_SETTINGS.requestTimeoutSeconds);
   saveCurrentProfileValuesOnly();
   settings = normalizeSettings(settings);
+  if (!await ensureEndpointPermissions(settings.profiles)) {
+    setStatus(fields.saveStatus, t("options.status.endpointPermissionDenied"), "error");
+    return;
+  }
 
   await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
   setStatus(fields.saveStatus, message, "ok");
@@ -242,7 +289,7 @@ function saveCurrentProfileValuesOnly() {
   profile.name = fields.profileName.value.trim() || profile.id;
   profile.provider = fields.provider.value;
   profile.endpoint = fields.endpoint.value.trim();
-  profile.apiKey = fields.apiKey.value.trim();
+  setProfileSecret(profile, fields.accessToken.value.trim());
   profile.model = fields.model.value.trim();
   profile.temperature = Number(fields.temperature.value || 1);
   profile.maxTokens = Number(fields.maxTokens.value || 4096);
@@ -255,6 +302,7 @@ function addProfile() {
     provider: "openai-compatible",
     endpoint: "",
     apiKey: "",
+    accessToken: "",
     model: "",
     temperature: 1,
     maxTokens: 4096
@@ -283,9 +331,31 @@ function applyPreset(name) {
   const profile = getActiveProfile();
   profile.provider = preset.provider;
   profile.endpoint = preset.endpoint;
+  profile.apiKey = "";
+  profile.accessToken = "";
   fields.provider.value = profile.provider;
   fields.endpoint.value = profile.endpoint;
+  fields.accessToken.value = "";
+  updateProviderHints();
   setStatus(fields.apiStatus, t("options.status.presetApplied"), "ok");
+}
+
+function handleProviderChange() {
+  const preset = profilePreset(providerDefaultPresetName(fields.provider.value));
+  fields.endpoint.value = preset.endpoint || "";
+  fields.accessToken.value = "";
+  updateProviderHints();
+}
+
+function providerDefaultPresetName(provider) {
+  const names = {
+    proxy: "proxy",
+    "openai-compatible": "deepseek",
+    anthropic: "claude",
+    gemini: "gemini",
+    ollama: "ollama"
+  };
+  return names[provider] || "deepseek";
 }
 
 function profilePreset(name) {
@@ -296,6 +366,7 @@ function profilePreset(name) {
       provider: "openai-compatible",
       endpoint: "https://api.deepseek.com/v1/chat/completions",
       apiKey: "",
+      accessToken: "",
       model: "",
       temperature: 1,
       maxTokens: 4096
@@ -306,6 +377,7 @@ function profilePreset(name) {
       provider: "openai-compatible",
       endpoint: "https://api.openai.com/v1/chat/completions",
       apiKey: "",
+      accessToken: "",
       model: "",
       temperature: 1,
       maxTokens: 4096
@@ -316,6 +388,7 @@ function profilePreset(name) {
       provider: "anthropic",
       endpoint: "https://api.anthropic.com/v1/messages",
       apiKey: "",
+      accessToken: "",
       model: "",
       temperature: 1,
       maxTokens: 4096
@@ -326,6 +399,7 @@ function profilePreset(name) {
       provider: "gemini",
       endpoint: "",
       apiKey: "",
+      accessToken: "",
       model: "",
       temperature: 1,
       maxTokens: 4096
@@ -336,6 +410,7 @@ function profilePreset(name) {
       provider: "openai-compatible",
       endpoint: "https://api.moonshot.ai/v1/chat/completions",
       apiKey: "",
+      accessToken: "",
       model: "",
       temperature: 1,
       maxTokens: 4096
@@ -346,6 +421,7 @@ function profilePreset(name) {
       provider: "openai-compatible",
       endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
       apiKey: "",
+      accessToken: "",
       model: "",
       temperature: 1,
       maxTokens: 4096
@@ -356,16 +432,18 @@ function profilePreset(name) {
       provider: "openai-compatible",
       endpoint: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
       apiKey: "",
+      accessToken: "",
       model: "",
       temperature: 1,
       maxTokens: 4096
     },
-    mimo: {
-      id: "mimo",
-      name: "小米 MiMo (本地)",
-      provider: "openai-compatible",
-      endpoint: "http://localhost:11434/v1/chat/completions",
+    proxy: {
+      id: "proxy",
+      name: "专用服务",
+      provider: "proxy",
+      endpoint: "",
       apiKey: "",
+      accessToken: "",
       model: "",
       temperature: 1,
       maxTokens: 4096
@@ -376,6 +454,7 @@ function profilePreset(name) {
       provider: "ollama",
       endpoint: "http://localhost:11434/v1/chat/completions",
       apiKey: "",
+      accessToken: "",
       model: "",
       temperature: 1,
       maxTokens: 4096
@@ -385,41 +464,13 @@ function profilePreset(name) {
   return structuredClone(presets[name] || presets.deepseek);
 }
 
-function applyTemplate(name) {
-  const templates = {
-    study: [
-      "请使用 Markdown 输出：",
-      "## 一句话结论",
-      "## 核心摘要",
-      "## 概念解释",
-      "## 章节时间线",
-      "## 关键术语",
-      "## 课后复盘问题"
-    ].join("\n"),
-    meeting: [
-      "请使用 Markdown 输出：",
-      "## 会议结论",
-      "## 已确认决策",
-      "## 行动项",
-      "- 负责人 / 截止时间 / 背景",
-      "## 风险与阻塞",
-      "## 需要追问"
-    ].join("\n"),
-    research: [
-      "请使用 Markdown 输出：",
-      "## 研究摘要",
-      "## 论点与证据",
-      "## 重要数据 / 名词",
-      "## 反方观点或不确定性",
-      "## 可引用时间点"
-    ].join("\n")
-  };
-
-  fields.outputTemplate.value = templates[name] || templates.study;
-}
-
 async function testProfile() {
   saveCurrentProfileValuesOnly();
+  settings = normalizeSettings(settings);
+  if (!await ensureEndpointPermissions([getActiveProfile()])) {
+    setStatus(fields.apiStatus, t("options.status.endpointPermissionDenied"), "error");
+    return;
+  }
   setStatus(fields.apiStatus, t("options.status.testing"), "");
 
   const response = await chrome.runtime.sendMessage({
@@ -441,7 +492,7 @@ async function exportSettings() {
     type: "video-caption-ai-settings",
     version: 1,
     exportedAt: new Date().toISOString(),
-    settings
+    settings: sanitizeSettingsForExport(settings)
   };
   const json = JSON.stringify(payload, null, 2);
   downloadJson(json, `video-caption-ai-settings-${formatDateForFilename(new Date())}.json`);
@@ -568,6 +619,167 @@ function parseImportedSettings(text) {
   return imported;
 }
 
+function sanitizeSettingsForExport(value) {
+  const output = structuredClone(value || {});
+  output.profiles = (Array.isArray(output.profiles) ? output.profiles : []).map((profile) => {
+    const cleanProfile = { ...profile };
+    delete cleanProfile.apiKey;
+    cleanProfile.accessToken = "";
+    return cleanProfile;
+  });
+  return output;
+}
+
+function getProfileSecret(profile) {
+  if (!profile || profile.provider === "ollama") {
+    return "";
+  }
+  return profile.provider === "proxy"
+    ? profile.accessToken || ""
+    : profile.apiKey || "";
+}
+
+function setProfileSecret(profile, value) {
+  if (!profile) {
+    return;
+  }
+  if (profile.provider === "proxy") {
+    profile.accessToken = value;
+    profile.apiKey = "";
+    return;
+  }
+  if (profile.provider === "ollama") {
+    profile.accessToken = "";
+    profile.apiKey = "";
+    return;
+  }
+  profile.apiKey = value;
+  profile.accessToken = "";
+}
+
+async function ensureEndpointPermissions(profiles) {
+  const origins = uniqueValues((profiles || [])
+    .map(endpointPermissionPattern)
+    .filter(Boolean));
+
+  for (const origin of origins) {
+    const hasPermission = await chrome.permissions.contains({ origins: [origin] });
+    if (hasPermission) {
+      continue;
+    }
+    const granted = await chrome.permissions.request({ origins: [origin] });
+    if (!granted) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function endpointPermissionPattern(profile) {
+  const url = parseUrl(getProfileEndpoint(profile));
+  if (!url) {
+    return "";
+  }
+  if (url.protocol === "https:") {
+    return `https://${url.hostname}/*`;
+  }
+  if (url.protocol === "http:" && isLoopbackHostname(url.hostname)) {
+    return `http://${url.hostname}/*`;
+  }
+  return "";
+}
+
+function updateProviderHints() {
+  const locale = i18n();
+  const provider = fields.provider.value;
+  const isOllama = provider === "ollama";
+  const isProxy = provider === "proxy";
+  const isGemini = provider === "gemini";
+  setFieldLabel(fields.endpoint, getEndpointLabel(provider, locale));
+  fields.endpoint.placeholder = getEndpointPlaceholder(provider);
+  setFieldLabel(fields.accessToken, isProxy ? locale.t("options.api.accessToken") : locale.t("options.api.apiKey"));
+  fields.accessToken.placeholder = getSecretPlaceholder(provider, locale);
+  fields.accessToken.disabled = isOllama;
+  fields.endpoint.disabled = isGemini;
+  fields.model.placeholder = isProxy ? locale.t("options.api.modelPlaceholder") : locale.t("options.api.directModelPlaceholder");
+}
+
+function getEndpointLabel(provider, locale) {
+  if (provider === "ollama") {
+    return locale.t("options.api.ollamaEndpoint");
+  }
+  if (provider === "proxy") {
+    return locale.t("options.api.endpoint");
+  }
+  return locale.t("options.api.directEndpoint");
+}
+
+function getEndpointPlaceholder(provider) {
+  const placeholders = {
+    proxy: "https://your-domain.example.com/v1/chat/completions",
+    "openai-compatible": "https://api.deepseek.com/v1/chat/completions",
+    anthropic: "https://api.anthropic.com/v1/messages",
+    gemini: "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+    ollama: "http://localhost:11434/v1/chat/completions"
+  };
+  return placeholders[provider] || placeholders["openai-compatible"];
+}
+
+function getSecretPlaceholder(provider, locale) {
+  if (provider === "ollama") {
+    return "";
+  }
+  if (provider === "proxy") {
+    return locale.language === "en" ? "Optional access token" : "可选访问口令";
+  }
+  return "sk-...";
+}
+
+function getProfileEndpoint(profile) {
+  if (!profile) {
+    return "";
+  }
+  if (profile.provider === "gemini" && !profile.endpoint) {
+    const model = profile.model || "gemini-pro";
+    return `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  }
+  return profile.endpoint || "";
+}
+
+function parseUrl(value) {
+  try {
+    return value ? new URL(value) : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function normalizeHostname(hostname) {
+  return String(hostname || "")
+    .replace(/^\[/, "")
+    .replace(/\]$/, "")
+    .toLowerCase();
+}
+
+function isLoopbackHostname(hostname) {
+  const host = normalizeHostname(hostname);
+  return host === "localhost"
+    || host.endsWith(".localhost")
+    || host === "::1"
+    || host === "0:0:0:0:0:0:0:1"
+    || host.startsWith("127.");
+}
+
+function isLoopbackEndpoint(endpoint) {
+  const url = parseUrl(endpoint);
+  return Boolean(url && url.protocol === "http:" && isLoopbackHostname(url.hostname));
+}
+
+function uniqueValues(values) {
+  return [...new Set(values)];
+}
+
 function normalizeSettings(input) {
   const normalized = deepMerge(DEFAULT_SETTINGS, input || {});
   const importedVersion = Number(input?.settingsVersion || 0);
@@ -578,9 +790,15 @@ function normalizeSettings(input) {
   normalized.panelEnabled = normalized.panelEnabled !== false;
   normalized.includeTimestamps = normalized.includeTimestamps !== false;
   normalized.includeTitleAndUrl = normalized.includeTitleAndUrl !== false;
-  normalized.saveHistory = importedVersion < 2 ? true : normalized.saveHistory !== false;
+  normalized.saveHistory = normalized.saveHistory === true;
   normalized.promptTemplate = String(normalized.promptTemplate || DEFAULT_SETTINGS.promptTemplate);
   normalized.outputTemplate = String(normalized.outputTemplate || DEFAULT_SETTINGS.outputTemplate);
+  if (String(input?.promptTemplate || "") === OLD_DEFAULT_PROMPT_TEMPLATE) {
+    normalized.promptTemplate = DEFAULT_SETTINGS.promptTemplate;
+  }
+  if (String(input?.outputTemplate || "") === OLD_DEFAULT_OUTPUT_TEMPLATE) {
+    normalized.outputTemplate = DEFAULT_SETTINGS.outputTemplate;
+  }
   normalized.redactTerms = String(normalized.redactTerms || "");
   normalized.chunkSize = clampNumber(normalized.chunkSize, 12000, 2000, 50000);
   normalized.chunkOverlap = clampNumber(normalized.chunkOverlap, 600, 0, 5000);
@@ -602,21 +820,29 @@ function normalizeSettings(input) {
 }
 
 function normalizeProfile(profile, index, importedVersion) {
-  const fallback = profilePreset(index === 1 ? "openai" : index === 2 ? "claude" : "deepseek");
-  const temperature = importedVersion < 3 && Number(profile?.temperature) === 0.2
+  const source = profile || {};
+  const rawProvider = String(source.provider || "openai-compatible");
+  const isLocalOpenAI = rawProvider === "ollama"
+    || (rawProvider === "openai-compatible" && isLoopbackEndpoint(source.endpoint));
+  const supportedProviders = ["proxy", "openai-compatible", "anthropic", "gemini", "ollama"];
+  const provider = isLocalOpenAI
+    ? "ollama"
+    : (supportedProviders.includes(rawProvider) ? rawProvider : "openai-compatible");
+  const fallback = profilePreset(provider === "openai-compatible" ? "deepseek" : provider);
+  const temperature = importedVersion < 3 && Number(source.temperature) === 0.2
     ? 1
-    : profile?.temperature;
+    : source.temperature;
   return {
     ...fallback,
-    ...(profile || {}),
-    id: String(profile?.id || fallback.id || `profile-${index + 1}`),
-    name: String(profile?.name || fallback.name || `API ${index + 1}`),
-    provider: String(profile?.provider || fallback.provider || "openai-compatible"),
-    endpoint: String(profile?.endpoint || fallback.endpoint || ""),
-    apiKey: String(profile?.apiKey || ""),
-    model: String(profile?.model || fallback.model || ""),
+    id: String(source.id || fallback.id || `profile-${index + 1}`),
+    name: String(source.name || fallback.name || `Profile ${index + 1}`),
+    provider,
+    endpoint: String(source.endpoint || fallback.endpoint || ""),
+    apiKey: String(source.apiKey || (!["proxy", "ollama"].includes(provider) ? source.accessToken || "" : "")),
+    accessToken: String(provider === "proxy" ? source.accessToken || "" : ""),
+    model: String(source.model || fallback.model || ""),
     temperature: clampNumber(temperature, fallback.temperature ?? 1, 0, 2),
-    maxTokens: clampNumber(profile?.maxTokens, fallback.maxTokens, 256, 32000)
+    maxTokens: clampNumber(source.maxTokens, fallback.maxTokens, 256, 32000)
   };
 }
 
@@ -664,26 +890,25 @@ function applyTranslations() {
   setFieldLabel(fields.profileName, locale.t("options.api.profileName"));
   fields.profileName.placeholder = locale.t("options.api.profileNamePlaceholder");
   setFieldLabel(fields.provider, locale.t("options.api.provider"));
+  setOptionText(fields.provider, "proxy", locale.t("options.api.provider.proxy"));
   setOptionText(fields.provider, "openai-compatible", locale.t("options.api.provider.openai"));
   setOptionText(fields.provider, "anthropic", locale.t("options.api.provider.anthropic"));
   setOptionText(fields.provider, "gemini", locale.t("options.api.provider.gemini"));
   setOptionText(fields.provider, "ollama", locale.t("options.api.provider.ollama"));
   setFieldLabel(fields.endpoint, locale.t("options.api.endpoint"));
-  setFieldLabel(fields.apiKey, locale.t("options.api.apiKey"));
+  setFieldLabel(fields.accessToken, locale.t("options.api.accessToken"));
   setFieldLabel(fields.model, locale.t("options.api.model"));
   fields.model.placeholder = locale.t("options.api.modelPlaceholder");
   setFieldLabel(fields.temperature, locale.t("options.api.temperature"));
   setFieldLabel(fields.maxTokens, locale.t("options.api.maxTokens"));
   setText("#saveProfile", locale.t("options.api.saveProfile"));
   setText("#testProfile", locale.t("options.api.testProfile"));
+  updateProviderHints();
 
   setText("#prompt .section__head h2", locale.t("options.nav.prompt"));
   setText("#prompt .section__head p", locale.t("options.prompt.description"));
   setFieldLabel(fields.promptTemplate, locale.t("options.prompt.promptTemplate"));
   setFieldLabel(fields.outputTemplate, locale.t("options.prompt.outputTemplate"));
-  setTemplateText("study", locale.t("options.prompt.study.title"), locale.t("options.prompt.study.body"));
-  setTemplateText("meeting", locale.t("options.prompt.meeting.title"), locale.t("options.prompt.meeting.body"));
-  setTemplateText("research", locale.t("options.prompt.research.title"), locale.t("options.prompt.research.body"));
 
   setText("#platforms .section__head h2", locale.t("options.nav.platforms"));
   setText("#platforms .section__head p", locale.t("options.platforms.description"));
@@ -809,15 +1034,6 @@ function setOptionText(select, value, text) {
   if (option) {
     option.textContent = text;
   }
-}
-
-function setTemplateText(name, title, body) {
-  const template = document.querySelector(`.template[data-template='${name}']`);
-  if (!template) {
-    return;
-  }
-  template.querySelector("strong").textContent = title;
-  template.querySelector("span").textContent = body;
 }
 
 function setStatus(element, message, tone) {

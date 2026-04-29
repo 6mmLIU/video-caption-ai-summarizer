@@ -27,7 +27,7 @@
     <main class="layout">
       <nav class="sidebar" aria-label="Settings sections">
         <a href="#appearance">外观</a>
-        <a href="#api">API 模型</a>
+        <a href="#api">摘要服务</a>
         <a href="#prompt">提示词</a>
         <a href="#platforms">平台与隐私</a>
         <a href="#history">历史</a>
@@ -81,8 +81,8 @@
         <section id="api" class="section">
           <div class="section__head section__head--row">
             <div>
-              <h2>API 模型</h2>
-              <p>支持 OpenAI 兼容接口、DeepSeek、Claude、Gemini、Ollama 和其他自定义服务。</p>
+              <h2>摘要服务</h2>
+              <p>选择摘要服务，填写对应的服务地址、API Key 和模型名称。</p>
             </div>
             <div class="button-row">
               <button id="addProfile" class="button button--ghost" type="button">新增</button>
@@ -92,29 +92,30 @@
 
           <div class="grid two">
             <label class="field">
-              <span>配置名称</span>
+              <span>服务名称</span>
               <input id="profileName" type="text" placeholder="例如：我的 Kimi 配置">
             </label>
             <label class="field">
-              <span>服务商类型</span>
+              <span>摘要服务</span>
               <select id="provider">
-                <option value="openai-compatible">OpenAI 兼容接口</option>
-                <option value="anthropic">Anthropic Claude</option>
-                <option value="gemini">Google Gemini</option>
+                <option value="proxy">专用服务地址</option>
+                <option value="openai-compatible">OpenAI 兼容服务</option>
+                <option value="anthropic">Claude</option>
+                <option value="gemini">Gemini</option>
                 <option value="ollama">Ollama / 本地 OpenAI 兼容</option>
               </select>
             </label>
           </div>
 
           <label class="field">
-            <span>接口地址</span>
-            <input id="endpoint" type="url" placeholder="https://api.deepseek.com/v1/chat/completions">
+            <span>服务地址</span>
+            <input id="endpoint" type="url" placeholder="https://your-domain.example.com/v1/chat/completions">
           </label>
 
           <div class="grid two">
             <label class="field">
               <span>API Key</span>
-              <input id="apiKey" type="password" autocomplete="off" placeholder="sk-...">
+              <input id="accessToken" type="password" autocomplete="off" placeholder="sk-...">
             </label>
             <label class="field">
               <span>模型名称</span>
@@ -141,13 +142,13 @@
             <button class="preset" data-preset="openai" type="button">ChatGPT</button>
             <button class="preset" data-preset="claude" type="button">Claude</button>
             <button class="preset" data-preset="gemini" type="button">Gemini</button>
-            <button class="preset" data-preset="mimo" type="button">小米 MiMo</button>
+            <button class="preset" data-preset="proxy" type="button">专用服务</button>
             <button class="preset" data-preset="ollama" type="button">Ollama</button>
           </div>
 
           <div class="button-row">
-            <button id="saveProfile" class="button button--primary" type="button">保存当前 API 配置</button>
-            <button id="testProfile" class="button button--ghost" type="button">测试连接</button>
+            <button id="saveProfile" class="button button--primary" type="button">保存当前服务配置</button>
+            <button id="testProfile" class="button button--ghost" type="button">验证连接</button>
             <span id="apiStatus" class="status t-text-swap" role="status"></span>
           </div>
         </section>
@@ -167,21 +168,6 @@
             <span>输出模板</span>
             <textarea id="outputTemplate" rows="8"></textarea>
           </label>
-
-          <div class="template-grid">
-            <button class="template" data-template="study" type="button">
-              <strong>学习笔记</strong>
-              <span>适合课程、讲座、知识视频。</span>
-            </button>
-            <button class="template" data-template="meeting" type="button">
-              <strong>会议纪要</strong>
-              <span>提炼决策、行动项、风险。</span>
-            </button>
-            <button class="template" data-template="research" type="button">
-              <strong>研究卡片</strong>
-              <span>输出术语、论点、证据和反问。</span>
-            </button>
-          </div>
         </section>
 
         <section id="platforms" class="section">

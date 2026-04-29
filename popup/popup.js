@@ -121,6 +121,26 @@ async function getActiveTab() {
 async function sendToTab(tabId, message) {
   try {
     return await chrome.tabs.sendMessage(tabId, message);
+  } catch (firstError) {
+    const injected = await injectContentScript(tabId);
+    if (!injected.ok) {
+      return { ok: false, error: firstError.message };
+    }
+    try {
+      return await chrome.tabs.sendMessage(tabId, message);
+    } catch (secondError) {
+      return { ok: false, error: secondError.message };
+    }
+  }
+}
+
+async function injectContentScript(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["src/i18n.js", "src/content.js"]
+    });
+    return { ok: true };
   } catch (error) {
     return { ok: false, error: error.message };
   }

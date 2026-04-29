@@ -1,7 +1,7 @@
 import "./i18n.js";
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 5,
+  settingsVersion: 6,
   theme: "auto",
   uiLanguage: "zh-CN",
   language: "中文（简体）",
@@ -14,6 +14,7 @@ const DEFAULT_SETTINGS = {
       provider: "openai-compatible",
       endpoint: "https://api.deepseek.com/v1/chat/completions",
       apiKey: "",
+      accessToken: "",
       model: "",
       temperature: 1,
       maxTokens: 4096
@@ -46,7 +47,7 @@ const DEFAULT_SETTINGS = {
   includeTimestamps: true,
   includeTitleAndUrl: true,
   redactTerms: "",
-  saveHistory: true
+  saveHistory: false
 };
 const DEFAULT_REQUEST_TIMEOUT_MS = DEFAULT_SETTINGS.requestTimeoutSeconds * 1000;
 const HISTORY_LIMIT = 30;
@@ -77,7 +78,7 @@ async function handleMessage(message, sender) {
   }
 
   if (message.type === "VCS_FETCH_TEXT") {
-    return fetchText(message.url);
+    return fetchText(message.url, sender);
   }
 
   if (message.type === "VCS_SUMMARIZE") {
@@ -90,7 +91,7 @@ async function handleMessage(message, sender) {
   if (message.type === "VCS_TEST_API") {
     const settings = await getSettings();
     const locale = i18n(settings);
-    const profile = message.profile || getActiveProfile(settings);
+    const profile = normalizeProfile(message.profile || getActiveProfile(settings), 0, DEFAULT_SETTINGS.settingsVersion);
     const testOptions = {
       i18n: locale,
       timeoutMs: getRequestTimeoutMs(settings)
@@ -119,19 +120,28 @@ async function handleMessage(message, sender) {
   throw new Error(`Unknown message type: ${message.type}`);
 }
 
-async function fetchText(url) {
+async function fetchText(url, sender) {
   const locale = i18n(await getSettings());
-  if (!url || typeof url !== "string") {
+  const safeUrl = validateCaptionFetchUrl(url, sender, locale);
+  if (!safeUrl?.href) {
     throw new Error(locale.t("background.error.fetchUrlMissing"));
   }
 
-  const response = await fetch(url, {
-    credentials: "include",
+  const fetchOptions = {
+    credentials: shouldIncludeFetchCredentials(safeUrl, sender) ? "include" : "omit",
     cache: "no-store",
     headers: {
       "Accept": "application/json,text/vtt,text/plain,text/xml,*/*"
     }
-  });
+  };
+
+  const senderUrl = parseUrl(sender?.tab?.url);
+  if (senderUrl?.protocol === "https:" && safeUrl.protocol === "https:") {
+    fetchOptions.referrer = senderUrl.href;
+    fetchOptions.referrerPolicy = "strict-origin-when-cross-origin";
+  }
+
+  const response = await fetch(safeUrl.href, fetchOptions);
 
   if (!response.ok) {
     throw new Error(locale.t("background.error.fetchFailed", {
@@ -191,12 +201,19 @@ async function summarizeTranscript(payload, sender, options = {}) {
       chunkLabel: ""
     }), { onDelta: streamDelta, i18n: locale, timeoutMs });
     streamNotifier?.flush();
-    await maybeSaveHistory(settings, { title, platform, url, summary: text, model: profile.model, provider: profile.provider });
+    await maybeSaveHistory(settings, {
+      title,
+      platform,
+      url,
+      summary: text,
+      model: getModelDisplayName(profile, locale),
+      provider: getProviderDisplayName(profile, locale)
+    });
     return {
       text,
       chunks: 1,
-      model: profile.model,
-      provider: profile.provider
+      model: getModelDisplayName(profile, locale),
+      provider: getProviderDisplayName(profile, locale)
     };
   }
 
@@ -265,12 +282,19 @@ async function summarizeTranscript(payload, sender, options = {}) {
   ], { onDelta: streamDelta, i18n: locale, timeoutMs });
   streamNotifier?.flush();
 
-  await maybeSaveHistory(settings, { title, platform, url, summary: finalText, model: profile.model, provider: profile.provider });
+  await maybeSaveHistory(settings, {
+    title,
+    platform,
+    url,
+    summary: finalText,
+    model: getModelDisplayName(profile, locale),
+    provider: getProviderDisplayName(profile, locale)
+  });
   return {
     text: finalText,
     chunks: chunks.length,
-    model: profile.model,
-    provider: profile.provider
+    model: getModelDisplayName(profile, locale),
+    provider: getProviderDisplayName(profile, locale)
   };
 }
 
@@ -312,18 +336,26 @@ function validateProfile(profile, locale = i18n(DEFAULT_SETTINGS)) {
   if (!profile.provider) {
     throw new Error(locale.t("background.error.noProvider"));
   }
-  if (!profile.apiKey && profile.provider !== "ollama") {
+  const supportedProviders = ["proxy", "openai-compatible", "anthropic", "gemini", "ollama"];
+  if (!supportedProviders.includes(profile.provider)) {
+    throw new Error(locale.t("background.error.unsupportedProvider", { provider: profile.provider }));
+  }
+  if (!profile.apiKey && !profile.accessToken && !["proxy", "ollama"].includes(profile.provider)) {
     throw new Error(locale.t("background.error.noApiKey"));
   }
-  if (!profile.model) {
+  if (!profile.model && !["proxy"].includes(profile.provider)) {
     throw new Error(locale.t("background.error.noModel"));
   }
-  if (!profile.endpoint && profile.provider !== "gemini") {
+  if (!getModelEndpoint(profile)) {
     throw new Error(locale.t("background.error.noEndpoint"));
   }
+  assertSafeModelEndpoint(getModelEndpoint(profile), locale);
 }
 
 async function callModel(profile, messages, options = {}) {
+  if (profile.provider === "proxy") {
+    return callSecureProxy(profile, messages, options);
+  }
   if (profile.provider === "openai-compatible" || profile.provider === "ollama") {
     return callOpenAICompatible(profile, messages, options);
   }
@@ -337,6 +369,37 @@ async function callModel(profile, messages, options = {}) {
   throw new Error(locale.t("background.error.unsupportedProvider", { provider: profile.provider }));
 }
 
+async function callSecureProxy(profile, messages, options = {}) {
+  const locale = options.i18n || i18n(DEFAULT_SETTINGS);
+  const wantsStream = typeof options.onDelta === "function";
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Video-Caption-AI": "extension"
+  };
+
+  if (profile.accessToken) {
+    headers.Authorization = `Bearer ${profile.accessToken}`;
+  }
+
+  const response = await fetchModel(getModelEndpoint(profile), {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: profile.model || undefined,
+      messages,
+      temperature: toNumber(profile.temperature, 1),
+      max_tokens: toNumber(profile.maxTokens, 4096),
+      stream: wantsStream
+    })
+  }, profile, locale, { timeoutMs: options.timeoutMs });
+
+  if (wantsStream) {
+    return readOpenAICompatibleStream(response, profile, options.onDelta, locale);
+  }
+
+  return readProxyJsonText(response, profile, locale);
+}
+
 async function callOpenAICompatible(profile, messages, options = {}) {
   const locale = options.i18n || i18n(DEFAULT_SETTINGS);
   const wantsStream = typeof options.onDelta === "function";
@@ -344,8 +407,9 @@ async function callOpenAICompatible(profile, messages, options = {}) {
     "Content-Type": "application/json"
   };
 
-  if (profile.apiKey) {
-    headers.Authorization = `Bearer ${profile.apiKey}`;
+  const apiKey = getProfileApiKey(profile);
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
   }
 
   const body = {
@@ -361,7 +425,7 @@ async function callOpenAICompatible(profile, messages, options = {}) {
     body.temperature = toNumber(profile.temperature, 1);
   }
 
-  const response = await fetchModel(profile.endpoint, {
+  const response = await fetchModel(getModelEndpoint(profile), {
     method: "POST",
     headers,
     body: JSON.stringify(body)
@@ -390,12 +454,11 @@ async function callAnthropic(profile, messages, options = {}) {
       content: message.content
     }));
 
-  const endpoint = profile.endpoint || "https://api.anthropic.com/v1/messages";
-  const response = await fetchModel(endpoint, {
+  const response = await fetchModel(getModelEndpoint(profile), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": profile.apiKey,
+      "x-api-key": getProfileApiKey(profile),
       "anthropic-version": "2023-06-01",
       "anthropic-dangerous-direct-browser-access": "true"
     },
@@ -426,14 +489,14 @@ async function callAnthropic(profile, messages, options = {}) {
 async function callGemini(profile, messages, options = {}) {
   const locale = options.i18n || i18n(DEFAULT_SETTINGS);
   const wantsStream = typeof options.onDelta === "function";
-  const base = profile.endpoint || `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(profile.model)}:generateContent`;
-  const url = new URL(base);
+  const url = new URL(getModelEndpoint(profile));
   if (wantsStream && url.pathname.includes(":generateContent")) {
     url.pathname = url.pathname.replace(":generateContent", ":streamGenerateContent");
     url.searchParams.set("alt", "sse");
   }
-  if (profile.apiKey && !url.searchParams.has("key")) {
-    url.searchParams.set("key", profile.apiKey);
+  const apiKey = getProfileApiKey(profile);
+  if (apiKey && !url.searchParams.has("key")) {
+    url.searchParams.set("key", apiKey);
   }
 
   const text = messages
@@ -642,6 +705,7 @@ function parseStreamJson(data, profile, endpoint, locale = i18n(DEFAULT_SETTINGS
 }
 
 async function fetchModel(url, options, profile, locale = i18n(DEFAULT_SETTINGS), requestOptions = {}) {
+  assertSafeModelEndpoint(url, locale);
   const controller = new AbortController();
   const timeoutMs = normalizeTimeoutMs(requestOptions.timeoutMs);
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -685,14 +749,68 @@ async function readJsonResponse(response, profile, locale = i18n(DEFAULT_SETTING
 
   if (!response.ok) {
     const message = data?.error?.message || data?.message || response.statusText;
-    throw new Error(locale.t("background.error.http", {
-      target: getApiTargetLabel(profile, response.url),
-      status: response.status,
-      message
-    }));
+    throw new Error(readableHttpError({ status: response.status, message, locale }));
   }
 
   return data;
+}
+
+function readableHttpError({ status, message, locale = i18n(DEFAULT_SETTINGS) }) {
+  const text = String(message || "");
+  if (isRiskControlMessage(text)) {
+    return locale.t("background.error.highRisk");
+  }
+  return locale.t("background.error.http", {
+    status,
+    message: text || "Request failed"
+  });
+}
+
+function isRiskControlMessage(message) {
+  return /high risk|risk control|rejected because|安全|风控|风险|敏感/i.test(String(message || ""));
+}
+
+async function readProxyJsonText(response, profile, locale = i18n(DEFAULT_SETTINGS)) {
+  const data = await readJsonResponse(response, profile, locale);
+  const content = data?.text
+    || data?.summary
+    || data?.output
+    || data?.choices?.[0]?.message?.content
+    || data?.choices?.[0]?.text;
+  if (!content) {
+    throw new Error(locale.t("background.error.proxyNoText"));
+  }
+  return String(content).trim();
+}
+
+function getModelEndpoint(profile) {
+  if (profile?.provider === "gemini" && !profile.endpoint) {
+    const model = profile.model || "gemini-pro";
+    return `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  }
+  if (profile?.provider === "anthropic" && !profile.endpoint) {
+    return "https://api.anthropic.com/v1/messages";
+  }
+  return profile?.endpoint || "";
+}
+
+function getProfileApiKey(profile) {
+  return String(profile?.apiKey || profile?.accessToken || "");
+}
+
+function getModelDisplayName(profile, locale = i18n(DEFAULT_SETTINGS)) {
+  return profile?.model || profile?.name || locale.t("background.label.defaultModel");
+}
+
+function getProviderDisplayName(profile, locale = i18n(DEFAULT_SETTINGS)) {
+  const key = {
+    proxy: "background.provider.proxy",
+    "openai-compatible": "background.provider.openai",
+    anthropic: "background.provider.anthropic",
+    gemini: "background.provider.gemini",
+    ollama: "background.provider.ollama"
+  }[profile?.provider];
+  return key ? locale.t(key) : profile?.provider || "";
 }
 
 function shouldDisableKimiThinking(profile) {
@@ -718,6 +836,119 @@ function getApiTargetLabel(profile, endpoint) {
   }
   const model = profile?.model || "unknown model";
   return `${model} @ ${host}`;
+}
+
+function validateCaptionFetchUrl(rawUrl, sender, locale = i18n(DEFAULT_SETTINGS)) {
+  if (!rawUrl || typeof rawUrl !== "string") {
+    return null;
+  }
+
+  let url = null;
+  try {
+    url = new URL(rawUrl);
+  } catch (_error) {
+    throw new Error(locale.t("background.error.fetchUrlMissing"));
+  }
+
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error(locale.t("background.error.unsafeFetchUrl"));
+  }
+
+  const senderUrl = parseUrl(sender?.tab?.url);
+  const sameSenderHost = senderUrl?.hostname && normalizeHostname(senderUrl.hostname) === normalizeHostname(url.hostname);
+  if (url.protocol === "http:" && !sameSenderHost && !isLoopbackHostname(url.hostname)) {
+    throw new Error(locale.t("background.error.unsafeFetchUrl"));
+  }
+  if (isPrivateNetworkHostname(url.hostname) && !sameSenderHost) {
+    throw new Error(locale.t("background.error.privateFetchUrl"));
+  }
+
+  return url;
+}
+
+function shouldIncludeFetchCredentials(url, sender) {
+  const senderUrl = parseUrl(sender?.tab?.url);
+  if (!senderUrl?.hostname || !url?.hostname) {
+    return false;
+  }
+
+  const senderHost = normalizeHostname(senderUrl.hostname);
+  const targetHost = normalizeHostname(url.hostname);
+  if (senderHost === targetHost) {
+    return true;
+  }
+
+  const senderSite = getCredentialSite(senderHost);
+  return Boolean(senderSite && senderSite === getCredentialSite(targetHost));
+}
+
+function getCredentialSite(hostname) {
+  const host = normalizeHostname(hostname);
+  const sites = [
+    "bilibili.com",
+    "youtube.com",
+    "vimeo.com",
+    "ted.com"
+  ];
+  return sites.find((site) => host === site || host.endsWith(`.${site}`)) || "";
+}
+
+function assertSafeModelEndpoint(rawUrl, locale = i18n(DEFAULT_SETTINGS)) {
+  const url = parseUrl(rawUrl);
+  if (!url) {
+    throw new Error(locale.t("background.error.noEndpoint"));
+  }
+  if (url.protocol === "https:") {
+    return;
+  }
+  if (url.protocol === "http:" && isLoopbackHostname(url.hostname)) {
+    return;
+  }
+  throw new Error(locale.t("background.error.unsafeEndpoint"));
+}
+
+function parseUrl(value) {
+  try {
+    return value ? new URL(value) : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function normalizeHostname(hostname) {
+  return String(hostname || "")
+    .replace(/^\[/, "")
+    .replace(/\]$/, "")
+    .toLowerCase();
+}
+
+function isLoopbackHostname(hostname) {
+  const host = normalizeHostname(hostname);
+  return host === "localhost"
+    || host.endsWith(".localhost")
+    || host === "::1"
+    || host === "0:0:0:0:0:0:0:1"
+    || host.startsWith("127.");
+}
+
+function isPrivateNetworkHostname(hostname) {
+  const host = normalizeHostname(hostname);
+  if (isLoopbackHostname(host) || host === "0.0.0.0" || host.endsWith(".local")) {
+    return true;
+  }
+
+  const parts = host.split(".").map((part) => Number(part));
+  if (parts.length === 4 && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) {
+    return parts[0] === 10
+      || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+      || (parts[0] === 192 && parts[1] === 168)
+      || (parts[0] === 169 && parts[1] === 254)
+      || (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127);
+  }
+
+  return host.startsWith("fc")
+    || host.startsWith("fd")
+    || host.startsWith("fe80:");
 }
 
 function chunkTranscript(text, size, overlap) {
@@ -860,7 +1091,7 @@ function normalizeSettings(input) {
   normalized.panelEnabled = normalized.panelEnabled !== false;
   normalized.includeTimestamps = normalized.includeTimestamps !== false;
   normalized.includeTitleAndUrl = normalized.includeTitleAndUrl !== false;
-  normalized.saveHistory = importedVersion < 2 ? true : normalized.saveHistory !== false;
+  normalized.saveHistory = normalized.saveHistory === true;
   normalized.promptTemplate = String(normalized.promptTemplate || DEFAULT_SETTINGS.promptTemplate);
   normalized.outputTemplate = String(normalized.outputTemplate || DEFAULT_SETTINGS.outputTemplate);
   normalized.redactTerms = String(normalized.redactTerms || "");
@@ -876,26 +1107,75 @@ function normalizeSettings(input) {
   if (!Array.isArray(normalized.profiles) || !normalized.profiles.length) {
     normalized.profiles = structuredClone(DEFAULT_SETTINGS.profiles);
   }
-  normalized.profiles = normalized.profiles.map((profile, index) => {
-    const temperature = importedVersion < 3 && Number(profile?.temperature) === 0.2
-      ? 1
-      : profile?.temperature;
-    return {
-      id: String(profile?.id || `profile-${index + 1}`),
-      name: String(profile?.name || profile?.id || `API ${index + 1}`),
-      provider: String(profile?.provider || "openai-compatible"),
-      endpoint: String(profile?.endpoint || ""),
-      apiKey: String(profile?.apiKey || ""),
-      model: String(profile?.model || ""),
-      temperature: clampNumber(temperature, 1, 0, 2),
-      maxTokens: clampNumber(profile?.maxTokens, 4096, 256, 32000)
-    };
-  });
+  normalized.profiles = normalized.profiles.map((profile, index) => normalizeProfile(profile, index, importedVersion));
   if (!normalized.profiles.some((profile) => profile.id === normalized.activeProfileId)) {
     normalized.activeProfileId = normalized.profiles[0].id;
   }
 
   return normalized;
+}
+
+function normalizeProfile(profile, index, importedVersion) {
+  const source = profile || {};
+  const rawProvider = String(source.provider || DEFAULT_SETTINGS.profiles[0].provider || "openai-compatible");
+  const isLocalOpenAI = rawProvider === "ollama"
+    || (rawProvider === "openai-compatible" && isLoopbackEndpoint(source.endpoint));
+  const supportedProviders = ["proxy", "openai-compatible", "anthropic", "gemini", "ollama"];
+  const provider = isLocalOpenAI
+    ? "ollama"
+    : (supportedProviders.includes(rawProvider) ? rawProvider : "openai-compatible");
+  const fallback = getProviderFallback(provider);
+  const temperature = importedVersion < 3 && Number(source.temperature) === 0.2
+    ? 1
+    : source.temperature;
+
+  return {
+    id: String(source.id || fallback.id || `profile-${index + 1}`),
+    name: String(source.name || fallback.name || `Profile ${index + 1}`),
+    provider,
+    endpoint: String(source.endpoint || fallback.endpoint || ""),
+    apiKey: String(source.apiKey || (!["proxy", "ollama"].includes(provider) ? source.accessToken || "" : "")),
+    accessToken: String(provider === "proxy" ? source.accessToken || "" : ""),
+    model: String(source.model || fallback.model || ""),
+    temperature: clampNumber(temperature, 1, 0, 2),
+    maxTokens: clampNumber(source.maxTokens, 4096, 256, 32000)
+  };
+}
+
+function getProviderFallback(provider) {
+  const fallbacks = {
+    proxy: {
+      id: "proxy",
+      name: "专用服务",
+      provider: "proxy",
+      endpoint: ""
+    },
+    "openai-compatible": DEFAULT_SETTINGS.profiles[0],
+    anthropic: {
+      id: "claude",
+      name: "Claude",
+      provider: "anthropic",
+      endpoint: "https://api.anthropic.com/v1/messages"
+    },
+    gemini: {
+      id: "gemini",
+      name: "Gemini",
+      provider: "gemini",
+      endpoint: ""
+    },
+    ollama: {
+      id: "ollama",
+      name: "Ollama Local",
+      provider: "ollama",
+      endpoint: "http://localhost:11434/v1/chat/completions"
+    }
+  };
+  return fallbacks[provider] || DEFAULT_SETTINGS.profiles[0];
+}
+
+function isLoopbackEndpoint(endpoint) {
+  const url = parseUrl(endpoint);
+  return Boolean(url && url.protocol === "http:" && isLoopbackHostname(url.hostname));
 }
 
 function deepMerge(base, extra) {
