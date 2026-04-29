@@ -1,7 +1,71 @@
 import "./i18n.js";
 
+const OLD_DEFAULT_PROMPT_TEMPLATE = [
+  "你是一个擅长处理视频字幕的中文研究助理。",
+  "请根据下面的视频字幕生成高质量总结。",
+  "",
+  "标题：{{title}}",
+  "平台：{{platform}}",
+  "链接：{{url}}",
+  "输出语言：{{language}}",
+  "",
+  "字幕：",
+  "{{transcript}}"
+].join("\n");
+
+const OLD_DEFAULT_OUTPUT_TEMPLATE = [
+  "请使用 Markdown 输出：",
+  "## 一句话结论",
+  "## 核心摘要",
+  "## 关键观点",
+  "- 每条观点尽量带上相关时间点",
+  "## 章节时间线",
+  "## 可执行事项 / 值得追问的问题"
+].join("\n");
+
+const DEFAULT_PROMPT_TEMPLATE = [
+  "你是一位视频内容提炼专家。请基于字幕文本，生成一份精炼、高信息密度的结构化总结。",
+  "",
+  "## 视频信息",
+  "📌 标题：{{title}}｜🌐 平台：{{platform}}｜🔗 链接：{{url}}",
+  "",
+  "## 核心原则",
+  "- 总结 ≠ 复述。你的任务是**压缩与重构**，不是逐段改写",
+  "- 保留硬信息（数据、人名、术语、方法论），砍掉软信息（过渡语、重复论证、情绪渲染）",
+  "- 每句话必须承载独立信息量，删掉后会造成信息缺失才有资格留下",
+  "- 仅基于字幕实际内容，不推测、不补充、不评价",
+  "",
+  "## 输出语言：{{language}}",
+  "",
+  "## 输出格式",
+  "{{outputTemplate}}",
+  "",
+  "## 字幕正文",
+  "{{transcript}}"
+].join("\n");
+
+const DEFAULT_OUTPUT_TEMPLATE = [
+  "请使用 Markdown 输出：",
+  "",
+  "## 💡 一句话结论",
+  "≤ 30字。视频最核心的一个判断或发现。",
+  "",
+  "## 📋 核心摘要",
+  "3~4句话覆盖完整逻辑链：什么问题 → 什么观点/方案 → 什么结论。不用条目，写成连贯段落。",
+  "",
+  "## 🎯 关键观点",
+  "3~7条，每条格式：",
+  "- ⏱️ [时间戳] **关键词**：一句话说明（无时间戳则省略⏱️）",
+  "",
+  "只保留\"删掉就损失信息\"的观点，不凑数。",
+  "",
+  "## 🗂️ 章节时间线",
+  "按叙事顺序分3~6段，每段格式：",
+  "- ⏱️ [起止时间] **章节名**：一句话概括（无时间戳则用 1️⃣2️⃣3️⃣ 编号）"
+].join("\n");
+
 const DEFAULT_SETTINGS = {
-  settingsVersion: 6,
+  settingsVersion: 7,
   theme: "auto",
   uiLanguage: "zh-CN",
   language: "中文（简体）",
@@ -20,27 +84,8 @@ const DEFAULT_SETTINGS = {
       maxTokens: 4096
     }
   ],
-  promptTemplate: [
-    "你是一个擅长处理视频字幕的中文研究助理。",
-    "请根据下面的视频字幕生成高质量总结。",
-    "",
-    "标题：{{title}}",
-    "平台：{{platform}}",
-    "链接：{{url}}",
-    "输出语言：{{language}}",
-    "",
-    "字幕：",
-    "{{transcript}}"
-  ].join("\n"),
-  outputTemplate: [
-    "请使用 Markdown 输出：",
-    "## 一句话结论",
-    "## 核心摘要",
-    "## 关键观点",
-    "- 每条观点尽量带上相关时间点",
-    "## 章节时间线",
-    "## 可执行事项 / 值得追问的问题"
-  ].join("\n"),
+  promptTemplate: DEFAULT_PROMPT_TEMPLATE,
+  outputTemplate: DEFAULT_OUTPUT_TEMPLATE,
   chunkSize: 12000,
   chunkOverlap: 600,
   requestTimeoutSeconds: 60,
@@ -1094,6 +1139,12 @@ function normalizeSettings(input) {
   normalized.saveHistory = normalized.saveHistory === true;
   normalized.promptTemplate = String(normalized.promptTemplate || DEFAULT_SETTINGS.promptTemplate);
   normalized.outputTemplate = String(normalized.outputTemplate || DEFAULT_SETTINGS.outputTemplate);
+  if (String(input?.promptTemplate || "") === OLD_DEFAULT_PROMPT_TEMPLATE) {
+    normalized.promptTemplate = DEFAULT_SETTINGS.promptTemplate;
+  }
+  if (String(input?.outputTemplate || "") === OLD_DEFAULT_OUTPUT_TEMPLATE) {
+    normalized.outputTemplate = DEFAULT_SETTINGS.outputTemplate;
+  }
   normalized.redactTerms = String(normalized.redactTerms || "");
   normalized.chunkSize = clampNumber(normalized.chunkSize, DEFAULT_SETTINGS.chunkSize, 2000, 50000);
   normalized.chunkOverlap = clampNumber(normalized.chunkOverlap, DEFAULT_SETTINGS.chunkOverlap, 0, 5000);
