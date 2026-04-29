@@ -22,7 +22,9 @@
     status: "正在读取字幕",
     statusTone: "neutral",
     progress: null,
-    refreshing: false
+    refreshing: false,
+    copyingTranscript: false,
+    copyingSummary: false
   };
 
   let root = null;
@@ -485,9 +487,25 @@
     }
 
     if (track.source === "youtube") {
-      const url = addQueryParam(track.url, "fmt", "json3");
-      const response = await extensionFetch(url);
-      return parseYouTubeTranscript(response.text);
+      const transcript = await loadYouTubeTrackTranscript(track);
+      if (transcript) {
+        return transcript;
+      }
+
+      for (const fallbackTrack of state.tracks.filter((item) => item.source === "youtube" && item.id !== track.id)) {
+        const fallbackTranscript = await loadYouTubeTrackTranscript(fallbackTrack);
+        if (fallbackTranscript) {
+          state.selectedTrackId = fallbackTrack.id;
+          return fallbackTranscript;
+        }
+      }
+
+      const visibleTranscript = getVisibleTranscript();
+      if (visibleTranscript) {
+        return visibleTranscript;
+      }
+
+      throw new Error("已找到字幕轨道，但 YouTube 返回了空字幕内容。请换一条字幕轨，或打开 YouTube 转写文稿后再试。");
     }
 
     if (track.source === "bilibili") {
@@ -505,6 +523,25 @@
     }
 
     throw new Error(`不支持的字幕来源：${track.source}`);
+  }
+
+  async function loadYouTubeTrackTranscript(track) {
+    const formats = ["json3", "srv3", "vtt", ""];
+    for (const format of formats) {
+      try {
+        const url = format ? addQueryParam(track.url, "fmt", format) : track.url;
+        const response = await extensionFetch(url);
+        const transcript = format === "vtt"
+          ? parseTextTrack(response.text)
+          : parseYouTubeTranscript(response.text) || parseTextTrack(response.text);
+        if (transcript.trim()) {
+          return transcript.trim();
+        }
+      } catch (_error) {
+        // Try the next format or fallback track.
+      }
+    }
+    return "";
   }
 
   async function extensionFetch(url) {
@@ -594,8 +631,9 @@
     shadow.innerHTML = `
       <style>${getPanelCss()}</style>
       <aside class="vcs-panel ${state.collapsed ? "is-collapsed" : ""} ${embedClass}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
-        <button id="vcs-expand" class="vcs-seal-collapsed" type="button" title="展开字幕摘要">
-          <span class="vcs-seal-char">AI 摘要</span>
+        <button id="vcs-expand" class="vcs-collapsed-toggle" type="button" title="展开字幕摘要" aria-label="展开字幕摘要">
+          <span class="vcs-collapsed-icon">${expandIcon()}</span>
+          <span class="vcs-collapsed-title">字幕摘要</span>
         </button>
 
         <header class="vcs-header">
@@ -607,9 +645,9 @@
             </div>
           </div>
           <div class="vcs-actions">
-            <button id="vcs-refresh" class="vcs-icon-button ${state.refreshing ? "is-spinning" : ""}" title="重新检测字幕" aria-label="重新检测">${refreshIcon()}</button>
-            <button id="vcs-options" class="vcs-icon-button" title="打开设置" aria-label="设置">${settingsIcon()}</button>
-            <button id="vcs-collapse" class="vcs-icon-button" title="收起" aria-label="收起">${closeIcon()}</button>
+            <button id="vcs-refresh" class="vcs-icon-button ${state.refreshing ? "is-spinning" : ""}" data-motion="spin" title="重新检测字幕" aria-label="重新检测">${refreshIcon()}</button>
+            <button id="vcs-options" class="vcs-icon-button" data-motion="gear" title="打开设置" aria-label="设置">${settingsIcon()}</button>
+            <button id="vcs-collapse" class="vcs-icon-button vcs-collapse-button" title="折叠面板" aria-label="折叠面板">${collapseIcon()}</button>
           </div>
         </header>
 
@@ -632,7 +670,7 @@
             <select id="vcs-track" class="vcs-select" ${state.tracks.length ? "" : "disabled"}>
               ${trackOptions || "<option>未发现字幕轨道</option>"}
             </select>
-            <button id="vcs-copy-transcript" class="vcs-tool-button" type="button" title="复制字幕">${copyIcon()}</button>
+            <button id="vcs-copy-transcript" class="vcs-tool-button ${state.copyingTranscript ? "is-busy" : ""}" type="button" title="复制字幕" aria-label="复制字幕">${state.copyingTranscript ? loadingIcon() : copyIcon()}</button>
           </div>
 
           <details class="vcs-details">
@@ -648,7 +686,7 @@
           <section class="vcs-result" ${state.lastSummary ? "" : "hidden"}>
             <div class="vcs-result-head">
               <span class="vcs-result-title">摘要</span>
-              <button id="vcs-copy-summary" class="vcs-tool-button" type="button" title="复制摘要">${copyIcon()}</button>
+              <button id="vcs-copy-summary" class="vcs-tool-button ${state.copyingSummary ? "is-busy" : ""}" type="button" title="复制摘要" aria-label="复制摘要">${state.copyingSummary ? loadingIcon() : copyIcon()}</button>
             </div>
             <article id="vcs-summary">${markdownToHtml(state.lastSummary)}</article>
           </section>
@@ -677,17 +715,90 @@
       state.selectedTrackId = event.target.value;
     });
     shadow.querySelector("#vcs-summarize")?.addEventListener("click", summarize);
-    shadow.querySelector("#vcs-copy-transcript")?.addEventListener("click", async () => {
+    shadow.querySelector("#vcs-copy-transcript")?.addEventListener("click", copyTranscript);
+    shadow.querySelector("#vcs-copy-summary")?.addEventListener("click", copySummary);
+  }
+
+  async function copyTranscript() {
+    if (state.copyingTranscript) {
+      return;
+    }
+
+    state.copyingTranscript = true;
+    setStatus("正在复制字幕", "busy");
+    render();
+
+    try {
       const text = state.transcript || await loadSelectedTranscript();
-      state.transcript = text;
-      await navigator.clipboard.writeText(text);
-      setStatus("字幕已复制", "done");
+      const cleanText = text.trim();
+      if (!cleanText) {
+        throw new Error("没有可复制的字幕内容。");
+      }
+      state.transcript = cleanText;
+      await copyTextToClipboard(cleanText);
+      setStatus(`字幕已复制（${cleanText.length} 字符）`, "done");
+    } catch (error) {
+      setStatus(`复制失败：${error.message}`, "error");
+    } finally {
+      state.copyingTranscript = false;
       render();
-    });
-    shadow.querySelector("#vcs-copy-summary")?.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(state.lastSummary || "");
-      setStatus("总结已复制", "done");
-    });
+    }
+  }
+
+  async function copySummary() {
+    if (state.copyingSummary) {
+      return;
+    }
+
+    state.copyingSummary = true;
+    setStatus("正在复制摘要", "busy");
+    render();
+
+    try {
+      const text = (state.lastSummary || "").trim();
+      if (!text) {
+        throw new Error("还没有可复制的摘要。");
+      }
+      await copyTextToClipboard(text);
+      setStatus("摘要已复制", "done");
+    } catch (error) {
+      setStatus(`复制失败：${error.message}`, "error");
+    } finally {
+      state.copyingSummary = false;
+      render();
+    }
+  }
+
+  async function copyTextToClipboard(text) {
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch (_error) {
+        // Fall back to the selection-based path below.
+      }
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.top = "0";
+    textarea.style.left = "0";
+    textarea.style.width = "1px";
+    textarea.style.height = "1px";
+    textarea.style.opacity = "0";
+    textarea.style.pointerEvents = "none";
+    document.documentElement.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, text.length);
+    const copied = document.execCommand("copy");
+    textarea.remove();
+
+    if (!copied) {
+      throw new Error("浏览器拒绝写入剪贴板。");
+    }
   }
 
   function applyTheme() {
@@ -1145,12 +1256,20 @@
     return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z'/><path d='M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1A2 2 0 1 1 4.2 17l.1-.1A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1A2 2 0 1 1 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3h.1a1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.6h.1a1.7 1.7 0 0 0 1.9-.3l.1-.1A2 2 0 1 1 19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.6 1h.1a2 2 0 1 1 0 4H21a1.7 1.7 0 0 0-1.6 1Z'/></svg>";
   }
 
-  function closeIcon() {
-    return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M6 6l12 12M18 6L6 18'/></svg>";
+  function collapseIcon() {
+    return "<svg viewBox='0 0 24 24' aria-hidden='true'><rect x='4' y='5' width='16' height='14' rx='1'/><path d='M15 5v14'/><path d='M10 9l-3 3 3 3'/></svg>";
+  }
+
+  function expandIcon() {
+    return "<svg viewBox='0 0 24 24' aria-hidden='true'><rect x='4' y='5' width='16' height='14' rx='1'/><path d='M9 5v14'/><path d='M14 9l3 3-3 3'/></svg>";
   }
 
   function copyIcon() {
     return "<svg viewBox='0 0 24 24' aria-hidden='true'><rect x='9' y='9' width='13' height='13' rx='2'/><path d='M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'/></svg>";
+  }
+
+  function loadingIcon() {
+    return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3a9 9 0 1 0 9 9'/></svg>";
   }
 
   function getPanelCss() {
@@ -1182,11 +1301,13 @@
         color: var(--sumi);
         background: var(--paper);
         border: 1px solid var(--haijiro);
-        border-radius: 12px;
+        border-radius: 6px;
         font: 13px/1.7 var(--sans);
         letter-spacing: 0;
         overflow: hidden;
         box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+        transform-origin: top right;
+        animation: vcs-panel-in 180ms ease both;
       }
 
       .vcs-panel.is-floating {
@@ -1238,7 +1359,7 @@
         height: 30px;
         color: var(--paper);
         background: var(--shu);
-        border-radius: 8px;
+        border-radius: 4px;
         font: 700 12px/1 var(--sans);
         letter-spacing: 0;
         user-select: none;
@@ -1283,7 +1404,7 @@
         color: var(--nezumi);
         background: transparent;
         border: 0;
-        border-radius: 999px;
+        border-radius: 4px;
         cursor: pointer;
         transition: color 180ms ease, background 180ms ease, transform 180ms ease;
       }
@@ -1293,12 +1414,22 @@
         transform: translateY(-1px);
       }
       .vcs-icon-button:active, .vcs-tool-button:active,
-      .vcs-primary:active, .vcs-seal-collapsed:active {
+      .vcs-primary:active, .vcs-collapsed-toggle:active {
         transform: translateY(0) scale(0.98);
       }
       .vcs-icon-button.is-spinning svg {
-        animation: vcs-spin 700ms cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
+        animation: vcs-spin 720ms cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
         transform-origin: 50% 50%;
+      }
+      .vcs-tool-button.is-busy svg {
+        animation: vcs-spin 760ms linear infinite;
+        transform-origin: 50% 50%;
+      }
+      .vcs-icon-button[data-motion="gear"]:hover svg {
+        transform: rotate(38deg);
+      }
+      .vcs-collapse-button:hover svg {
+        transform: translateX(-1px);
       }
 
       svg {
@@ -1309,6 +1440,7 @@
         stroke-width: 1.8;
         stroke-linecap: round;
         stroke-linejoin: round;
+        transition: transform 180ms ease;
       }
 
       .vcs-body {
@@ -1366,7 +1498,7 @@
       .vcs-progress {
         position: relative;
         height: 2px;
-        border-radius: 999px;
+        border-radius: 2px;
         overflow: hidden;
         background: var(--haijiro);
       }
@@ -1390,7 +1522,7 @@
         color: var(--paper);
         background: var(--sumi);
         border: 1px solid var(--sumi);
-        border-radius: 999px;
+        border-radius: 4px;
         font: 650 13px/1 var(--sans);
         letter-spacing: 0;
         cursor: pointer;
@@ -1480,7 +1612,7 @@
         color: var(--sumi);
         background: var(--washi);
         border: 1px solid var(--haijiro);
-        border-radius: 10px;
+        border-radius: 4px;
         outline: none;
         font: 12px/1.7 var(--sans);
       }
@@ -1527,29 +1659,45 @@
       #vcs-summary ul { margin: 0 0 10px; padding-left: 18px; color: var(--sumi-soft); }
       #vcs-summary li { margin-bottom: 4px; }
 
-      .vcs-seal-collapsed {
+      .vcs-collapsed-toggle {
         display: none;
-        width: 112px;
-        height: 36px;
-        padding: 0 14px;
-        color: var(--paper);
-        background: var(--shu);
-        border: 0;
-        border-radius: 999px;
+        grid-template-columns: 22px auto;
+        align-items: center;
+        gap: 8px;
+        width: 136px;
+        min-height: 36px;
+        padding: 0 10px 0 8px;
+        color: var(--sumi);
+        background: var(--paper);
+        border: 1px solid var(--haijiro);
+        border-radius: 4px;
         cursor: pointer;
         font: 650 12px/1 var(--sans);
         letter-spacing: 0;
-        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.14);
-        transition: opacity 180ms ease, transform 180ms ease, box-shadow 180ms ease;
+        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.12);
+        transform-origin: top right;
+        animation: vcs-tab-in 180ms ease both;
+        transition: border-color 180ms ease, transform 180ms ease, box-shadow 180ms ease;
       }
-      .vcs-seal-collapsed:hover {
-        opacity: 0.92;
+      .vcs-collapsed-toggle:hover {
+        border-color: var(--sumi);
         transform: translateY(-1px);
-        box-shadow: 0 14px 30px rgba(0, 0, 0, 0.18);
+        box-shadow: 0 14px 30px rgba(0, 0, 0, 0.16);
       }
-      .vcs-seal-char {
+      .vcs-collapsed-toggle:hover svg {
+        transform: translateX(1px);
+      }
+      .vcs-collapsed-icon {
+        display: grid;
+        place-items: center;
+        width: 22px;
+        height: 22px;
+        color: var(--paper);
+        background: var(--sumi);
+        border-radius: 3px;
+      }
+      .vcs-collapsed-title {
         display: block;
-        transform: translateY(0.5px);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -1565,9 +1713,8 @@
       .vcs-panel.is-collapsed .vcs-body {
         display: none;
       }
-      .vcs-panel.is-collapsed .vcs-seal-collapsed {
+      .vcs-panel.is-collapsed .vcs-collapsed-toggle {
         display: grid;
-        place-items: center;
       }
       .vcs-panel.is-floating.is-collapsed {
         top: 84px;
@@ -1583,10 +1730,22 @@
         100% { transform: rotate(360deg); }
       }
 
+      @keyframes vcs-panel-in {
+        0% { opacity: 0; transform: translateX(12px) scale(0.985); }
+        100% { opacity: 1; transform: translateX(0) scale(1); }
+      }
+
+      @keyframes vcs-tab-in {
+        0% { opacity: 0; transform: translateX(10px); }
+        100% { opacity: 1; transform: translateX(0); }
+      }
+
       @media (prefers-reduced-motion: reduce) {
         .vcs-panel[data-tone="busy"] .vcs-progress span { animation: none; }
         .vcs-icon-button.is-spinning svg { animation: none; }
-        .vcs-primary, .vcs-icon-button, .vcs-tool-button, .vcs-seal-collapsed { transition: none; }
+        .vcs-tool-button.is-busy svg { animation: none; }
+        .vcs-panel, .vcs-collapsed-toggle { animation: none; }
+        .vcs-primary, .vcs-icon-button, .vcs-tool-button, .vcs-collapsed-toggle { transition: none; }
       }
 
       @media (max-width: 1100px) {

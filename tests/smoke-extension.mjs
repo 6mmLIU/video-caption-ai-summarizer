@@ -11,6 +11,7 @@ const outputDir = join(rootDir, "output", "playwright");
 const userDataDir = join(rootDir, "output", `chrome-profile-${Date.now()}`);
 const externalVideoUrl = process.env.VCS_TEST_URL || "";
 const externalNonVideoUrl = process.env.VCS_NON_VIDEO_URL || "";
+const skipCopyCheck = process.env.VCS_SKIP_COPY === "1";
 const chromeCandidates = [
   "/Users/liu/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
   "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
@@ -166,6 +167,33 @@ try {
   await delay(280);
   await capture(videoPage, join(outputDir, "video-panel.png"));
 
+  let copyState = null;
+  if (!skipCopyCheck) {
+    await evaluate(videoPage, `
+      document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-copy-transcript").click();
+      return true;
+    `, { userGesture: true });
+    await waitForExpression(videoPage, `
+      (() => {
+        const root = document.querySelector("#vcs-root");
+        const shadow = root?.shadowRoot;
+        const status = shadow?.querySelector("#vcs-status")?.textContent || "";
+        return status.includes("字幕已复制") || status.includes("复制失败");
+      })()
+    `, waitTimeout);
+    copyState = await evaluate(videoPage, `
+      const root = document.querySelector("#vcs-root");
+      const shadow = root.shadowRoot;
+      return {
+        status: shadow.querySelector("#vcs-status")?.textContent || "",
+        transcriptLength: shadow.querySelector("#vcs-preview")?.value?.length || 0
+      };
+    `);
+    if (!copyState.status.includes("字幕已复制") || copyState.transcriptLength < 40) {
+      throw new Error(`Transcript copy failed: ${JSON.stringify(copyState)}`);
+    }
+  }
+
   await evaluate(videoPage, `
     document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-refresh").click();
     return true;
@@ -223,6 +251,8 @@ try {
     targetNonVideoUrl,
     extensionId,
     panelState,
+    copyState,
+    skipCopyCheck,
     refreshAnimated,
     nonVideoState,
     screenshots: [
@@ -278,11 +308,12 @@ async function waitForExpression(cdp, expression, timeoutMs) {
   throw new Error(`Timed out waiting for expression: ${expression}`);
 }
 
-async function evaluate(cdp, expression) {
+async function evaluate(cdp, expression, options = {}) {
   const result = await cdp.send("Runtime.evaluate", {
     expression: `(() => { ${expression} })()`,
     returnByValue: true,
-    awaitPromise: true
+    awaitPromise: true,
+    userGesture: Boolean(options.userGesture)
   });
   if (result.exceptionDetails) {
     throw new Error(result.exceptionDetails.text || "Runtime.evaluate failed");
