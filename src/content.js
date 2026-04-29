@@ -1,11 +1,15 @@
 (() => {
   const PANEL_ID = "vcs-root";
+  const PAGE_STYLE_ID = "vcs-page-polish";
+  const AI_MARK_URL = chrome.runtime.getURL("icons/ai-mark.png");
   const DEFAULT_SETTINGS = {
+    settingsVersion: 2,
     theme: "auto",
     language: "中文（简体）",
-    activeProfileId: "deepseek",
+    activeProfileId: "custom",
     panelEnabled: true,
-    includeTimestamps: true
+    includeTimestamps: true,
+    saveHistory: true
   };
 
   const state = {
@@ -23,6 +27,7 @@
     statusTone: "neutral",
     progress: null,
     refreshing: false,
+    previewLoading: false,
     copyingTranscript: false,
     copyingSummary: false
   };
@@ -31,6 +36,11 @@
   let shadow = null;
   let lastUrl = location.href;
   let refreshTimer = null;
+  let statusSwapTimer = null;
+  let previewPromise = null;
+  let activeVideo = null;
+  let lastActiveTranscriptIndex = -1;
+  let transcriptPanelCloseTimer = null;
 
   init();
 
@@ -96,22 +106,30 @@
 
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area === "local" && changes.vcsSettings) {
-        state.settings = {
-          ...DEFAULT_SETTINGS,
-          ...changes.vcsSettings.newValue
-        };
+        state.settings = normalizeSettings(changes.vcsSettings.newValue);
+        if (state.settings.panelEnabled === false) {
+          unmount();
+          return;
+        }
+        if (!state.mounted && shouldShowPanel()) {
+          maybeMount();
+          return;
+        }
         applyTheme();
         render();
+      }
+    });
+
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+      if (state.settings.theme === "auto" && state.mounted) {
+        applyTheme();
       }
     });
   }
 
   async function loadSettings() {
     const result = await chrome.storage.local.get("vcsSettings");
-    return {
-      ...DEFAULT_SETTINGS,
-      ...(result.vcsSettings || {})
-    };
+    return normalizeSettings(result.vcsSettings);
   }
 
   function observeNavigation() {
@@ -141,6 +159,7 @@
       state.transcript = "";
       state.lastSummary = "";
       state.platform = null;
+      state.previewLoading = false;
       state.collapsed = true;
       if (shouldShowPanel()) {
         const wasMounted = state.mounted;
@@ -163,6 +182,8 @@
       return;
     }
 
+    applyPagePolish();
+
     const wasMounted = state.mounted;
     if (!root) {
       root = document.createElement("div");
@@ -184,6 +205,10 @@
     if (root?.parentElement) {
       root.remove();
     }
+    clearTimeout(transcriptPanelCloseTimer);
+    endYouTubeTranscriptProbe();
+    removePagePolish();
+    unbindVideoSync();
     state.mounted = false;
     state.embedded = false;
     state.platform = null;
@@ -191,7 +216,10 @@
 
   function placeRoot() {
     const target = findEmbedTarget();
-    if (target && root.parentElement !== target) {
+    if (target && target !== document.documentElement && (root.parentElement !== target || target.firstElementChild !== root)) {
+      target.insertBefore(root, target.firstChild);
+      state.embedded = true;
+    } else if (target && root.parentElement !== target) {
       if (target === document.documentElement) {
         target.appendChild(root);
       } else {
@@ -227,11 +255,16 @@
       name: "Generic Video",
       kind: "generic"
     };
+    if (state.platform.kind === "youtube") {
+      scheduleCloseYouTubeTranscriptPanel({ attempts: 4, delayMs: 120 });
+    }
     state.title = getVideoTitle();
+    state.transcript = "";
     state.status = "正在读取字幕轨道";
     state.statusTone = "busy";
     state.progress = null;
     state.refreshing = true;
+    lastActiveTranscriptIndex = -1;
     render();
 
     try {
@@ -240,7 +273,7 @@
       state.selectedTrackId = chooseDefaultTrackId(tracks);
       state.status = tracks.length
         ? `已发现 ${tracks.length} 条字幕轨道`
-        : "没有发现可直接读取的字幕，可粘贴字幕后总结";
+        : "没有发现可直接读取的字幕，可打开平台转写文稿后重试";
       state.statusTone = tracks.length ? "done" : "neutral";
     } catch (error) {
       state.tracks = [];
@@ -255,6 +288,9 @@
     }
 
     render();
+    if (state.tracks.length) {
+      hydrateTranscriptPreview({ silent: true }).catch(() => {});
+    }
   }
 
   function delay(ms) {
@@ -468,18 +504,13 @@
   }
 
   async function loadSelectedTranscript() {
-    const manual = getManualTranscript();
-    if (manual) {
-      return manual;
-    }
-
     const track = state.tracks.find((item) => item.id === state.selectedTrackId) || state.tracks[0];
     if (!track) {
       const visibleTranscript = getVisibleTranscript();
       if (visibleTranscript) {
         return visibleTranscript;
       }
-      throw new Error("没有可用字幕。你可以在面板底部粘贴字幕文本。");
+      throw new Error("没有可用字幕。请打开视频平台的转写文稿后重试。");
     }
 
     if (track.text) {
@@ -669,16 +700,24 @@
   async function loadYouTubeTranscriptPanelText() {
     const existing = getYouTubeTranscriptPanelText();
     if (existing) {
+      beginYouTubeTranscriptProbe();
+      scheduleCloseYouTubeTranscriptPanel();
       return existing;
     }
 
+    beginYouTubeTranscriptProbe();
     const opened = await openYouTubeTranscriptPanel();
     if (!opened) {
+      endYouTubeTranscriptProbe();
       return "";
     }
 
-    await waitForCondition(() => Boolean(getYouTubeTranscriptPanelText()), 8000, 250);
-    return getYouTubeTranscriptPanelText();
+    try {
+      await waitForCondition(() => Boolean(getYouTubeTranscriptPanelText()), 8000, 250);
+      return getYouTubeTranscriptPanelText();
+    } finally {
+      scheduleCloseYouTubeTranscriptPanel();
+    }
   }
 
   async function openYouTubeTranscriptPanel() {
@@ -742,8 +781,108 @@
     }));
   }
 
+  function beginYouTubeTranscriptProbe() {
+    document.documentElement.dataset.vcsTranscriptProbe = "true";
+  }
+
+  function endYouTubeTranscriptProbe() {
+    delete document.documentElement.dataset.vcsTranscriptProbe;
+  }
+
+  function scheduleCloseYouTubeTranscriptPanel(options = {}) {
+    const attempts = options.attempts ?? 12;
+    const delayMs = options.delayMs ?? 180;
+    let count = 0;
+
+    clearTimeout(transcriptPanelCloseTimer);
+
+    const tick = () => {
+      const panel = getYouTubeTranscriptPanelElement();
+      if (!panel) {
+        endYouTubeTranscriptProbe();
+        return;
+      }
+
+      closeYouTubeTranscriptPanel(panel);
+      count += 1;
+
+      if (count >= attempts) {
+        suppressYouTubeTranscriptPanel(panel);
+        endYouTubeTranscriptProbe();
+        return;
+      }
+
+      transcriptPanelCloseTimer = window.setTimeout(tick, delayMs);
+    };
+
+    transcriptPanelCloseTimer = window.setTimeout(tick, delayMs);
+  }
+
+  function closeYouTubeTranscriptPanel(panel = null) {
+    const targetPanel = panel || getYouTubeTranscriptPanelElement();
+    if (!targetPanel) {
+      return false;
+    }
+
+    const closeButton = findTranscriptCloseButton(targetPanel);
+    if (!closeButton) {
+      return false;
+    }
+
+    clickElement(closeButton);
+    return true;
+  }
+
+  function suppressYouTubeTranscriptPanel(panel = null) {
+    const targetPanel = panel || getYouTubeTranscriptPanelElement();
+    if (!targetPanel) {
+      return false;
+    }
+
+    const container = targetPanel.closest?.("ytd-engagement-panel-section-list-renderer") || targetPanel;
+    container.dataset.vcsSuppressed = "true";
+    container.setAttribute("hidden", "");
+    container.style.display = "none";
+    return true;
+  }
+
+  function getYouTubeTranscriptPanelElement() {
+    const element = document.querySelector([
+      "ytd-engagement-panel-section-list-renderer[target-id*='transcript' i]",
+      "ytd-engagement-panel-section-list-renderer[visibility='ENGAGEMENT_PANEL_VISIBILITY_EXPANDED'] ytd-transcript-renderer",
+      "ytd-transcript-renderer",
+      "ytd-transcript-search-panel-renderer"
+    ].join(","));
+    return element?.closest?.("ytd-engagement-panel-section-list-renderer") || element;
+  }
+
+  function findTranscriptCloseButton(panel) {
+    const container = panel.closest?.("ytd-engagement-panel-section-list-renderer") || panel;
+    const buttons = [
+      ...container.querySelectorAll("button, tp-yt-paper-icon-button, yt-icon-button, ytd-button-renderer")
+    ];
+    const closeWords = ["关闭", "關閉", "隐藏", "隱藏", "收起", "close", "dismiss", "hide"];
+
+    return buttons.find((button) => {
+      const value = normalizeSearchText([
+        button.id || "",
+        button.className || "",
+        button.getAttribute("aria-label") || "",
+        button.getAttribute("title") || "",
+        button.getAttribute("tooltip") || "",
+        button.textContent || ""
+      ].join(" "));
+      return closeWords.some((word) => value.includes(word));
+    }) || null;
+  }
+
   function getYouTubeTranscriptPanelText() {
-    const segments = [...document.querySelectorAll("ytd-transcript-segment-renderer")]
+    const segments = [...document.querySelectorAll([
+      "ytd-transcript-segment-renderer",
+      "ytd-transcript-segment-list-renderer [role='button']",
+      "ytd-transcript-segment-list-renderer yt-formatted-string",
+      "[target-id*='transcript' i] [role='button']"
+    ].join(","))]
       .map(parseYouTubeTranscriptSegment)
       .filter(Boolean);
 
@@ -751,31 +890,45 @@
       return uniqueValues(segments).join("\n");
     }
 
-    const transcriptContainer = document.querySelector(
-      "ytd-transcript-renderer, ytd-transcript-search-panel-renderer, ytd-transcript-segment-list-renderer"
-    );
-    if (!transcriptContainer) {
-      return "";
+    const transcriptContainers = [
+      ...document.querySelectorAll([
+        "ytd-transcript-renderer",
+        "ytd-transcript-search-panel-renderer",
+        "ytd-transcript-segment-list-renderer",
+        "ytd-engagement-panel-section-list-renderer[target-id*='transcript' i]",
+        "ytd-engagement-panel-section-list-renderer[visibility='ENGAGEMENT_PANEL_VISIBILITY_EXPANDED']",
+        "[aria-label*='转写' i]",
+        "[aria-label*='transcript' i]"
+      ].join(","))
+    ].filter((element) => !root?.contains(element));
+
+    for (const container of transcriptContainers) {
+      const text = normalizeTranscriptPanelText(container.innerText || container.textContent || "");
+      if (text.length > 80) {
+        return text;
+      }
     }
 
-    const text = normalizeTranscriptPanelText(transcriptContainer.innerText || transcriptContainer.textContent || "");
-    return text.length > 120 ? text : "";
+    return "";
   }
 
   function parseYouTubeTranscriptSegment(segment) {
-    const lines = String(segment.innerText || segment.textContent || "")
-      .split(/\n+/)
-      .map((line) => line.trim())
-      .filter(Boolean);
+    const lines = getTranscriptTextLines(segment.innerText || segment.textContent || "");
 
     if (!lines.length) {
       return "";
+    }
+
+    const inline = lines.map(parseTimeContentLine).find((item) => item);
+    if (inline) {
+      return `[${inline.time}] ${inline.content}`;
     }
 
     const timeIndex = lines.findIndex((line) => isTimeLabel(line));
     const time = timeIndex >= 0 ? lines[timeIndex] : "";
     const content = lines
       .filter((_line, index) => index !== timeIndex)
+      .filter((line) => !/^(转写文稿|搜索转写内容|Transcript|Search transcript)$/i.test(line))
       .join(" ")
       .replace(/\s+/g, " ")
       .trim();
@@ -788,22 +941,29 @@
   }
 
   function normalizeTranscriptPanelText(text) {
-    const lines = String(text || "")
-      .split(/\n+/)
-      .map((line) => line.trim())
-      .filter(Boolean);
+    const lines = getTranscriptTextLines(text);
     const output = [];
 
     for (let index = 0; index < lines.length; index += 1) {
+      const inline = parseTimeContentLine(lines[index]);
+      if (inline) {
+        output.push(`[${inline.time}] ${inline.content}`);
+        continue;
+      }
+
       if (!isTimeLabel(lines[index])) {
         continue;
       }
       const time = lines[index];
       const contentParts = [];
-      for (let next = index + 1; next < lines.length && !isTimeLabel(lines[next]); next += 1) {
+      for (let next = index + 1; next < lines.length && !isTimeLabel(lines[next]) && !parseTimeContentLine(lines[next]); next += 1) {
         contentParts.push(lines[next]);
       }
-      const content = contentParts.join(" ").replace(/\s+/g, " ").trim();
+      const content = contentParts
+        .filter((line) => !/^(转写文稿|搜索转写内容|Transcript|Search transcript)$/i.test(line))
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
       if (content) {
         output.push(`[${time}] ${content}`);
       }
@@ -814,6 +974,48 @@
 
   function isTimeLabel(value) {
     return /^\d{1,2}:\d{2}(?::\d{2})?$/.test(String(value || "").trim());
+  }
+
+  function parseTimeContentLine(value) {
+    const match = String(value || "")
+      .trim()
+      .match(/^(\d{1,2}:\d{2}(?::\d{2})?)\s*(.+)$/);
+    if (!match) {
+      return null;
+    }
+
+    const content = match[2]
+      .replace(/\s+/g, " ")
+      .trim();
+    return content ? { time: match[1], content } : null;
+  }
+
+  function getTranscriptTextLines(text) {
+    return String(text || "")
+      .replace(/\r/g, "\n")
+      .split(/\n+/)
+      .flatMap(splitPackedTranscriptLine)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  }
+
+  function splitPackedTranscriptLine(line) {
+    const value = String(line || "").trim();
+    const matches = [...value.matchAll(/\d{1,2}:\d{2}(?::\d{2})?/g)];
+    if (matches.length < 2) {
+      return [value];
+    }
+
+    const chunks = [];
+    if (matches[0].index > 0) {
+      chunks.push(value.slice(0, matches[0].index));
+    }
+    for (let index = 0; index < matches.length; index += 1) {
+      const start = matches[index].index;
+      const end = matches[index + 1]?.index ?? value.length;
+      chunks.push(value.slice(start, end));
+    }
+    return chunks;
   }
 
   async function waitForCondition(predicate, timeoutMs, intervalMs) {
@@ -843,9 +1045,7 @@
   async function summarize() {
     try {
       setStatus("正在准备字幕", "busy");
-      const transcript = await loadSelectedTranscript();
-      state.transcript = transcript;
-      render();
+      const transcript = await hydrateTranscriptPreview();
 
       setStatus("正在请求 AI 总结", "busy");
       const response = await chrome.runtime.sendMessage({
@@ -871,24 +1071,85 @@
     }
   }
 
-  function getManualTranscript() {
-    return shadow?.querySelector("#vcs-manual")?.value.trim() || "";
-  }
-
   function setStatus(message, tone = "neutral", progress = null) {
     state.status = message;
     state.statusTone = tone;
     state.progress = progress;
     const status = shadow?.querySelector("#vcs-status");
     if (status) {
-      status.textContent = message;
       status.dataset.tone = tone;
+      swapStatusText(status, message);
     }
     const bar = shadow?.querySelector("#vcs-progress-bar");
     if (bar) {
       const percent = progress?.total ? Math.round((progress.current / progress.total) * 100) : 0;
       bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
     }
+  }
+
+  async function hydrateTranscriptPreview(options = {}) {
+    const silent = Boolean(options.silent);
+    if (previewPromise) {
+      return previewPromise;
+    }
+
+    state.previewLoading = true;
+    if (!silent) {
+      setStatus("正在读取转写文稿", "busy");
+    }
+    render();
+
+    previewPromise = loadSelectedTranscript()
+      .then((transcript) => {
+        const cleanText = String(transcript || "").trim();
+        if (!cleanText) {
+          throw new Error("没有读取到字幕内容。");
+        }
+        state.transcript = cleanText;
+        lastActiveTranscriptIndex = -1;
+        if (!silent) {
+          setStatus(`字幕已读取（${cleanText.length} 字符）`, "done");
+        }
+        return cleanText;
+      })
+      .catch((error) => {
+        if (!silent) {
+          setStatus(`读取失败：${error.message}`, "error");
+        }
+        throw error;
+      })
+      .finally(() => {
+        state.previewLoading = false;
+        previewPromise = null;
+        render();
+      });
+
+    return previewPromise;
+  }
+
+  function swapStatusText(element, nextText) {
+    if (!element || element.textContent === nextText) {
+      return;
+    }
+
+    clearTimeout(statusSwapTimer);
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      element.textContent = nextText;
+      return;
+    }
+
+    const duration = parseFloat(getComputedStyle(element).getPropertyValue("--text-swap-dur")) || 200;
+    element.classList.add("is-exit");
+    statusSwapTimer = setTimeout(() => {
+      if (!element.isConnected) {
+        return;
+      }
+      element.textContent = nextText;
+      element.classList.remove("is-exit");
+      element.classList.add("is-enter-start");
+      void element.offsetHeight;
+      element.classList.remove("is-enter-start");
+    }, duration);
   }
 
   function render() {
@@ -905,48 +1166,73 @@
       ? Math.round((state.progress.current / state.progress.total) * 100)
       : 0;
     const summarizeLabel = state.statusTone === "busy" ? "正在解析…" : "解析字幕";
+    const previewPlaceholder = state.previewLoading
+      ? "正在读取字幕或转写文稿…"
+      : "自动读取到的字幕和 YouTube 转写文稿会显示在这里。";
+    const previewContent = state.transcript
+      ? renderTranscriptPreview(state.transcript)
+      : `<span class="vcs-transcript-placeholder">${escapeHtml(previewPlaceholder)}</span>`;
 
     const trackCount = state.tracks.length
       ? `字幕 · ${state.tracks.length}`
       : "无字幕轨";
+    const platformLabel = state.platform?.name || "video";
+    const collapsedMeta = state.tracks.length
+      ? `${platformLabel} · ${state.tracks.length} 条字幕`
+      : `${platformLabel} · ${state.status}`;
     const embedClass = state.embedded ? "is-embedded" : "is-floating";
 
     shadow.innerHTML = `
       <style>${getPanelCss()}</style>
-      <aside class="vcs-panel ${state.collapsed ? "is-collapsed" : ""} ${embedClass}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
+      <aside class="vcs-panel t-resize ${state.collapsed ? "is-collapsed" : ""} ${embedClass}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
         <button id="vcs-expand" class="vcs-collapsed-toggle" type="button" title="展开字幕摘要" aria-label="展开字幕摘要">
-          <span class="vcs-collapsed-icon">${expandIcon()}</span>
-          <span class="vcs-collapsed-title">字幕摘要</span>
+          <span class="vcs-collapsed-icon"><img src="${escapeHtml(AI_MARK_URL)}" alt=""></span>
+          <span class="vcs-collapsed-copy">
+            <span class="vcs-collapsed-title">字幕摘要</span>
+            <span class="vcs-collapsed-meta">${escapeHtml(collapsedMeta)}</span>
+          </span>
+          <span class="vcs-collapsed-arrow">${chevronRightIcon()}</span>
         </button>
 
         <header class="vcs-header">
           <div class="vcs-brand">
-            <div class="vcs-seal" aria-hidden="true"><span>AI</span></div>
+            <div class="vcs-seal" aria-hidden="true"><img src="${escapeHtml(AI_MARK_URL)}" alt=""></div>
             <div class="vcs-brand-text">
               <div class="vcs-title">字幕摘要</div>
-              <div class="vcs-subtitle">${escapeHtml(state.platform?.name || "video")} · ${escapeHtml(activeProfile)}</div>
+              <div class="vcs-subtitle">${escapeHtml(platformLabel)} · ${escapeHtml(activeProfile)}</div>
             </div>
           </div>
           <div class="vcs-actions">
             <button id="vcs-refresh" class="vcs-icon-button ${state.refreshing ? "is-spinning" : ""}" data-motion="spin" title="重新检测字幕" aria-label="重新检测">${refreshIcon()}</button>
             <button id="vcs-options" class="vcs-icon-button" data-motion="gear" title="打开设置" aria-label="设置">${settingsIcon()}</button>
-            <button id="vcs-collapse" class="vcs-icon-button vcs-collapse-button" title="折叠面板" aria-label="折叠面板">${collapseIcon()}</button>
+            <button id="vcs-collapse" class="vcs-icon-button vcs-collapse-button" title="折叠面板" aria-label="折叠面板">${chevronRightIcon()}</button>
           </div>
         </header>
 
-        <section class="vcs-body">
+        <section class="vcs-body t-panel-slide" data-open="${state.collapsed ? "false" : "true"}">
           <div class="vcs-meta-line">
             <span class="vcs-meta-title" title="${escapeHtml(state.title)}">${escapeHtml(state.title || "未命名视频")}</span>
           </div>
 
           <div class="vcs-status-wrap">
-            <div id="vcs-status" class="vcs-status" data-tone="${escapeHtml(state.statusTone)}">${escapeHtml(state.status)}</div>
+            <div id="vcs-status" class="vcs-status t-text-swap" data-tone="${escapeHtml(state.statusTone)}">${escapeHtml(state.status)}</div>
             <div class="vcs-progress" data-tone="${escapeHtml(state.statusTone)}"><span id="vcs-progress-bar" style="width:${progressWidth}%"></span></div>
           </div>
 
           <button id="vcs-summarize" class="vcs-primary" type="button">
+            <span class="vcs-primary-icon">${sparkIcon()}</span>
             <span>${escapeHtml(summarizeLabel)}</span>
           </button>
+
+          <section class="vcs-result" aria-live="polite" ${state.lastSummary ? "" : "hidden"}>
+            <div class="vcs-result-head">
+              <span class="vcs-result-title">摘要</span>
+              <button id="vcs-copy-summary" class="vcs-tool-button ${state.copyingSummary ? "is-busy" : ""}" type="button" title="复制摘要" aria-label="复制摘要">${state.copyingSummary ? loadingIcon() : copyIcon()}</button>
+            </div>
+            <div class="vcs-summary-shell" role="region" aria-label="Markdown 摘要" tabindex="0">
+              <article id="vcs-summary" class="vcs-markdown">${markdownToHtml(state.lastSummary)}</article>
+            </div>
+          </section>
 
           <div class="vcs-track-row">
             <span class="vcs-track-label">${escapeHtml(trackCount)}</span>
@@ -956,29 +1242,18 @@
             <button id="vcs-copy-transcript" class="vcs-tool-button ${state.copyingTranscript ? "is-busy" : ""}" type="button" title="复制字幕" aria-label="复制字幕">${state.copyingTranscript ? loadingIcon() : copyIcon()}</button>
           </div>
 
-          <details class="vcs-details">
-            <summary>手动粘贴字幕</summary>
-            <textarea id="vcs-manual" class="vcs-textarea" placeholder="若当前页面无法自动读取，可在此粘贴字幕原文。"></textarea>
+          <details class="vcs-details vcs-transcript-details" open>
+            <summary>字幕预览 / 转写文稿</summary>
+            <div id="vcs-preview" class="vcs-transcript-box" role="region" aria-label="字幕预览" data-empty="${state.transcript ? "false" : "true"}">${previewContent}</div>
           </details>
-
-          <details class="vcs-details" ${state.transcript ? "open" : ""}>
-            <summary>字幕预览</summary>
-            <textarea id="vcs-preview" class="vcs-textarea" readonly>${escapeHtml(state.transcript)}</textarea>
-          </details>
-
-          <section class="vcs-result" ${state.lastSummary ? "" : "hidden"}>
-            <div class="vcs-result-head">
-              <span class="vcs-result-title">摘要</span>
-              <button id="vcs-copy-summary" class="vcs-tool-button ${state.copyingSummary ? "is-busy" : ""}" type="button" title="复制摘要" aria-label="复制摘要">${state.copyingSummary ? loadingIcon() : copyIcon()}</button>
-            </div>
-            <article id="vcs-summary">${markdownToHtml(state.lastSummary)}</article>
-          </section>
         </section>
       </aside>
     `;
 
     bindEvents();
     applyTheme();
+    bindVideoSync();
+    syncTranscriptToVideo(true);
   }
 
   function bindEvents() {
@@ -996,10 +1271,185 @@
     });
     shadow.querySelector("#vcs-track")?.addEventListener("change", (event) => {
       state.selectedTrackId = event.target.value;
+      state.transcript = "";
+      lastActiveTranscriptIndex = -1;
+      hydrateTranscriptPreview({ silent: true }).catch(() => {});
     });
     shadow.querySelector("#vcs-summarize")?.addEventListener("click", summarize);
     shadow.querySelector("#vcs-copy-transcript")?.addEventListener("click", copyTranscript);
     shadow.querySelector("#vcs-copy-summary")?.addEventListener("click", copySummary);
+    shadow.querySelector("#vcs-preview")?.addEventListener("click", handleTranscriptClick);
+  }
+
+  function renderTranscriptPreview(transcript) {
+    const items = parseTranscriptPreviewItems(transcript);
+    if (!items.length) {
+      return escapeHtml(transcript);
+    }
+
+    return `
+      <ol class="vcs-transcript-list" aria-label="字幕时间轴">
+        ${items.map(renderTranscriptItem).join("")}
+      </ol>
+    `;
+  }
+
+  function renderTranscriptItem(item) {
+    const content = escapeHtml(item.content || item.raw);
+    if (!item.time || !Number.isFinite(item.seconds)) {
+      return `
+        <li class="vcs-transcript-item">
+          <div class="vcs-transcript-row is-plain" data-index="${item.index}">
+            <span class="vcs-cue-text">${content}</span>
+          </div>
+        </li>
+      `;
+    }
+
+    return `
+      <li class="vcs-transcript-item">
+        <button class="vcs-transcript-row" type="button" data-index="${item.index}" data-seconds="${item.seconds}" aria-label="跳转到 ${escapeHtml(item.time)}">
+          <span class="vcs-cue-time">${escapeHtml(item.time)}</span>
+          <span class="vcs-cue-text">${content}</span>
+        </button>
+      </li>
+    `;
+  }
+
+  function parseTranscriptPreviewItems(transcript) {
+    return getTranscriptTextLines(transcript)
+      .map((line, index) => {
+        const bracketed = line.match(/^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.*)$/);
+        const inline = bracketed ? null : parseTimeContentLine(line);
+        const time = bracketed?.[1] || inline?.time || "";
+        const content = (bracketed?.[2] || inline?.content || line).trim();
+        return {
+          index,
+          raw: line,
+          time,
+          seconds: time ? parseTimestamp(time) : Number.NaN,
+          content
+        };
+      });
+  }
+
+  function handleTranscriptClick(event) {
+    const row = event.target.closest?.(".vcs-transcript-row[data-seconds]");
+    if (!row) {
+      return;
+    }
+
+    const seconds = Number(row.dataset.seconds);
+    if (!Number.isFinite(seconds)) {
+      return;
+    }
+
+    seekVideoTo(seconds);
+  }
+
+  function bindVideoSync() {
+    const nextVideo = getPrimaryVideo();
+    if (activeVideo === nextVideo) {
+      return;
+    }
+
+    unbindVideoSync();
+    activeVideo = nextVideo;
+    if (!activeVideo) {
+      return;
+    }
+
+    activeVideo.addEventListener("timeupdate", syncTranscriptToVideo);
+    activeVideo.addEventListener("seeked", syncTranscriptToVideo);
+    activeVideo.addEventListener("play", syncTranscriptToVideo);
+  }
+
+  function unbindVideoSync() {
+    if (!activeVideo) {
+      return;
+    }
+
+    activeVideo.removeEventListener("timeupdate", syncTranscriptToVideo);
+    activeVideo.removeEventListener("seeked", syncTranscriptToVideo);
+    activeVideo.removeEventListener("play", syncTranscriptToVideo);
+    activeVideo = null;
+    lastActiveTranscriptIndex = -1;
+  }
+
+  function getPrimaryVideo() {
+    const videos = [...document.querySelectorAll("video")]
+      .filter((video) => !root?.contains(video) && isVisible(video))
+      .sort((a, b) => {
+        const rectA = a.getBoundingClientRect();
+        const rectB = b.getBoundingClientRect();
+        return (rectB.width * rectB.height) - (rectA.width * rectA.height);
+      });
+    return videos[0] || null;
+  }
+
+  function seekVideoTo(seconds) {
+    const video = activeVideo || getPrimaryVideo();
+    if (!video) {
+      return;
+    }
+
+    try {
+      video.currentTime = Math.max(0, seconds);
+      syncTranscriptToVideo(true);
+    } catch (_error) {
+      // Some embedded players can block direct seeking until media metadata is ready.
+    }
+  }
+
+  function syncTranscriptToVideo(force = false) {
+    const shouldForce = force === true;
+    const video = activeVideo || getPrimaryVideo();
+    const preview = shadow?.querySelector("#vcs-preview");
+    if (!video || !preview) {
+      return;
+    }
+
+    const rows = [...preview.querySelectorAll(".vcs-transcript-row[data-seconds]")];
+    if (!rows.length) {
+      return;
+    }
+
+    const currentTime = Number(video.currentTime) || 0;
+    let activeRow = rows[0];
+    for (const row of rows) {
+      const seconds = Number(row.dataset.seconds);
+      if (Number.isFinite(seconds) && seconds <= currentTime + 0.25) {
+        activeRow = row;
+      } else {
+        break;
+      }
+    }
+
+    const activeIndex = Number(activeRow.dataset.index);
+    if (!shouldForce && activeIndex === lastActiveTranscriptIndex) {
+      return;
+    }
+
+    preview.querySelectorAll(".vcs-transcript-row.is-active").forEach((row) => {
+      row.classList.remove("is-active");
+      row.removeAttribute("aria-current");
+    });
+    activeRow.classList.add("is-active");
+    activeRow.setAttribute("aria-current", "true");
+    lastActiveTranscriptIndex = activeIndex;
+
+    if (!isElementInsideContainer(activeRow, preview)) {
+      activeRow.scrollIntoView({
+        block: "nearest",
+        behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
+      });
+    }
+  }
+
+  function isElementInsideContainer(element, container) {
+    const elementRect = element.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    return elementRect.top >= containerRect.top + 8 && elementRect.bottom <= containerRect.bottom - 8;
   }
 
   async function copyTranscript() {
@@ -1012,7 +1462,7 @@
     render();
 
     try {
-      const text = state.transcript || await loadSelectedTranscript();
+      const text = state.transcript || await hydrateTranscriptPreview();
       const cleanText = text.trim();
       if (!cleanText) {
         throw new Error("没有可复制的字幕内容。");
@@ -1089,6 +1539,43 @@
     if (panel) {
       panel.dataset.theme = getTheme();
     }
+  }
+
+  function applyPagePolish() {
+    const platform = detectPlatform();
+    if (platform?.kind !== "youtube") {
+      removePagePolish();
+      return;
+    }
+
+    if (document.getElementById(PAGE_STYLE_ID)) {
+      return;
+    }
+
+    const style = document.createElement("style");
+    style.id = PAGE_STYLE_ID;
+    style.textContent = getYouTubePageCss();
+    document.documentElement.appendChild(style);
+  }
+
+  function removePagePolish() {
+    endYouTubeTranscriptProbe();
+    document.getElementById(PAGE_STYLE_ID)?.remove();
+  }
+
+  function normalizeSettings(input) {
+    const normalized = {
+      ...DEFAULT_SETTINGS,
+      ...(input || {})
+    };
+    const importedVersion = Number(input?.settingsVersion || 0);
+    normalized.settingsVersion = DEFAULT_SETTINGS.settingsVersion;
+    normalized.theme = ["auto", "light", "dark"].includes(normalized.theme) ? normalized.theme : DEFAULT_SETTINGS.theme;
+    normalized.language = String(normalized.language || "").trim() || DEFAULT_SETTINGS.language;
+    normalized.panelEnabled = normalized.panelEnabled !== false;
+    normalized.includeTimestamps = normalized.includeTimestamps !== false;
+    normalized.saveHistory = importedVersion < 2 ? true : normalized.saveHistory !== false;
+    return normalized;
   }
 
   function getTheme() {
@@ -1482,6 +1969,7 @@
     const html = [];
     let paragraph = [];
     let inList = false;
+    let listType = "";
 
     const flushParagraph = () => {
       if (paragraph.length) {
@@ -1492,8 +1980,20 @@
 
     const closeList = () => {
       if (inList) {
-        html.push("</ul>");
+        html.push(`</${listType}>`);
         inList = false;
+        listType = "";
+      }
+    };
+
+    const openList = (type) => {
+      if (inList && listType !== type) {
+        closeList();
+      }
+      if (!inList) {
+        html.push(`<${type}>`);
+        inList = true;
+        listType = type;
       }
     };
 
@@ -1506,37 +2006,85 @@
         continue;
       }
 
+      if (/^---+$/.test(line)) {
+        flushParagraph();
+        closeList();
+        html.push("<hr>");
+        continue;
+      }
+
+      if (line.startsWith("# ")) {
+        flushParagraph();
+        closeList();
+        html.push(`<h3>${renderInlineMarkdown(line.slice(2))}</h3>`);
+        continue;
+      }
+
       if (line.startsWith("### ")) {
         flushParagraph();
         closeList();
-        html.push(`<h4>${escapeHtml(line.slice(4))}</h4>`);
+        html.push(`<h5>${renderInlineMarkdown(line.slice(4))}</h5>`);
         continue;
       }
 
       if (line.startsWith("## ")) {
         flushParagraph();
         closeList();
-        html.push(`<h3>${escapeHtml(line.slice(3))}</h3>`);
+        html.push(`<h4>${renderInlineMarkdown(line.slice(3))}</h4>`);
         continue;
       }
 
-      if (line.startsWith("- ")) {
+      if (/^[-*]\s+/.test(line)) {
         flushParagraph();
-        if (!inList) {
-          html.push("<ul>");
-          inList = true;
-        }
-        html.push(`<li>${escapeHtml(line.slice(2))}</li>`);
+        openList("ul");
+        html.push(`<li>${renderInlineMarkdown(line.replace(/^[-*]\s+/, ""))}</li>`);
+        continue;
+      }
+
+      if (/^\d+\.\s+/.test(line)) {
+        flushParagraph();
+        openList("ol");
+        html.push(`<li>${renderInlineMarkdown(line.replace(/^\d+\.\s+/, ""))}</li>`);
         continue;
       }
 
       closeList();
-      paragraph.push(escapeHtml(line));
+      paragraph.push(renderInlineMarkdown(line));
     }
 
     flushParagraph();
     closeList();
     return html.join("");
+  }
+
+  function renderInlineMarkdown(value) {
+    const placeholders = [];
+    let html = escapeHtml(value);
+
+    const stash = (replacement) => {
+      const token = `@@VCSMD${placeholders.length}@@`;
+      placeholders.push(replacement);
+      return token;
+    };
+
+    html = html.replace(/`([^`]+)`/g, (_match, code) => {
+      return stash(`<code>${code}</code>`);
+    });
+
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_match, label, url) => {
+      const href = escapeHtml(url);
+      return stash(`<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`);
+    });
+    html = html
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+      .replace(/_([^_]+)_/g, "<em>$1</em>");
+
+    placeholders.forEach((replacement, index) => {
+      html = html.replace(`@@VCSMD${index}@@`, replacement);
+    });
+    return html;
   }
 
   function pad(value) {
@@ -1551,12 +2099,12 @@
     return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z'/><path d='M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1A2 2 0 1 1 4.2 17l.1-.1A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1A2 2 0 1 1 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3h.1a1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.6h.1a1.7 1.7 0 0 0 1.9-.3l.1-.1A2 2 0 1 1 19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.6 1h.1a2 2 0 1 1 0 4H21a1.7 1.7 0 0 0-1.6 1Z'/></svg>";
   }
 
-  function collapseIcon() {
-    return "<svg viewBox='0 0 24 24' aria-hidden='true'><rect x='4' y='5' width='16' height='14' rx='1'/><path d='M15 5v14'/><path d='M10 9l-3 3 3 3'/></svg>";
+  function chevronRightIcon() {
+    return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M9 6l6 6-6 6'/></svg>";
   }
 
-  function expandIcon() {
-    return "<svg viewBox='0 0 24 24' aria-hidden='true'><rect x='4' y='5' width='16' height='14' rx='1'/><path d='M9 5v14'/><path d='M14 9l3 3-3 3'/></svg>";
+  function sparkIcon() {
+    return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3l1.7 5.1L19 10l-5.3 1.9L12 17l-1.7-5.1L5 10l5.3-1.9L12 3Z'/><path d='M18 16l.8 2.2L21 19l-2.2.8L18 22l-.8-2.2L15 19l2.2-.8L18 16Z'/></svg>";
   }
 
   function copyIcon() {
@@ -1567,6 +2115,90 @@
     return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3a9 9 0 1 0 9 9'/></svg>";
   }
 
+  function getYouTubePageCss() {
+    return `
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i],
+      ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"] ytd-transcript-renderer {
+        --vcs-yt-transcript-body-size: 13.5px;
+        --vcs-yt-transcript-time-size: 11px;
+        --vcs-yt-transcript-title-size: 19px;
+      }
+
+      html[data-vcs-transcript-probe="true"] ytd-engagement-panel-section-list-renderer[target-id*="transcript" i],
+      html[data-vcs-transcript-probe="true"] ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"]:has(ytd-transcript-renderer),
+      ytd-engagement-panel-section-list-renderer[data-vcs-suppressed="true"] {
+        max-height: 0 !important;
+        min-height: 0 !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        opacity: 0 !important;
+        overflow: hidden !important;
+        pointer-events: none !important;
+        visibility: hidden !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] #header,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] .header {
+        padding-block: 12px !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] h2,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] #title,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] yt-formatted-string#title {
+        font-size: var(--vcs-yt-transcript-title-size) !important;
+        line-height: 1.25 !important;
+        letter-spacing: 0 !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] #content,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] #content *,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-renderer,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-renderer * {
+        font-size: var(--vcs-yt-transcript-body-size) !important;
+        letter-spacing: 0 !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-renderer,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-list-renderer [role="button"] {
+        align-items: flex-start !important;
+        column-gap: 8px !important;
+        padding-block: 5px !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-renderer yt-formatted-string,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-renderer #segment-text,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-renderer [id*="text" i],
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-list-renderer yt-formatted-string,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-list-renderer #segment-text,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-list-renderer [id*="text" i],
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-list-renderer [role="button"] {
+        font-size: var(--vcs-yt-transcript-body-size) !important;
+        line-height: 1.42 !important;
+        letter-spacing: 0 !important;
+        font-weight: 500 !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] .segment-timestamp,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] #timestamp,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] yt-formatted-string[class*="timestamp" i],
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] [class*="timestamp" i],
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] [id*="timestamp" i] {
+        font-size: var(--vcs-yt-transcript-time-size) !important;
+        line-height: 1.3 !important;
+        font-weight: 600 !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] input,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] tp-yt-paper-input,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] yt-searchbox input {
+        font-size: 14px !important;
+        line-height: 1.35 !important;
+      }
+    `;
+  }
+
   function getPanelCss() {
     return `
       :host { all: initial; display: block; }
@@ -1574,33 +2206,51 @@
 
       .vcs-panel {
         --washi: #f7f7f7;
-        --washi-soft: #f1f1f1;
+        --washi-soft: #eeeeee;
         --paper: #ffffff;
-        --sumi: #0f0f0f;
-        --sumi-soft: #3f3f3f;
-        --nezumi: #606060;
-        --haijiro: #dedede;
-        --haijiro-soft: #eeeeee;
-        --rikyu: #0f0f0f;
-        --shu: #0f0f0f;
-        --good: #107c41;
-        --bad: #cc0000;
+        --paper-elevated: #ffffff;
+        --sumi: #111111;
+        --sumi-soft: #343434;
+        --nezumi: #6b6b6b;
+        --haijiro: #d9d9d9;
+        --haijiro-soft: #ebebeb;
+        --rikyu: #111111;
+        --shu: #111111;
+        --clay: #767676;
+        --button: #111111;
+        --button-hover: #2a2a2a;
+        --good: #111111;
+        --bad: #b00020;
+        --shadow: rgba(0, 0, 0, 0.12);
+
+        --resize-dur: 300ms;
+        --resize-ease: cubic-bezier(0.22, 1, 0.36, 1);
+        --panel-open-dur: 240ms;
+        --panel-close-dur: 200ms;
+        --panel-translate-y: 8px;
+        --panel-blur: 2px;
+        --panel-ease: cubic-bezier(0.22, 1, 0.36, 1);
+        --text-swap-dur: 200ms;
+        --text-swap-translate-y: 8px;
+        --text-swap-blur: 2px;
+        --text-swap-ease: ease-out;
 
         --sans: -apple-system, BlinkMacSystemFont, "Roboto", "Arial", "PingFang SC", "Hiragino Sans", "Microsoft YaHei", sans-serif;
         --serif: var(--sans);
 
         position: relative;
-        display: block;
+        display: flex;
+        flex-direction: column;
         width: 100%;
-        margin: 0 0 16px;
+        margin: 0 0 14px;
         color: var(--sumi);
         background: var(--paper);
         border: 1px solid var(--haijiro);
-        border-radius: 6px;
+        border-radius: 8px;
         font: 13px/1.7 var(--sans);
         letter-spacing: 0;
         overflow: hidden;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+        box-shadow: 0 12px 32px var(--shadow);
         transform-origin: top right;
         animation: vcs-panel-in 180ms ease both;
       }
@@ -1615,34 +2265,47 @@
         margin: 0;
       }
 
+      .vcs-panel.is-embedded:not(.is-collapsed) {
+        height: auto;
+        max-height: none;
+      }
+
       .vcs-panel[data-theme="dark"] {
         --washi: #181818;
-        --washi-soft: #202020;
-        --paper: #0f0f0f;
-        --sumi: #f1f1f1;
+        --washi-soft: #242424;
+        --paper: #101010;
+        --paper-elevated: #151515;
+        --sumi: #f4f4f4;
         --sumi-soft: #d0d0d0;
         --nezumi: #a0a0a0;
-        --haijiro: #303030;
-        --haijiro-soft: #242424;
-        --rikyu: #ffffff;
-        --shu: #ffffff;
-        --good: #64d884;
-        --bad: #ff6b6b;
+        --haijiro: #3a3a3a;
+        --haijiro-soft: #292929;
+        --rikyu: #f4f4f4;
+        --shu: #f4f4f4;
+        --clay: #9a9a9a;
+        --button: #f4f4f4;
+        --button-hover: #ffffff;
+        --good: #f4f4f4;
+        --bad: #ff6b7a;
+        --shadow: rgba(0, 0, 0, 0.32);
       }
 
       .vcs-header {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 12px;
-        padding: 14px 16px 12px;
-        border-bottom: 1px solid var(--haijiro);
+        gap: 10px;
+        padding: 12px 14px 10px;
+        border-bottom: 1px solid color-mix(in srgb, var(--haijiro) 72%, transparent);
+        background:
+          linear-gradient(90deg, color-mix(in srgb, var(--washi) 72%, transparent), transparent 58%),
+          var(--paper-elevated);
       }
 
       .vcs-brand {
         display: flex;
         align-items: center;
-        gap: 12px;
+        gap: 10px;
         min-width: 0;
       }
 
@@ -1650,25 +2313,26 @@
         flex: 0 0 auto;
         display: grid;
         place-items: center;
-        width: 30px;
-        height: 30px;
+        width: 36px;
+        height: 36px;
+        padding: 3px;
         color: var(--paper);
-        background: var(--shu);
-        border-radius: 4px;
-        font: 700 12px/1 var(--sans);
-        letter-spacing: 0;
+        background: color-mix(in srgb, var(--shu) 92%, var(--clay));
+        border: 1px solid color-mix(in srgb, var(--paper-elevated) 26%, transparent);
+        border-radius: 7px;
         user-select: none;
       }
-      .vcs-panel[data-theme="dark"] .vcs-seal {
-        color: var(--paper);
-        background: var(--sumi);
+      .vcs-seal img {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
       }
-      .vcs-seal span { transform: translateY(0.5px); }
 
       .vcs-brand-text { min-width: 0; }
       .vcs-title {
         color: var(--sumi);
-        font: 650 14px/1.3 var(--sans);
+        font: 720 14px/1.22 var(--sans);
         letter-spacing: 0;
         white-space: nowrap;
       }
@@ -1681,13 +2345,13 @@
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-        max-width: 220px;
+        max-width: 218px;
       }
 
       .vcs-actions {
         display: flex;
         align-items: center;
-        gap: 2px;
+        gap: 4px;
       }
 
       .vcs-icon-button, .vcs-tool-button {
@@ -1697,15 +2361,20 @@
         height: 26px;
         padding: 0;
         color: var(--nezumi);
-        background: transparent;
-        border: 0;
-        border-radius: 4px;
+        background: color-mix(in srgb, var(--paper) 74%, transparent);
+        border: 1px solid transparent;
+        border-radius: 5px;
         cursor: pointer;
-        transition: color 180ms ease, background 180ms ease, transform 180ms ease;
+        transition:
+          color 180ms ease,
+          background 180ms ease,
+          border-color 180ms ease,
+          transform 180ms ease;
       }
       .vcs-icon-button:hover, .vcs-tool-button:hover {
         color: var(--sumi);
-        background: var(--washi-soft);
+        background: var(--washi);
+        border-color: color-mix(in srgb, var(--haijiro) 70%, transparent);
         transform: translateY(-1px);
       }
       .vcs-icon-button:active, .vcs-tool-button:active,
@@ -1723,13 +2392,17 @@
       .vcs-icon-button[data-motion="gear"]:hover svg {
         transform: rotate(38deg);
       }
+      .vcs-collapse-button svg {
+        transform: rotate(90deg);
+        transform-origin: 50% 50%;
+      }
       .vcs-collapse-button:hover svg {
-        transform: translateX(-1px);
+        transform: rotate(90deg) translateX(1px);
       }
 
       svg {
-        width: 14px;
-        height: 14px;
+        width: 13px;
+        height: 13px;
         fill: none;
         stroke: currentColor;
         stroke-width: 1.8;
@@ -1738,55 +2411,118 @@
         transition: transform 180ms ease;
       }
 
+      .t-resize {
+        transition:
+          width  var(--resize-dur) var(--resize-ease),
+          height var(--resize-dur) var(--resize-ease);
+        will-change: width, height;
+      }
+
+      .t-panel-slide {
+        transform: translateY(var(--panel-translate-y));
+        opacity: 0;
+        filter: blur(var(--panel-blur));
+        pointer-events: none;
+        transition:
+          transform var(--panel-close-dur) var(--panel-ease),
+          opacity   var(--panel-close-dur) var(--panel-ease),
+          filter    var(--panel-close-dur) var(--panel-ease);
+        will-change: transform, opacity, filter;
+      }
+      .t-panel-slide[data-open="true"] {
+        transform: translateY(0);
+        opacity: 1;
+        filter: blur(0);
+        pointer-events: auto;
+        transition:
+          transform var(--panel-open-dur) var(--panel-ease),
+          opacity   var(--panel-open-dur) var(--panel-ease),
+          filter    var(--panel-open-dur) var(--panel-ease);
+      }
+
+      .t-text-swap {
+        display: inline-block;
+        transform: translateY(0);
+        filter: blur(0);
+        opacity: 1;
+        transition:
+          transform var(--text-swap-dur) var(--text-swap-ease),
+          filter    var(--text-swap-dur) var(--text-swap-ease),
+          opacity   var(--text-swap-dur) var(--text-swap-ease);
+        will-change: transform, filter, opacity;
+      }
+      .t-text-swap.is-exit {
+        transform: translateY(calc(var(--text-swap-translate-y) * -1));
+        filter: blur(var(--text-swap-blur));
+        opacity: 0;
+      }
+      .t-text-swap.is-enter-start {
+        transform: translateY(var(--text-swap-translate-y));
+        filter: blur(var(--text-swap-blur));
+        opacity: 0;
+        transition: none;
+      }
+
       .vcs-body {
         display: grid;
-        gap: 14px;
-        padding: 16px;
+        flex: 1 1 auto;
+        gap: 10px;
+        padding: 14px;
         max-height: 78vh;
-        overflow: auto;
+        min-height: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
       }
       .vcs-panel.is-floating .vcs-body {
         max-height: calc(100vh - 200px);
       }
+      .vcs-panel.is-embedded .vcs-body {
+        max-height: none;
+        overflow: visible;
+      }
 
       .vcs-body::-webkit-scrollbar,
-      #vcs-summary::-webkit-scrollbar,
-      .vcs-textarea::-webkit-scrollbar {
+      .vcs-summary-shell::-webkit-scrollbar,
+      .vcs-transcript-box::-webkit-scrollbar {
         width: 6px;
         height: 6px;
       }
       .vcs-body::-webkit-scrollbar-thumb,
-      #vcs-summary::-webkit-scrollbar-thumb,
-      .vcs-textarea::-webkit-scrollbar-thumb {
-        background: var(--haijiro);
-        border-radius: 0;
+      .vcs-summary-shell::-webkit-scrollbar-thumb,
+      .vcs-transcript-box::-webkit-scrollbar-thumb {
+        background: color-mix(in srgb, var(--haijiro) 82%, transparent);
+        border-radius: 999px;
       }
 
       .vcs-meta-line {
+        padding: 8px 10px;
         font-size: 12px;
         color: var(--sumi-soft);
         line-height: 1.5;
+        background: color-mix(in srgb, var(--washi) 72%, transparent);
+        border: 1px solid color-mix(in srgb, var(--haijiro-soft) 82%, transparent);
+        border-radius: 6px;
+        min-width: 0;
       }
       .vcs-meta-title {
         display: block;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+        overflow-wrap: anywhere;
+        white-space: normal;
         font-family: var(--sans);
         letter-spacing: 0;
       }
 
       .vcs-status-wrap {
         display: grid;
-        gap: 8px;
+        gap: 6px;
       }
       .vcs-status {
         color: var(--nezumi);
-        font-size: 12px;
+        font: 560 12px/1.5 var(--sans);
         letter-spacing: 0;
         min-height: 18px;
       }
-      .vcs-status[data-tone="busy"] { color: var(--rikyu); }
+      .vcs-status[data-tone="busy"] { color: var(--clay); }
       .vcs-status[data-tone="done"] { color: var(--good); }
       .vcs-status[data-tone="error"] { color: var(--bad); }
 
@@ -1795,13 +2531,13 @@
         height: 2px;
         border-radius: 2px;
         overflow: hidden;
-        background: var(--haijiro);
+        background: color-mix(in srgb, var(--haijiro) 72%, transparent);
       }
       .vcs-progress span {
         display: block;
         width: 0;
         height: 100%;
-        background: var(--rikyu);
+        background: linear-gradient(90deg, var(--clay), var(--rikyu));
         transition: width 280ms ease;
       }
       .vcs-progress[data-tone="done"] span { background: var(--good); }
@@ -1812,72 +2548,109 @@
       }
 
       .vcs-primary {
-        width: 100%;
-        height: 40px;
-        color: var(--paper);
-        background: var(--sumi);
-        border: 1px solid var(--sumi);
-        border-radius: 4px;
-        font: 650 13px/1 var(--sans);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 7px;
+        justify-self: end;
+        width: auto;
+        min-width: 126px;
+        height: 34px;
+        padding: 0 14px;
+        color: #fffaf1;
+        background: linear-gradient(180deg, color-mix(in srgb, var(--button) 94%, #ffffff), var(--button));
+        border: 1px solid color-mix(in srgb, var(--button) 82%, var(--haijiro));
+        border-radius: 5px;
+        font: 680 12px/1 var(--sans);
         letter-spacing: 0;
         cursor: pointer;
-        transition: background 180ms ease, color 180ms ease, transform 180ms ease;
+        box-shadow: 0 5px 14px color-mix(in srgb, var(--shadow) 58%, transparent);
+        transition:
+          background 180ms ease,
+          border-color 180ms ease,
+          box-shadow 180ms ease,
+          transform 180ms ease;
+      }
+      .vcs-primary-icon {
+        display: grid;
+        place-items: center;
+        width: 14px;
+        height: 14px;
+      }
+      .vcs-primary-icon svg {
+        width: 13px;
+        height: 13px;
+        stroke-width: 1.7;
       }
       .vcs-primary:hover {
-        background: #000000;
-        border-color: #000000;
-        transform: translateY(-1px);
+        background: linear-gradient(180deg, color-mix(in srgb, var(--button-hover) 92%, #ffffff), var(--button-hover));
+        border-color: color-mix(in srgb, var(--button-hover) 76%, var(--haijiro));
+        box-shadow: 0 7px 18px color-mix(in srgb, var(--shadow) 68%, transparent);
+        transform: translateY(-0.5px);
       }
       .vcs-panel[data-theme="dark"] .vcs-primary {
-        background: var(--sumi);
-        color: var(--paper);
+        background: linear-gradient(180deg, #e8dccb, var(--button));
+        border-color: color-mix(in srgb, var(--button) 80%, var(--haijiro));
+        color: #24221e;
       }
       .vcs-panel[data-theme="dark"] .vcs-primary:hover {
-        background: #ffffff;
-        border-color: #ffffff;
-        color: #0f0f0f;
+        background: linear-gradient(180deg, #fff3df, var(--button-hover));
+        border-color: var(--button-hover);
+        color: #24221e;
       }
 
       .vcs-track-row {
         display: grid;
-        grid-template-columns: auto 1fr auto;
+        grid-template-columns: auto minmax(0, 1fr) auto;
         align-items: center;
         gap: 8px;
-        padding-top: 4px;
-        border-top: 1px solid var(--haijiro-soft);
+        padding: 8px 0 0;
+        border-top: 1px solid color-mix(in srgb, var(--haijiro-soft) 82%, transparent);
+        min-width: 0;
       }
       .vcs-track-label {
-        font-size: 11px;
+        font: 650 11px/1.35 var(--sans);
         color: var(--nezumi);
         letter-spacing: 0;
-        font-family: var(--sans);
+        white-space: nowrap;
       }
       .vcs-select {
         width: 100%;
         min-width: 0;
         height: 28px;
-        padding: 0 6px;
+        padding: 0 26px 0 8px;
         color: var(--sumi);
-        background: transparent;
-        border: 0;
-        border-bottom: 1px solid var(--haijiro);
-        border-radius: 0;
+        background:
+          linear-gradient(45deg, transparent 50%, var(--nezumi) 50%),
+          linear-gradient(135deg, var(--nezumi) 50%, transparent 50%),
+          color-mix(in srgb, var(--paper) 78%, transparent);
+        background-position:
+          calc(100% - 15px) 52%,
+          calc(100% - 10px) 52%,
+          0 0;
+        background-size: 5px 5px, 5px 5px, 100% 100%;
+        background-repeat: no-repeat;
+        border: 1px solid color-mix(in srgb, var(--haijiro) 76%, transparent);
+        border-radius: 5px;
         outline: none;
+        appearance: none;
+        -webkit-appearance: none;
         font-family: var(--sans);
         font-size: 12px;
       }
-      .vcs-select:focus { border-bottom-color: var(--rikyu); }
+      .vcs-select:focus { border-color: var(--rikyu); }
 
       .vcs-details {
         border: 0;
-        border-top: 1px solid var(--haijiro-soft);
-        padding-top: 8px;
+        border-top: 1px solid color-mix(in srgb, var(--haijiro-soft) 82%, transparent);
+        padding-top: 7px;
         background: transparent;
       }
       .vcs-details summary {
-        padding: 4px 0;
+        min-height: 28px;
+        padding: 3px 0;
         color: var(--sumi-soft);
-        font: 550 12px/1.5 var(--sans);
+        font: 650 12px/1.5 var(--sans);
         letter-spacing: 0;
         cursor: pointer;
         list-style: none;
@@ -1887,38 +2660,131 @@
       }
       .vcs-details summary::-webkit-details-marker { display: none; }
       .vcs-details summary::after {
-        content: "＋";
+        content: "›";
+        display: grid;
+        place-items: center;
+        width: 18px;
+        height: 18px;
         color: var(--nezumi);
-        font-size: 12px;
+        font-size: 19px;
         line-height: 1;
-        font-weight: 400;
-        transition: transform 200ms ease;
+        font-weight: 500;
+        transform: rotate(0deg);
+        transform-origin: 50% 50%;
+        transition:
+          transform 190ms cubic-bezier(0.22, 1, 0.36, 1),
+          color 160ms ease;
       }
-      .vcs-details[open] summary::after { content: "－"; }
+      .vcs-details[open] summary::after { transform: rotate(90deg); }
       .vcs-details summary:hover { color: var(--sumi); }
+      .vcs-details summary:hover::after { color: var(--sumi); }
 
-      .vcs-textarea {
+      .vcs-transcript-box {
         display: block;
         width: 100%;
-        min-height: 110px;
-        margin-top: 8px;
-        padding: 10px;
-        resize: vertical;
+        height: 220px;
+        margin-top: 6px;
+        padding: 8px;
+        overflow: auto;
         color: var(--sumi);
-        background: var(--washi);
-        border: 1px solid var(--haijiro);
-        border-radius: 4px;
+        background: color-mix(in srgb, var(--paper-elevated) 72%, var(--washi));
+        border: 1px solid color-mix(in srgb, var(--haijiro) 78%, transparent);
+        border-radius: 6px;
         outline: none;
-        font: 12px/1.7 var(--sans);
+        font: 400 11px/1.55 var(--sans);
+        overscroll-behavior: contain;
       }
-      .vcs-textarea:focus { border-color: var(--rikyu); }
+      .vcs-transcript-box[data-empty="true"] {
+        display: grid;
+        place-items: start;
+        color: var(--nezumi);
+      }
+      .vcs-transcript-placeholder {
+        color: var(--nezumi);
+      }
+      .vcs-transcript-box:focus { border-color: var(--rikyu); }
+      .vcs-transcript-list {
+        display: grid;
+        gap: 2px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+      .vcs-transcript-item {
+        margin: 0;
+        padding: 0;
+      }
+      .vcs-transcript-row {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: start;
+        gap: 8px;
+        width: 100%;
+        min-height: 28px;
+        padding: 4px 5px;
+        color: var(--sumi-soft);
+        background: transparent;
+        border: 0;
+        border-radius: 5px;
+        appearance: none;
+        -webkit-appearance: none;
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+        transition:
+          background 160ms ease,
+          color 160ms ease,
+          transform 160ms ease;
+      }
+      .vcs-transcript-row:hover {
+        color: var(--sumi);
+        background: color-mix(in srgb, var(--haijiro-soft) 68%, transparent);
+      }
+      .vcs-transcript-row.is-active {
+        color: var(--sumi);
+        background: color-mix(in srgb, #edf4ff 82%, transparent);
+      }
+      .vcs-transcript-row.is-plain {
+        display: block;
+        cursor: default;
+      }
+      .vcs-transcript-row.is-plain:hover {
+        color: var(--sumi-soft);
+        background: transparent;
+      }
+      .vcs-cue-time {
+        display: inline-grid;
+        place-items: center;
+        min-width: 38px;
+        height: 20px;
+        padding: 0 7px;
+        color: #5f6f8f;
+        background: #eef5ff;
+        border-radius: 999px;
+        font: 650 10.5px/1 var(--sans);
+        letter-spacing: 0;
+        white-space: nowrap;
+      }
+      .vcs-transcript-row.is-active .vcs-cue-time {
+        color: #2f4f86;
+        background: #dfeeff;
+      }
+      .vcs-cue-text {
+        min-width: 0;
+        overflow-wrap: anywhere;
+        white-space: normal;
+      }
 
       .vcs-result {
         display: grid;
-        gap: 10px;
-        padding-top: 12px;
-        border-top: 1px solid var(--sumi);
-        margin-top: 4px;
+        justify-self: center;
+        gap: 8px;
+        width: min(100%, 720px);
+        padding: 10px;
+        background: color-mix(in srgb, var(--paper-elevated) 88%, var(--washi));
+        border: 1px solid color-mix(in srgb, var(--haijiro) 86%, transparent);
+        border-radius: 7px;
+        box-shadow: inset 0 1px 0 color-mix(in srgb, #ffffff 48%, transparent);
       }
       .vcs-result[hidden] { display: none; }
 
@@ -1933,15 +2799,35 @@
         color: var(--sumi);
       }
 
+      .vcs-summary-shell {
+        width: 100%;
+        max-height: clamp(260px, 42vh, 500px);
+        padding: 2px 8px 2px 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        overscroll-behavior: contain;
+        scrollbar-gutter: stable;
+      }
+      .vcs-summary-shell:focus {
+        outline: 2px solid color-mix(in srgb, var(--rikyu) 38%, transparent);
+        outline-offset: 3px;
+        border-radius: 5px;
+      }
+      .vcs-panel.is-floating .vcs-summary-shell {
+        max-height: min(360px, 38vh);
+      }
+      .vcs-panel.is-embedded .vcs-summary-shell {
+        max-height: clamp(300px, 48vh, 560px);
+      }
+
       #vcs-summary {
         color: var(--sumi);
         background: transparent;
-        max-height: 360px;
-        overflow: auto;
         font: 13px/1.85 var(--sans);
         letter-spacing: 0;
+        overflow-wrap: anywhere;
       }
-      #vcs-summary h3, #vcs-summary h4 {
+      #vcs-summary h3, #vcs-summary h4, #vcs-summary h5 {
         margin: 16px 0 6px;
         font: 650 13px/1.5 var(--sans);
         letter-spacing: 0;
@@ -1949,60 +2835,119 @@
         padding-bottom: 4px;
         border-bottom: 1px solid var(--haijiro-soft);
       }
-      #vcs-summary h3:first-child, #vcs-summary h4:first-child { margin-top: 0; }
+      #vcs-summary h3:first-child, #vcs-summary h4:first-child, #vcs-summary h5:first-child { margin-top: 0; }
       #vcs-summary p { margin: 0 0 10px; color: var(--sumi-soft); }
-      #vcs-summary ul { margin: 0 0 10px; padding-left: 18px; color: var(--sumi-soft); }
+      #vcs-summary ul, #vcs-summary ol { margin: 0 0 10px; padding-left: 18px; color: var(--sumi-soft); }
       #vcs-summary li { margin-bottom: 4px; }
+      #vcs-summary strong { color: var(--sumi); font-weight: 720; }
+      #vcs-summary em { font-style: italic; }
+      #vcs-summary code {
+        padding: 1px 4px;
+        color: var(--sumi);
+        background: color-mix(in srgb, var(--haijiro-soft) 72%, transparent);
+        border-radius: 4px;
+        font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      #vcs-summary a {
+        color: var(--sumi);
+        text-decoration: underline;
+        text-decoration-color: color-mix(in srgb, var(--sumi) 38%, transparent);
+        text-underline-offset: 3px;
+      }
+      #vcs-summary hr {
+        height: 1px;
+        margin: 14px 0;
+        background: var(--haijiro-soft);
+        border: 0;
+      }
 
       .vcs-collapsed-toggle {
         display: none;
-        grid-template-columns: 22px auto;
+        grid-template-columns: 34px minmax(0, 1fr) 22px;
         align-items: center;
-        gap: 8px;
-        width: 136px;
-        min-height: 36px;
-        padding: 0 10px 0 8px;
+        gap: 9px;
+        width: 100%;
+        min-height: 54px;
+        padding: 8px 10px;
         color: var(--sumi);
-        background: var(--paper);
-        border: 1px solid var(--haijiro);
-        border-radius: 4px;
+        background:
+          linear-gradient(90deg, color-mix(in srgb, var(--paper-elevated) 94%, var(--washi)), var(--paper));
+        border: 1px solid color-mix(in srgb, var(--haijiro) 86%, transparent);
+        border-radius: 7px;
         cursor: pointer;
-        font: 650 12px/1 var(--sans);
+        font: 650 12px/1.2 var(--sans);
         letter-spacing: 0;
-        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.12);
+        box-shadow: 0 8px 20px var(--shadow);
         transform-origin: top right;
         animation: vcs-tab-in 180ms ease both;
-        transition: border-color 180ms ease, transform 180ms ease, box-shadow 180ms ease;
+        transition:
+          border-color 180ms ease,
+          background 180ms ease,
+          transform 180ms ease,
+          box-shadow 180ms ease;
       }
       .vcs-collapsed-toggle:hover {
-        border-color: var(--sumi);
+        border-color: color-mix(in srgb, var(--rikyu) 72%, var(--haijiro));
+        background:
+          linear-gradient(90deg, color-mix(in srgb, var(--paper-elevated) 86%, var(--washi-soft)), var(--paper-elevated));
         transform: translateY(-1px);
-        box-shadow: 0 14px 30px rgba(0, 0, 0, 0.16);
+        box-shadow: 0 10px 24px var(--shadow);
       }
-      .vcs-collapsed-toggle:hover svg {
+      .vcs-collapsed-toggle:hover .vcs-collapsed-arrow svg {
         transform: translateX(1px);
       }
       .vcs-collapsed-icon {
         display: grid;
         place-items: center;
-        width: 22px;
-        height: 22px;
-        color: var(--paper);
-        background: var(--sumi);
-        border-radius: 3px;
+        width: 34px;
+        height: 34px;
+        padding: 3px;
+        background: color-mix(in srgb, var(--shu) 92%, var(--clay));
+        border-radius: 7px;
+        overflow: hidden;
+      }
+      .vcs-collapsed-icon img {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+      .vcs-collapsed-copy {
+        display: grid;
+        gap: 3px;
+        min-width: 0;
       }
       .vcs-collapsed-title {
         display: block;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+        color: var(--sumi);
+        font: 740 13px/1.2 var(--sans);
+      }
+      .vcs-collapsed-meta {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--nezumi);
+        font: 520 11px/1.35 var(--sans);
+      }
+      .vcs-collapsed-arrow {
+        display: grid;
+        place-items: center;
+        width: 24px;
+        height: 24px;
+        color: var(--nezumi);
       }
 
       .vcs-panel.is-collapsed {
-        width: auto;
+        width: 100%;
         background: transparent;
         border: 0;
         overflow: visible;
+        box-shadow: none;
+        animation: none;
       }
       .vcs-panel.is-collapsed .vcs-header,
       .vcs-panel.is-collapsed .vcs-body {
@@ -2014,6 +2959,24 @@
       .vcs-panel.is-floating.is-collapsed {
         top: 84px;
         right: 20px;
+        width: 186px;
+      }
+      .vcs-panel.is-floating.is-collapsed .vcs-collapsed-toggle {
+        min-height: 48px;
+        grid-template-columns: 30px minmax(0, 1fr) 18px;
+        padding: 7px 9px;
+        border-radius: 9px;
+      }
+      .vcs-panel.is-floating.is-collapsed .vcs-collapsed-icon {
+        width: 30px;
+        height: 30px;
+        border-radius: 7px;
+      }
+      .vcs-panel.is-floating.is-collapsed .vcs-collapsed-title {
+        font-size: 13px;
+      }
+      .vcs-panel.is-floating.is-collapsed .vcs-collapsed-meta {
+        max-width: 108px;
       }
 
       @keyframes vcs-indeterminate {
@@ -2041,6 +3004,9 @@
         .vcs-tool-button.is-busy svg { animation: none; }
         .vcs-panel, .vcs-collapsed-toggle { animation: none; }
         .vcs-primary, .vcs-icon-button, .vcs-tool-button, .vcs-collapsed-toggle { transition: none; }
+        .t-resize { transition: none !important; }
+        .t-panel-slide { transition: none !important; }
+        .t-text-swap { transition: none !important; }
       }
 
       @media (max-width: 1100px) {
@@ -2049,6 +3015,9 @@
           right: 16px;
           bottom: 16px;
           width: min(360px, calc(100vw - 32px));
+        }
+        .vcs-panel.is-floating.is-collapsed {
+          width: min(220px, calc(100vw - 32px));
         }
       }
     `;

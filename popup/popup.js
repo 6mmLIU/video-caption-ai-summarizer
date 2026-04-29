@@ -1,6 +1,10 @@
 const statusEl = document.querySelector("#status");
 const platformEl = document.querySelector("#platform");
 const tracksEl = document.querySelector("#tracks");
+const DEFAULT_SETTINGS = {
+  theme: "auto",
+  language: "中文（简体）"
+};
 
 document.querySelector("#openOptions").addEventListener("click", () => {
   chrome.runtime.openOptionsPage();
@@ -24,6 +28,7 @@ document.querySelector("#summarize").addEventListener("click", async () => {
 init();
 
 async function init() {
+  await initTheme();
   const tab = await getActiveTab();
   const response = await sendToTab(tab.id, { type: "VCS_GET_STATUS" });
 
@@ -38,6 +43,38 @@ async function init() {
   setStatus(payload.title || "已连接页面面板");
   platformEl.textContent = payload.platform || "-";
   tracksEl.textContent = String(payload.tracks ?? "-");
+}
+
+async function initTheme() {
+  const result = await chrome.storage.local.get("vcsSettings");
+  applyTheme({
+    ...DEFAULT_SETTINGS,
+    ...(result.vcsSettings || {})
+  });
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.vcsSettings) {
+      applyTheme({
+        ...DEFAULT_SETTINGS,
+        ...(changes.vcsSettings.newValue || {})
+      });
+    }
+  });
+
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    if (document.documentElement.dataset.themeMode === "auto") {
+      applyTheme({ theme: "auto" });
+    }
+  });
+}
+
+function applyTheme(settings) {
+  const mode = ["auto", "light", "dark"].includes(settings.theme) ? settings.theme : "auto";
+  const resolved = mode === "auto"
+    ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+    : mode;
+  document.documentElement.dataset.themeMode = mode;
+  document.documentElement.dataset.theme = resolved;
 }
 
 async function getActiveTab() {

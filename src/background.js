@@ -1,36 +1,18 @@
 const DEFAULT_SETTINGS = {
+  settingsVersion: 3,
   theme: "auto",
   language: "中文（简体）",
-  activeProfileId: "deepseek",
+  panelEnabled: true,
+  activeProfileId: "custom",
   profiles: [
     {
-      id: "deepseek",
-      name: "DeepSeek",
+      id: "custom",
+      name: "我的 API 配置",
       provider: "openai-compatible",
       endpoint: "https://api.deepseek.com/v1/chat/completions",
       apiKey: "",
-      model: "deepseek-chat",
-      temperature: 0.2,
-      maxTokens: 4096
-    },
-    {
-      id: "openai",
-      name: "OpenAI / ChatGPT",
-      provider: "openai-compatible",
-      endpoint: "https://api.openai.com/v1/chat/completions",
-      apiKey: "",
-      model: "gpt-4o-mini",
-      temperature: 0.2,
-      maxTokens: 4096
-    },
-    {
-      id: "claude",
-      name: "Claude",
-      provider: "anthropic",
-      endpoint: "https://api.anthropic.com/v1/messages",
-      apiKey: "",
-      model: "claude-sonnet-4-5",
-      temperature: 0.2,
+      model: "",
+      temperature: 1,
       maxTokens: 4096
     }
   ],
@@ -60,13 +42,17 @@ const DEFAULT_SETTINGS = {
   includeTimestamps: true,
   includeTitleAndUrl: true,
   redactTerms: "",
-  saveHistory: false
+  saveHistory: true
 };
+const MODEL_REQUEST_TIMEOUT_MS = 60000;
+const HISTORY_LIMIT = 30;
 
 chrome.runtime.onInstalled.addListener(async () => {
   const existing = await chrome.storage.local.get("vcsSettings");
   if (!existing.vcsSettings) {
     await chrome.storage.local.set({ vcsSettings: DEFAULT_SETTINGS });
+  } else {
+    await chrome.storage.local.set({ vcsSettings: normalizeSettings(existing.vcsSettings) });
   }
 });
 
@@ -160,7 +146,7 @@ async function summarizeTranscript(payload, sender) {
 
   if (chunks.length === 1) {
     await notifyProgress(sender, {
-      label: "正在请求模型",
+      label: "正在请求模型（最多 60 秒）",
       current: 1,
       total: 1
     });
@@ -171,7 +157,7 @@ async function summarizeTranscript(payload, sender) {
       transcript: chunks[0],
       chunkLabel: ""
     }));
-    await maybeSaveHistory(settings, { title, platform, url, text });
+    await maybeSaveHistory(settings, { title, platform, url, summary: text, model: profile.model, provider: profile.provider });
     return {
       text,
       chunks: 1,
@@ -242,7 +228,7 @@ async function summarizeTranscript(payload, sender) {
     }
   ]);
 
-  await maybeSaveHistory(settings, { title, platform, url, text: finalText });
+  await maybeSaveHistory(settings, { title, platform, url, summary: finalText, model: profile.model, provider: profile.provider });
   return {
     text: finalText,
     chunks: chunks.length,
@@ -273,7 +259,7 @@ function buildSummaryMessages(settings, variables) {
 
 async function getSettings() {
   const result = await chrome.storage.local.get("vcsSettings");
-  return deepMerge(DEFAULT_SETTINGS, result.vcsSettings || {});
+  return normalizeSettings(result.vcsSettings);
 }
 
 function getActiveProfile(settings) {
@@ -321,19 +307,26 @@ async function callOpenAICompatible(profile, messages) {
     headers.Authorization = `Bearer ${profile.apiKey}`;
   }
 
-  const response = await fetch(profile.endpoint, {
+  const body = {
+    model: profile.model,
+    messages,
+    max_tokens: toNumber(profile.maxTokens, 4096),
+    stream: false
+  };
+
+  if (shouldDisableKimiThinking(profile)) {
+    body.thinking = { type: "disabled" };
+  } else {
+    body.temperature = toNumber(profile.temperature, 1);
+  }
+
+  const response = await fetchModel(profile.endpoint, {
     method: "POST",
     headers,
-    body: JSON.stringify({
-      model: profile.model,
-      messages,
-      temperature: toNumber(profile.temperature, 0.2),
-      max_tokens: toNumber(profile.maxTokens, 4096),
-      stream: false
-    })
-  });
+    body: JSON.stringify(body)
+  }, profile);
 
-  const data = await readJsonResponse(response);
+  const data = await readJsonResponse(response, profile);
   const content = data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text;
   if (!content) {
     throw new Error("The OpenAI-compatible response did not contain text.");
@@ -350,7 +343,8 @@ async function callAnthropic(profile, messages) {
       content: message.content
     }));
 
-  const response = await fetch(profile.endpoint || "https://api.anthropic.com/v1/messages", {
+  const endpoint = profile.endpoint || "https://api.anthropic.com/v1/messages";
+  const response = await fetchModel(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -361,13 +355,13 @@ async function callAnthropic(profile, messages) {
     body: JSON.stringify({
       model: profile.model,
       max_tokens: toNumber(profile.maxTokens, 4096),
-      temperature: toNumber(profile.temperature, 0.2),
+      temperature: toNumber(profile.temperature, 1),
       system: systemMessage,
       messages: userMessages.length ? userMessages : [{ role: "user", content: "OK" }]
     })
-  });
+  }, profile);
 
-  const data = await readJsonResponse(response);
+  const data = await readJsonResponse(response, profile);
   const content = Array.isArray(data?.content)
     ? data.content.map((part) => part.text || "").join("")
     : "";
@@ -388,7 +382,7 @@ async function callGemini(profile, messages) {
     .map((message) => `${message.role.toUpperCase()}:\n${message.content}`)
     .join("\n\n");
 
-  const response = await fetch(url.toString(), {
+  const response = await fetchModel(url.toString(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
@@ -401,13 +395,13 @@ async function callGemini(profile, messages) {
         }
       ],
       generationConfig: {
-        temperature: toNumber(profile.temperature, 0.2),
+        temperature: toNumber(profile.temperature, 1),
         maxOutputTokens: toNumber(profile.maxTokens, 4096)
       }
     })
-  });
+  }, profile);
 
-  const data = await readJsonResponse(response);
+  const data = await readJsonResponse(response, profile);
   const content = data?.candidates?.[0]?.content?.parts
     ?.map((part) => part.text || "")
     .join("");
@@ -417,21 +411,62 @@ async function callGemini(profile, messages) {
   return content.trim();
 }
 
-async function readJsonResponse(response) {
+async function fetchModel(url, options, profile) {
+  const controller = new AbortController();
+  const timeoutMs = MODEL_REQUEST_TIMEOUT_MS;
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } catch (error) {
+    const target = getApiTargetLabel(profile, url);
+    if (error?.name === "AbortError") {
+      throw new Error(`模型请求超时（${Math.round(timeoutMs / 1000)} 秒，${target}）。请检查接口地址、模型名/API Key，或换用更快的模型。`);
+    }
+    if (error instanceof TypeError || error?.name === "TypeError") {
+      throw new Error(`模型网络请求失败（${target}）：${error.message || "Failed to fetch"}。通常是接口地址无法连接、证书/CORS 被拦截，或当前网络访问不了该服务。`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function readJsonResponse(response, profile) {
   const text = await response.text();
   let data = null;
   try {
     data = text ? JSON.parse(text) : null;
   } catch (error) {
-    throw new Error(`API returned non-JSON response: ${text.slice(0, 240)}`);
+    throw new Error(`模型接口返回了非 JSON 内容（${getApiTargetLabel(profile, response.url)}）：${text.slice(0, 240)}`);
   }
 
   if (!response.ok) {
     const message = data?.error?.message || data?.message || response.statusText;
-    throw new Error(`API request failed: ${response.status} ${message}`);
+    throw new Error(`模型接口返回错误（${getApiTargetLabel(profile, response.url)}）：HTTP ${response.status} ${message}`);
   }
 
   return data;
+}
+
+function shouldDisableKimiThinking(profile) {
+  const model = String(profile?.model || "").toLowerCase();
+  const endpoint = String(profile?.endpoint || "").toLowerCase();
+  return endpoint.includes("moonshot") && (model === "kimi-k2.6" || model === "kimi-k2.5");
+}
+
+function getApiTargetLabel(profile, endpoint) {
+  let host = "";
+  try {
+    host = new URL(endpoint).host;
+  } catch (_error) {
+    host = endpoint || "unknown endpoint";
+  }
+  const model = profile?.model || "unknown model";
+  return `${model} @ ${host}`;
 }
 
 function chunkTranscript(text, size, overlap) {
@@ -512,10 +547,52 @@ async function maybeSaveHistory(settings, item) {
   const result = await chrome.storage.local.get("vcsHistory");
   const history = Array.isArray(result.vcsHistory) ? result.vcsHistory : [];
   history.unshift({
+    id: `summary-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     ...item,
     createdAt: new Date().toISOString()
   });
-  await chrome.storage.local.set({ vcsHistory: history.slice(0, 30) });
+  await chrome.storage.local.set({ vcsHistory: history.slice(0, HISTORY_LIMIT) });
+}
+
+function normalizeSettings(input) {
+  const normalized = deepMerge(DEFAULT_SETTINGS, input || {});
+  const importedVersion = Number(input?.settingsVersion || 0);
+  normalized.settingsVersion = DEFAULT_SETTINGS.settingsVersion;
+  normalized.theme = ["auto", "light", "dark"].includes(normalized.theme) ? normalized.theme : DEFAULT_SETTINGS.theme;
+  normalized.language = String(normalized.language || "").trim() || DEFAULT_SETTINGS.language;
+  normalized.panelEnabled = normalized.panelEnabled !== false;
+  normalized.includeTimestamps = normalized.includeTimestamps !== false;
+  normalized.includeTitleAndUrl = normalized.includeTitleAndUrl !== false;
+  normalized.saveHistory = importedVersion < 2 ? true : normalized.saveHistory !== false;
+  normalized.promptTemplate = String(normalized.promptTemplate || DEFAULT_SETTINGS.promptTemplate);
+  normalized.outputTemplate = String(normalized.outputTemplate || DEFAULT_SETTINGS.outputTemplate);
+  normalized.redactTerms = String(normalized.redactTerms || "");
+  normalized.chunkSize = clampNumber(normalized.chunkSize, DEFAULT_SETTINGS.chunkSize, 2000, 50000);
+  normalized.chunkOverlap = clampNumber(normalized.chunkOverlap, DEFAULT_SETTINGS.chunkOverlap, 0, 5000);
+
+  if (!Array.isArray(normalized.profiles) || !normalized.profiles.length) {
+    normalized.profiles = structuredClone(DEFAULT_SETTINGS.profiles);
+  }
+  normalized.profiles = normalized.profiles.map((profile, index) => {
+    const temperature = importedVersion < 3 && Number(profile?.temperature) === 0.2
+      ? 1
+      : profile?.temperature;
+    return {
+      id: String(profile?.id || `profile-${index + 1}`),
+      name: String(profile?.name || profile?.id || `API ${index + 1}`),
+      provider: String(profile?.provider || "openai-compatible"),
+      endpoint: String(profile?.endpoint || ""),
+      apiKey: String(profile?.apiKey || ""),
+      model: String(profile?.model || ""),
+      temperature: clampNumber(temperature, 1, 0, 2),
+      maxTokens: clampNumber(profile?.maxTokens, 4096, 256, 32000)
+    };
+  });
+  if (!normalized.profiles.some((profile) => profile.id === normalized.activeProfileId)) {
+    normalized.activeProfileId = normalized.profiles[0].id;
+  }
+
+  return normalized;
 }
 
 function deepMerge(base, extra) {
@@ -539,6 +616,14 @@ function deepMerge(base, extra) {
     }
   }
   return output;
+}
+
+function clampNumber(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, number));
 }
 
 function toNumber(value, fallback) {

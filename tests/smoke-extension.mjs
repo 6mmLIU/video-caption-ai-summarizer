@@ -12,6 +12,7 @@ const userDataDir = join(rootDir, "output", `chrome-profile-${Date.now()}`);
 const externalVideoUrl = process.env.VCS_TEST_URL || "";
 const externalNonVideoUrl = process.env.VCS_NON_VIDEO_URL || "";
 const skipCopyCheck = process.env.VCS_SKIP_COPY === "1";
+const skipExtendedOptionsChecks = process.env.VCS_SKIP_EXTENDED_OPTIONS === "1";
 const chromeCandidates = [
   "/Users/liu/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
   "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
@@ -20,6 +21,7 @@ const chromeCandidates = [
 ];
 const chromePath = await firstExisting(chromeCandidates);
 const debugPort = Number(process.env.VCS_DEBUG_PORT || 9227);
+const modelRequests = [];
 
 class Cdp {
   static async connect(url) {
@@ -55,7 +57,20 @@ class Cdp {
     this.nextId += 1;
     const payload = JSON.stringify({ id, method, params });
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timeoutId = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP command timed out: ${method}`));
+      }, 20000);
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timeoutId);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timeoutId);
+          reject(error);
+        }
+      });
       this.socket.send(payload);
     });
   }
@@ -71,6 +86,47 @@ await rm(userDataDir, { recursive: true, force: true });
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url || "/", "http://127.0.0.1");
+    if (url.pathname === "/mock-chat") {
+      const rawBody = await readRequestBody(request);
+      let body = null;
+      try {
+        body = rawBody ? JSON.parse(rawBody) : null;
+      } catch (_error) {
+        body = rawBody;
+      }
+      modelRequests.push({
+        method: request.method,
+        headers: request.headers,
+        body
+      });
+      response.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store"
+      });
+      response.end(JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: [
+                "## 一句话结论",
+                "",
+                "**MOCK SUMMARY CUSTOM PROMPT OK**",
+                "",
+                "---",
+                "",
+                "## 关键观点",
+                "- Markdown 粗体应该被渲染",
+                "- 摘要块应该在解析按钮下方",
+                "",
+                "1. 支持有序列表"
+              ].join("\n")
+            }
+          }
+        ]
+      }));
+      return;
+    }
+
     const pathname = url.pathname === "/" ? "/video-page.html" : url.pathname;
     const filePath = join(fixtureDir, pathname);
     const body = await readFile(filePath);
@@ -186,7 +242,7 @@ try {
       const shadow = root.shadowRoot;
       return {
         status: shadow.querySelector("#vcs-status")?.textContent || "",
-        transcriptLength: shadow.querySelector("#vcs-preview")?.value?.length || 0
+        transcriptLength: shadow.querySelector("#vcs-preview")?.textContent?.trim().length || 0
       };
     `);
     if (!copyState.status.includes("字幕已复制") || copyState.transcriptLength < 40) {
@@ -229,7 +285,130 @@ try {
   await optionsPage.send("Page.enable");
   await optionsPage.send("Runtime.enable");
   await waitForPageReady(optionsPage);
+
+  if (!skipExtendedOptionsChecks) {
+  await evaluate(optionsPage, `
+    return chrome.storage.local.remove(["vcsSettings", "vcsHistory"]);
+  `);
+  await optionsPage.send("Page.reload", { ignoreCache: true });
+  await waitForPageReady(optionsPage);
+
+  await waitForExpression(optionsPage, `
+    document.querySelector("#language")?.value?.trim().length > 0
+  `, 5000);
+  const optionsState = await evaluate(optionsPage, `
+    return chrome.storage.local.get("vcsSettings").then((result) => ({
+      language: document.querySelector("#language")?.value || "",
+      saveHistory: document.querySelector("#saveHistory")?.checked || false,
+      themeMode: document.documentElement.dataset.themeMode || "",
+      theme: document.documentElement.dataset.theme || "",
+      activeProfileExists: Boolean(document.querySelector("#activeProfile")),
+      settingsProfileCount: result.vcsSettings?.profiles?.length || 0,
+      profileName: document.querySelector("#profileName")?.value || "",
+      model: document.querySelector("#model")?.value || "",
+      temperature: document.querySelector("#temperature")?.value || ""
+    }));
+  `);
+  if (optionsState.language !== "中文（简体）") {
+    throw new Error(`Expected default summary language, got: ${optionsState.language}`);
+  }
+  if (!optionsState.saveHistory) {
+    throw new Error("Summary history should be enabled by default after settings migration.");
+  }
+  if (optionsState.activeProfileExists) {
+    throw new Error(`API profile selector should be removed: ${JSON.stringify(optionsState)}`);
+  }
+  if (!optionsState.settingsProfileCount || !optionsState.profileName || optionsState.model || optionsState.temperature !== "1") {
+    throw new Error(`API defaults should expose an editable name, blank model, and temperature 1: ${JSON.stringify(optionsState)}`);
+  }
+
+  const presetState = await evaluate(optionsPage, `
+    document.querySelector("#profileName").value = "自定义配置";
+    document.querySelector("#model").value = "custom-model";
+    document.querySelector("#temperature").value = "0.7";
+    document.querySelector("[data-preset='kimi']").click();
+    return {
+      profileName: document.querySelector("#profileName").value,
+      model: document.querySelector("#model").value,
+      temperature: document.querySelector("#temperature").value,
+      provider: document.querySelector("#provider").value,
+      endpoint: document.querySelector("#endpoint").value
+    };
+  `);
+  if (
+    presetState.profileName !== "自定义配置" ||
+    presetState.model !== "custom-model" ||
+    presetState.temperature !== "0.7" ||
+    !presetState.endpoint.includes("moonshot")
+  ) {
+    throw new Error(`Preset buttons should only update provider and endpoint: ${JSON.stringify(presetState)}`);
+  }
+
+  await evaluate(optionsPage, `
+    document.querySelector("input[name='theme'][value='dark']").click();
+    return true;
+  `);
+  await waitForExpression(optionsPage, `
+    document.documentElement.dataset.themeMode === "dark" && document.documentElement.dataset.theme === "dark"
+  `, 5000);
+
+  await evaluate(optionsPage, `
+    return chrome.storage.local.set({
+      vcsHistory: Array.from({ length: 35 }, (_, index) => ({
+        id: "history-" + index,
+        title: "History Video " + index,
+        platform: "Fixture",
+        model: "test-model",
+        summary: "Summary item " + index,
+        createdAt: new Date(Date.now() - index * 1000).toISOString()
+      }))
+    });
+  `);
+  await waitForExpression(optionsPage, `
+    document.querySelector("#historyCount")?.textContent?.trim() === "30 / 30"
+  `, 5000);
+  const historyState = await evaluate(optionsPage, `
+    return chrome.storage.local.get("vcsHistory").then((result) => ({
+      count: document.querySelector("#historyCount")?.textContent?.trim() || "",
+      items: document.querySelectorAll(".history-item").length,
+      storedLength: result.vcsHistory?.length || 0
+    }));
+  `);
+  if (historyState.items !== 30 || historyState.storedLength !== 30) {
+    throw new Error(`History should render and persist at 30 items: ${JSON.stringify(historyState)}`);
+  }
+
+  await evaluate(optionsPage, `
+    window.__vcsExportDownload = null;
+    HTMLAnchorElement.prototype.click = function () {
+      window.__vcsExportDownload = {
+        download: this.download,
+        href: this.href
+      };
+    };
+    document.querySelector("#exportSettings").click();
+    return true;
+  `);
+  await waitForExpression(optionsPage, `
+    Boolean(window.__vcsExportDownload?.download)
+  `, 5000);
+  const exportState = await evaluate(optionsPage, `
+    return window.__vcsExportDownload;
+  `);
+  if (!exportState.download.includes("video-caption-ai-settings") || !exportState.download.endsWith(".json")) {
+    throw new Error(`Settings export should create a JSON download: ${JSON.stringify(exportState)}`);
+  }
+  }
+
   await capture(optionsPage, join(outputDir, "options-page.png"));
+  const resetState = await assertResetRequiresSave(optionsPage, `${baseUrl}/mock-chat`);
+  const promptRequestState = await assertPromptTemplateReachesModel({
+    optionsPage,
+    videoPage,
+    modelRequests,
+    mockEndpoint: `${baseUrl}/mock-chat`,
+    waitTimeout
+  });
 
   const popupTarget = await createTarget(`chrome-extension://${extensionId}/popup/popup.html`);
   const popupPage = await Cdp.connect(popupTarget.webSocketDebuggerUrl);
@@ -255,9 +434,12 @@ try {
     skipCopyCheck,
     refreshAnimated,
     nonVideoState,
+    resetState,
+    promptRequestState,
     screenshots: [
       "output/playwright/video-panel-collapsed.png",
       "output/playwright/video-panel.png",
+      "output/playwright/video-panel-summary.png",
       "output/playwright/options-page.png",
       "output/playwright/popup.png"
     ]
@@ -321,6 +503,237 @@ async function evaluate(cdp, expression, options = {}) {
   return result.result.value;
 }
 
+async function assertResetRequiresSave(optionsPage, mockEndpoint) {
+  await setExtensionSettings(optionsPage, mockSettings({
+    endpoint: mockEndpoint,
+    promptTemplate: "RESET_GUARD_PROMPT {{transcript}}\n{{outputTemplate}}",
+    outputTemplate: "RESET_GUARD_OUTPUT"
+  }));
+  await optionsPage.send("Page.reload", { ignoreCache: true });
+  await waitForPageReady(optionsPage);
+  await waitForExpression(optionsPage, `
+    document.querySelector("#promptTemplate")?.value.includes("RESET_GUARD_PROMPT")
+  `, 5000);
+  await delay(300);
+
+  await evaluate(optionsPage, `
+    document.querySelector("#resetSettings").click();
+    return true;
+  `);
+  await waitForExpression(optionsPage, `
+    document.querySelector("#promptTemplate")?.value.includes("你是一个擅长处理视频字幕")
+  `, 5000);
+
+  const state = await evaluate(optionsPage, `
+    return new Promise((resolve) => {
+      chrome.storage.local.get("vcsSettings", (result) => {
+        resolve({
+          persistedPrompt: result.vcsSettings?.promptTemplate || "",
+          formPrompt: document.querySelector("#promptTemplate")?.value || "",
+          status: document.querySelector("#saveStatus")?.textContent || ""
+        });
+      });
+    });
+  `);
+
+  if (!state.persistedPrompt.includes("RESET_GUARD_PROMPT")) {
+    throw new Error("Reset should not persist defaults until Save Settings is clicked.");
+  }
+  if (state.formPrompt.includes("RESET_GUARD_PROMPT")) {
+    throw new Error("Reset should update the form to the default prompt.");
+  }
+  if (!state.status.includes("保存设置")) {
+    throw new Error(`Reset status should explain that saving is required, got: ${state.status}`);
+  }
+
+  return {
+    persistedPromptStillCustom: state.persistedPrompt.includes("RESET_GUARD_PROMPT"),
+    formResetToDefault: state.formPrompt.includes("你是一个擅长处理视频字幕")
+  };
+}
+
+async function assertPromptTemplateReachesModel({
+  optionsPage,
+  videoPage,
+  modelRequests,
+  mockEndpoint,
+  waitTimeout
+}) {
+  modelRequests.length = 0;
+  const promptTemplate = [
+    "PROMPT_EFFECT_MARKER",
+    "标题={{title}}",
+    "平台={{platform}}",
+    "链接={{url}}",
+    "语言={{language}}",
+    "字幕={{transcript}}",
+    "模板={{outputTemplate}}"
+  ].join("\n");
+  const outputTemplate = "OUTPUT_EFFECT_MARKER";
+
+  await setExtensionSettings(optionsPage, mockSettings({
+    endpoint: mockEndpoint,
+    promptTemplate: "PROMPT_SEED {{transcript}}\n{{outputTemplate}}",
+    outputTemplate: "OUTPUT_SEED"
+  }));
+  await optionsPage.send("Page.reload", { ignoreCache: true });
+  await waitForPageReady(optionsPage);
+  await waitForExpression(optionsPage, `
+    document.querySelector("#endpoint")?.value === ${JSON.stringify(mockEndpoint)}
+  `, 5000);
+  await delay(300);
+  await evaluate(optionsPage, `
+    document.querySelector("#promptTemplate").value = ${JSON.stringify(promptTemplate)};
+    document.querySelector("#outputTemplate").value = ${JSON.stringify(outputTemplate)};
+    document.querySelector("#saveAll").click();
+    return true;
+  `);
+  await waitForExpression(optionsPage, `
+    document.querySelector("#saveStatus")?.textContent.includes("设置已保存")
+  `, 5000);
+
+  const savedPromptState = await evaluate(optionsPage, `
+    return new Promise((resolve) => {
+      chrome.storage.local.get("vcsSettings", (result) => {
+        resolve({
+          promptTemplate: result.vcsSettings?.promptTemplate || "",
+          outputTemplate: result.vcsSettings?.outputTemplate || ""
+        });
+      });
+    });
+  `);
+  if (!savedPromptState.promptTemplate.includes("PROMPT_EFFECT_MARKER")) {
+    throw new Error("Prompt edited through the options page was not saved.");
+  }
+  if (!savedPromptState.outputTemplate.includes("OUTPUT_EFFECT_MARKER")) {
+    throw new Error("Output template edited through the options page was not saved.");
+  }
+
+  await waitForExpression(videoPage, `
+    !document.querySelector("#vcs-root")?.shadowRoot?.querySelector("#vcs-refresh")?.classList.contains("is-spinning")
+  `, waitTimeout);
+  await evaluate(videoPage, `
+    document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-summarize").click();
+    return true;
+  `, { userGesture: true });
+  await waitForExpression(videoPage, `
+    (() => {
+      const shadow = document.querySelector("#vcs-root")?.shadowRoot;
+      const status = shadow?.querySelector("#vcs-status")?.textContent || "";
+      const summary = shadow?.querySelector("#vcs-summary")?.textContent || "";
+      return status.includes("完成：") && summary.includes("MOCK SUMMARY CUSTOM PROMPT OK");
+    })()
+  `, waitTimeout);
+
+  if (modelRequests.length !== 1) {
+    throw new Error(`Expected exactly one model request, got ${modelRequests.length}.`);
+  }
+
+  const request = modelRequests[0];
+  const messages = Array.isArray(request.body?.messages) ? request.body.messages : [];
+  const requestText = JSON.stringify(request.body);
+  const requiredMarkers = [
+    "PROMPT_EFFECT_MARKER",
+    "OUTPUT_EFFECT_MARKER",
+    "Modern AI Video Demo",
+    "Generic Video"
+  ];
+
+  for (const marker of requiredMarkers) {
+    if (!requestText.includes(marker)) {
+      throw new Error(`Model request did not include expected prompt marker: ${marker}`);
+    }
+  }
+
+  const userMessage = messages.find((message) => message.role === "user")?.content || "";
+  if (!userMessage.includes("PROMPT_EFFECT_MARKER") || !userMessage.includes("OUTPUT_EFFECT_MARKER")) {
+    throw new Error("Custom prompt and output template should both be rendered into the user message.");
+  }
+
+  const summaryLayoutState = await evaluate(videoPage, `
+    const shadow = document.querySelector("#vcs-root")?.shadowRoot;
+    const summarizeButton = shadow?.querySelector("#vcs-summarize");
+    const result = shadow?.querySelector(".vcs-result");
+    const trackRow = shadow?.querySelector(".vcs-track-row");
+    const shell = shadow?.querySelector(".vcs-summary-shell");
+    const shellStyle = shell ? getComputedStyle(shell) : null;
+    return {
+      resultAfterButton: summarizeButton?.nextElementSibling === result,
+      resultBeforeTrack: result?.nextElementSibling === trackRow,
+      strongText: shadow?.querySelector("#vcs-summary strong")?.textContent || "",
+      listItems: shadow?.querySelectorAll("#vcs-summary li").length || 0,
+      hasSeparator: Boolean(shadow?.querySelector("#vcs-summary hr")),
+      overflowY: shellStyle?.overflowY || "",
+      maxHeight: shellStyle?.maxHeight || ""
+    };
+  `);
+  if (
+    !summaryLayoutState.resultAfterButton ||
+    !summaryLayoutState.resultBeforeTrack ||
+    !summaryLayoutState.strongText.includes("MOCK SUMMARY CUSTOM PROMPT OK") ||
+    summaryLayoutState.listItems < 3 ||
+    !summaryLayoutState.hasSeparator ||
+    summaryLayoutState.overflowY !== "auto" ||
+    summaryLayoutState.maxHeight === "none"
+  ) {
+    throw new Error(`Summary Markdown block should render below the parse button in a scrollable area: ${JSON.stringify(summaryLayoutState)}`);
+  }
+
+  await capture(videoPage, join(outputDir, "video-panel-summary.png"));
+
+  return {
+    requestCount: modelRequests.length,
+    customPromptInUserMessage: userMessage.includes("PROMPT_EFFECT_MARKER"),
+    outputTemplateInUserMessage: userMessage.includes("OUTPUT_EFFECT_MARKER"),
+    markdownSummaryRendered: summaryLayoutState.strongText.includes("MOCK SUMMARY CUSTOM PROMPT OK")
+  };
+}
+
+async function setExtensionSettings(cdp, settings) {
+  const serialized = JSON.stringify(settings);
+  return evaluate(cdp, `
+    return new Promise((resolve, reject) => {
+      chrome.storage.local.set({ vcsSettings: ${serialized} }, () => {
+        const error = chrome.runtime.lastError;
+        if (error) {
+          reject(new Error(error.message));
+          return;
+        }
+        resolve(true);
+      });
+    });
+  `);
+}
+
+function mockSettings({ endpoint, promptTemplate, outputTemplate }) {
+  return {
+    theme: "auto",
+    language: "中文（简体）",
+    panelEnabled: true,
+    activeProfileId: "deepseek",
+    profiles: [
+      {
+        id: "deepseek",
+        name: "Mock API",
+        provider: "openai-compatible",
+        endpoint,
+        apiKey: "test-key",
+        model: "mock-model",
+        temperature: 1,
+        maxTokens: 1024
+      }
+    ],
+    promptTemplate,
+    outputTemplate,
+    chunkSize: 12000,
+    chunkOverlap: 600,
+    includeTimestamps: true,
+    includeTitleAndUrl: true,
+    redactTerms: "",
+    saveHistory: false
+  };
+}
+
 async function capture(cdp, path) {
   const screenshot = await cdp.send("Page.captureScreenshot", {
     format: "png",
@@ -353,6 +766,14 @@ function contentType(filePath) {
     ".js": "text/javascript; charset=utf-8"
   };
   return types[extname(filePath)] || "application/octet-stream";
+}
+
+async function readRequestBody(request) {
+  const chunks = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function delay(ms) {

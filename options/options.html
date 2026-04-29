@@ -10,9 +10,12 @@
   <body>
     <header class="topbar">
       <div class="topbar__inner">
-        <div>
-          <h1>Video Caption AI</h1>
-          <p>为 YouTube、Bilibili 和其他视频网站总结字幕内容。</p>
+        <div class="topbar__brand">
+          <span class="brand-mark" aria-hidden="true"><img src="../icons/ai-mark.png" alt=""></span>
+          <div>
+            <h1>Video Caption AI</h1>
+            <p>为 YouTube、Bilibili 和其他视频网站总结字幕内容。</p>
+          </div>
         </div>
         <div class="topbar__actions">
           <button id="exportSettings" class="button button--ghost" type="button">导出配置</button>
@@ -27,6 +30,7 @@
         <a href="#api">API 模型</a>
         <a href="#prompt">提示词</a>
         <a href="#platforms">平台与隐私</a>
+        <a href="#history">历史</a>
         <a href="#advanced">高级</a>
       </nav>
 
@@ -78,15 +82,10 @@
             </div>
           </div>
 
-          <div class="field">
-            <label for="activeProfile">当前使用的配置</label>
-            <select id="activeProfile"></select>
-          </div>
-
           <div class="grid two">
             <label class="field">
               <span>配置名称</span>
-              <input id="profileName" type="text" placeholder="DeepSeek">
+              <input id="profileName" type="text" placeholder="例如：我的 Kimi 配置">
             </label>
             <label class="field">
               <span>服务商类型</span>
@@ -111,7 +110,7 @@
             </label>
             <label class="field">
               <span>模型名称</span>
-              <input id="model" type="text" placeholder="deepseek-chat">
+              <input id="model" type="text" placeholder="手动输入模型名称">
             </label>
           </div>
 
@@ -180,7 +179,7 @@
         <section id="platforms" class="section">
           <div class="section__head">
             <h2>平台与隐私</h2>
-            <p>不同视频网站的字幕接口差异很大，插件会优先读官方字幕轨道，失败时允许手动粘贴。</p>
+            <p>不同视频网站的字幕接口差异很大，插件会优先读官方字幕轨道，并自动整合页面可见的转写文稿。</p>
           </div>
 
           <div class="support-list">
@@ -197,26 +196,43 @@
               <span>读取 video track、VTT/SRT 字幕和页面可见 transcript。</span>
             </div>
             <div>
-              <strong>兜底模式</strong>
-              <span>无法自动读取时，在浮动面板粘贴字幕再总结。</span>
+              <strong>转写文稿</strong>
+              <span>无法直接读取字幕轨道时，优先读取页面里已经展开的转写内容。</span>
             </div>
           </div>
 
-          <div class="grid two">
-            <label class="field field--switch">
-              <span>发送字幕中的时间戳</span>
-              <input id="includeTimestamps" type="checkbox">
-            </label>
-            <label class="field field--switch">
-              <span>保存最近 30 条总结历史</span>
-              <input id="saveHistory" type="checkbox">
-            </label>
-          </div>
+          <label class="field field--switch">
+            <span>发送字幕中的时间戳</span>
+            <input id="includeTimestamps" type="checkbox">
+          </label>
 
           <label class="field">
             <span>发送前自动隐藏的敏感词</span>
             <textarea id="redactTerms" rows="4" placeholder="每行一个词，或用英文逗号分隔"></textarea>
           </label>
+        </section>
+
+        <section id="history" class="section">
+          <div class="section__head section__head--row">
+            <div>
+              <h2>历史</h2>
+              <p>最近 30 条总结会保存在本机浏览器存储中。</p>
+            </div>
+            <div class="button-row">
+              <button id="exportHistory" class="button button--ghost" type="button">导出历史</button>
+              <button id="clearHistory" class="button button--danger" type="button">清空历史</button>
+            </div>
+          </div>
+
+          <label class="field field--switch">
+            <span>保存最近 30 条总结历史</span>
+            <input id="saveHistory" type="checkbox">
+          </label>
+
+          <div class="history-head">
+            <span id="historyCount">0 / 30</span>
+          </div>
+          <div id="historyList" class="history-list" aria-live="polite"></div>
         </section>
 
         <section id="advanced" class="section">
@@ -239,6 +255,10 @@
           <label class="field">
             <span>导入配置 JSON</span>
             <textarea id="importText" rows="5" placeholder="把导出的配置 JSON 粘贴到这里"></textarea>
+          </label>
+          <label class="field">
+            <span>从文件导入</span>
+            <input id="importFile" type="file" accept="application/json,.json">
           </label>
           <div class="button-row">
             <button id="importSettings" class="button button--ghost" type="button">导入配置</button>
