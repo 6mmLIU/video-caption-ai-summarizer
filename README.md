@@ -1,30 +1,74 @@
-# Video Caption AI Summarizer
+<p align="center">
+  <img src="icons/ai-mark.png" alt="Video Caption AI Summarizer" width="128">
+</p>
 
-Video Caption AI Summarizer is a Chromium extension for turning video captions and transcripts into structured AI summaries. It is designed for people who frequently watch long videos, courses, interviews, product demos, or research talks and want a cleaner way to capture the essential points.
+<h1 align="center">Video Caption AI Summarizer</h1>
 
-Video Caption AI Summarizer 是一款 Chromium 浏览器扩展，用于读取视频字幕、页面转写文本或手动粘贴的字幕内容，并通过用户自选的 AI API 生成结构化摘要。它适合学习复盘、资料整理、会议/访谈回顾，以及需要从长视频中快速提取要点的使用场景。
+<p align="center">
+  Turn video captions into structured AI summaries with your own API.<br>
+  用你自己的 AI API，把长视频字幕整理成清晰、可复用的结构化摘要。
+</p>
+
+<p align="center">
+  <a href="#简体中文">🇨🇳 简体中文</a>
+  ·
+  <a href="#english">🇺🇸 English</a>
+</p>
+
+<p align="center">
+  <img alt="Chromium Extension" src="https://img.shields.io/badge/Chromium-Extension-4285F4?style=flat-square">
+  <img alt="Manifest V3" src="https://img.shields.io/badge/Manifest-V3-34A853?style=flat-square">
+  <img alt="Bring Your Own API" src="https://img.shields.io/badge/API-Bring%20Your%20Own-111827?style=flat-square">
+  <img alt="Local First Settings" src="https://img.shields.io/badge/Settings-Local%20First-7C3AED?style=flat-square">
+</p>
+
+<p align="center">
+  <strong>🎬 Watch less mechanically. Understand more deliberately.</strong><br>
+  <strong>🧠 少一点重复观看，多一点高质量理解。</strong>
+</p>
 
 ---
 
-## 中文说明
+<p align="center"><sub>点击语言标题展开对应版本 / Click a language panel to expand it.</sub></p>
 
-### 核心能力
+<a id="简体中文"></a>
+<details open>
+<summary><strong>🇨🇳 简体中文</strong></summary>
 
-- **YouTube 字幕读取**：读取播放器页面中的 `captionTracks`，并抓取可用字幕内容。
-- **Bilibili 字幕读取**：识别页面中的 `bvid` / `cid`，请求 B 站可用字幕接口。
-- **通用视频页面支持**：读取标准 HTML5 `<video><track>` 字幕、VTT/SRT 字幕，以及页面可见的 transcript / caption 文本。
-- **手动粘贴兜底**：当平台没有暴露可读取字幕时，可以把字幕或转写文本粘贴到浮动面板中再总结。
-- **视频页浮动面板**：在视频页面上直接选择字幕轨、预览字幕、复制字幕、发起摘要，并查看模型返回结果。
-- **工具栏弹窗**：可从浏览器工具栏查看当前页面状态、切换面板，或直接触发当前视频解析。
-- **多 API 配置**：支持保存多个 API 配置，并在不同服务和模型之间切换。
-- **服务预设**：内置 DeepSeek、OpenAI / ChatGPT、Claude、Gemini、Kimi、通义千问、智谱 GLM、小米 MiMo、Ollama 等常用配置模板。
-- **开放模型名称**：模型名称由用户手动填写，不锁定在固定列表中，便于使用新模型或私有部署模型。
-- **长字幕分段处理**：长视频会先按设定字符数分段提炼，再合并为最终摘要，降低超长文本请求失败的概率。
-- **自定义 Prompt**：支持自定义总结 Prompt 与输出模板，可使用 `{{title}}`、`{{platform}}`、`{{url}}`、`{{language}}`、`{{transcript}}`、`{{outputTemplate}}` 等变量。
-- **隐私控制**：可关闭时间戳发送、设置敏感词替换，并选择是否在本机保存最近 30 条摘要历史。
-- **外观设置**：支持自动、浅色、深色主题，并可控制是否在视频页自动显示浮动面板。
+## 产品定位
 
-### 安装方式
+**Video Caption AI Summarizer** 是一款面向高频视频学习者和内容研究者的 Chromium 浏览器扩展。它可以读取视频页面中已经暴露给浏览器的字幕、转写文本，或者用户手动粘贴的字幕内容，并调用你配置的 AI API 生成结构化摘要。
+
+它的目标不是简单“复述字幕”，而是帮助你把长视频变成更容易复盘、检索和二次使用的知识材料：
+
+- 🎯 快速判断视频是否值得完整观看
+- 🧩 从课程、访谈、发布会和讲座中提取核心信息
+- 📝 将字幕整理为 Markdown 摘要、学习笔记或研究卡片
+- 🔁 对超长视频进行分段提炼，再合并为完整结论
+- 🔐 使用自己的 API Key 和模型配置，避免被单一服务绑定
+
+## 亮点能力
+
+| 能力 | 说明 |
+| --- | --- |
+| 🎞️ 多平台字幕读取 | 支持 YouTube、Bilibili、通用 HTML5 视频字幕轨道、VTT/SRT 字幕，以及页面可见 transcript / caption 文本。 |
+| 🧷 手动粘贴兜底 | 平台不开放字幕接口时，可以直接把字幕或转写文本粘贴到浮动面板中总结。 |
+| 🧠 自选 AI 服务 | 支持 OpenAI 兼容接口、Claude、Gemini、Ollama、本地模型和代理服务。 |
+| 🧰 多 API 配置 | 可以保存多个 API 配置，在不同服务、模型和端点之间切换。 |
+| 📌 服务预设 | 内置 DeepSeek、OpenAI / ChatGPT、Claude、Gemini、Kimi、通义千问、智谱 GLM、小米 MiMo、Ollama 等常用模板。 |
+| ✍️ 自定义 Prompt | 支持自定义总结 Prompt 和输出模板，可控制摘要结构、语气、语言和细节密度。 |
+| 📚 长字幕分段 | 长视频会先按设定字符数分段提炼，再合并成最终摘要。 |
+| 🛡️ 隐私控制 | 可关闭时间戳发送、配置敏感词替换，并选择是否保存最近 30 条本地摘要历史。 |
+| 🌓 视觉设置 | 支持自动、浅色、深色主题，并可控制视频页是否自动显示浮动面板。 |
+
+## 适合谁使用
+
+- 经常观看 YouTube、Bilibili、课程平台、访谈和技术分享的学习者
+- 需要快速整理视频素材的内容创作者、研究人员和产品经理
+- 想用自己的模型服务总结字幕的开发者和 AI 工具用户
+- 需要把长视频转成结构化笔记、会议纪要或知识库素材的团队成员
+
+## 安装方式
 
 1. 下载或克隆本仓库到本地。
 2. 打开 Chrome、Edge 或其他 Chromium 浏览器。
@@ -33,20 +77,22 @@ Video Caption AI Summarizer 是一款 Chromium 浏览器扩展，用于读取视
 5. 点击“加载已解压的扩展程序”。
 6. 选择本项目目录。
 
-安装完成后，建议先打开扩展设置页，配置 API 服务、模型名称和输出语言，再进入视频页面使用。
+安装完成后，建议先打开扩展设置页，配置 API 服务、模型名称和摘要输出语言，再进入视频页面使用。
 
-### API 配置
+## API 配置
 
 在设置页的“API 模型”区域，可以新增、删除和切换配置。
 
-- **OpenAI 兼容接口**：适用于 DeepSeek、OpenAI / ChatGPT、Kimi、通义千问、智谱 GLM、小米 MiMo，以及其他兼容 `/v1/chat/completions` 的服务。
-- **Anthropic Claude**：适用于 Claude Messages API。
-- **Google Gemini**：可使用 Gemini API；如果没有填写接口地址，扩展会根据模型名称生成 Gemini 请求地址。
-- **Ollama / 本地 OpenAI 兼容服务**：默认使用 `http://localhost:11434/v1/chat/completions`，适合本地模型或局域网内的兼容服务。
+| 类型 | 适用场景 |
+| --- | --- |
+| OpenAI 兼容接口 | DeepSeek、OpenAI / ChatGPT、Kimi、通义千问、智谱 GLM、小米 MiMo，以及其他兼容 `/v1/chat/completions` 的服务。 |
+| Anthropic Claude | 使用 Claude Messages API 的场景。 |
+| Google Gemini | 使用 Gemini API；未填写接口地址时，扩展会根据模型名称生成 Gemini 请求地址。 |
+| Ollama / 本地 OpenAI 兼容服务 | 默认使用 `http://localhost:11434/v1/chat/completions`，适合本地模型或局域网内兼容服务。 |
 
-需要填写的关键参数包括接口地址、API Key、模型名称、Temperature 和最大输出 Token。不同服务商对模型名称、额度、上下文长度和安全策略的要求不同，请以对应服务商控制台为准。
+通常需要填写接口地址、API Key、模型名称、Temperature 和最大输出 Token。不同服务商对模型名称、额度、上下文长度和安全策略的要求不同，请以对应服务商控制台为准。
 
-### 使用流程
+## 使用流程
 
 1. 打开一个包含视频、字幕或转写内容的页面。
 2. 如果页面符合自动识别条件，扩展会显示 `Video Caption AI` 浮动面板。
@@ -58,20 +104,33 @@ Video Caption AI Summarizer 是一款 Chromium 浏览器扩展，用于读取视
 
 如果平台自带 transcript / 转写文稿入口，建议先在网页中展开该内容，再刷新页面或重新检测字幕。
 
-### 隐私与数据说明
+## Prompt 变量
+
+自定义 Prompt 与输出模板支持以下变量：
+
+| 变量 | 含义 |
+| --- | --- |
+| `{{title}}` | 视频标题 |
+| `{{platform}}` | 视频平台 |
+| `{{url}}` | 当前页面链接 |
+| `{{language}}` | 期望输出语言 |
+| `{{transcript}}` | 字幕正文 |
+| `{{outputTemplate}}` | 输出结构模板 |
+
+## 隐私与数据说明
 
 本扩展会把用户选择的字幕文本发送到已配置的 AI 服务，以便生成摘要。使用前请确认你信任对应的 API 服务商或自建服务。
 
 - API Key 保存在当前浏览器的扩展本地存储中。
 - 摘要请求会包含字幕文本，以及标题、平台、链接等用于生成摘要的上下文信息。
 - 可以关闭时间戳发送，也可以配置敏感词，在发送前自动替换。
-- 摘要历史默认取决于设置项；启用后会保存在本机浏览器存储中，最多保留最近 30 条。
+- 摘要历史启用后会保存在本机浏览器存储中，最多保留最近 30 条。
 - 当前配置导出会复制完整配置 JSON，可能包含 API Key。请只在可信环境中导出，并在分享前手动移除密钥。
 - 为了兼容不同视频网站的字幕读取方式，当前扩展声明了较宽的站点访问权限。请仅从可信来源安装和使用本扩展。
 
 如果视频内容涉及隐私、商业机密、受版权保护材料或合规要求，请在发送给第三方 AI 服务前谨慎评估。
 
-### 支持边界
+## 支持边界
 
 扩展只能读取浏览器能够访问到的字幕或文本。以下情况可能无法稳定自动处理：
 
@@ -83,7 +142,7 @@ Video Caption AI Summarizer 是一款 Chromium 浏览器扩展，用于读取视
 
 遇到读取失败时，可以尝试切换字幕轨、展开平台自带转写文稿、刷新页面，或使用手动粘贴模式。
 
-### 项目结构
+## 项目结构
 
 ```text
 manifest.json          # Chromium Manifest V3 配置
@@ -100,35 +159,50 @@ tests/fixtures/        # 本地测试页面和字幕文件
 tests/smoke-extension.mjs
 ```
 
-### 开发说明
+## 开发说明
 
 本项目不需要构建步骤，可以直接作为“已解压的扩展程序”加载。修改源码后，在浏览器扩展管理页点击重新加载，再刷新目标视频页面即可验证。
 
----
+</details>
 
-## English
+<a id="english"></a>
+<details>
+<summary><strong>🇺🇸 English</strong></summary>
 
-### Overview
+## Positioning
 
-Video Caption AI Summarizer helps you summarize video captions with your own AI API. It works with platform caption data, standard HTML5 caption tracks, visible transcript text, and manually pasted transcripts when automatic extraction is not available.
+**Video Caption AI Summarizer** is a Chromium extension for people who learn, research, and work from long-form video. It reads captions, visible transcripts, or manually pasted transcript text, then sends that content to your configured AI API to produce a structured summary.
 
-### Key Features
+The goal is not to repeat captions line by line. It helps convert long videos into reusable knowledge:
 
-- **YouTube support**: Reads available `captionTracks` from the player page.
-- **Bilibili support**: Detects `bvid` / `cid` and requests available Bilibili subtitles.
-- **Generic video support**: Reads standard HTML5 `<video><track>` captions, VTT/SRT files, and visible transcript / caption text on the page.
-- **Manual transcript fallback**: Paste captions or transcripts into the floating panel when a site does not expose readable captions.
-- **Floating page panel**: Select caption tracks, preview transcript text, copy captions, request summaries, and view AI output directly on the video page.
-- **Toolbar popup**: Check page status, toggle the panel, or trigger summarization from the browser toolbar.
-- **Multiple API profiles**: Save and switch between different providers, endpoints, API keys, and model names.
-- **Provider presets**: Includes templates for DeepSeek, OpenAI / ChatGPT, Claude, Gemini, Kimi, Qwen, Zhipu GLM, Xiaomi MiMo, and Ollama.
-- **Flexible model names**: Enter any model name supported by your provider instead of choosing from a fixed list.
-- **Long transcript handling**: Splits long transcripts into chunks, summarizes each chunk, and merges the result into a final summary.
-- **Custom prompts**: Customize the prompt and output template with `{{title}}`, `{{platform}}`, `{{url}}`, `{{language}}`, `{{transcript}}`, and `{{outputTemplate}}`.
-- **Privacy controls**: Toggle timestamp sharing, redact sensitive terms, and choose whether to keep the latest 30 summaries locally.
-- **Appearance settings**: Supports auto, light, and dark themes, plus a setting for automatic panel display.
+- 🎯 Decide quickly whether a video deserves full attention
+- 🧩 Extract core ideas from courses, interviews, product demos, and talks
+- 📝 Turn captions into Markdown summaries, study notes, or research cards
+- 🔁 Summarize long transcripts in chunks before merging the final result
+- 🔐 Use your own API key and model configuration instead of being locked to one provider
 
-### Installation
+## Highlights
+
+| Feature | Description |
+| --- | --- |
+| 🎞️ Multi-source caption reading | Supports YouTube, Bilibili, generic HTML5 caption tracks, VTT/SRT files, and visible transcript / caption text. |
+| 🧷 Manual paste fallback | Paste captions or transcript text into the floating panel when a site does not expose readable captions. |
+| 🧠 Bring your own AI service | Supports OpenAI-compatible APIs, Claude, Gemini, Ollama, local models, and proxy services. |
+| 🧰 Multiple API profiles | Save and switch between different providers, endpoints, API keys, and model names. |
+| 📌 Provider presets | Includes templates for DeepSeek, OpenAI / ChatGPT, Claude, Gemini, Kimi, Qwen, Zhipu GLM, Xiaomi MiMo, and Ollama. |
+| ✍️ Custom prompts | Customize the prompt and output template to control structure, tone, language, and detail level. |
+| 📚 Long transcript chunking | Long videos are summarized in chunks, then merged into a final result. |
+| 🛡️ Privacy controls | Toggle timestamp sharing, redact sensitive terms, and choose whether to keep the latest 30 summaries locally. |
+| 🌓 Appearance settings | Supports auto, light, and dark themes, plus automatic panel display settings. |
+
+## Who It Is For
+
+- Learners who watch YouTube, Bilibili, course platforms, interviews, and technical talks
+- Creators, researchers, and product managers who need to review video material quickly
+- Developers and AI tool users who prefer summarizing with their own model service
+- Teams that convert long videos into structured notes, meeting records, or knowledge-base material
+
+## Installation
 
 1. Download or clone this repository.
 2. Open Chrome, Edge, or another Chromium-based browser.
@@ -139,18 +213,20 @@ Video Caption AI Summarizer helps you summarize video captions with your own AI 
 
 After installation, open the extension options page and configure your API service, model name, and preferred summary language before using it on video pages.
 
-### API Setup
+## API Setup
 
 The options page lets you create, delete, and switch between API profiles.
 
-- **OpenAI-compatible APIs**: For DeepSeek, OpenAI / ChatGPT, Kimi, Qwen, Zhipu GLM, Xiaomi MiMo, and other services compatible with `/v1/chat/completions`.
-- **Anthropic Claude**: For Claude Messages API.
-- **Google Gemini**: For Gemini API. If no endpoint is entered, the extension generates the Gemini request URL from the model name.
-- **Ollama / local OpenAI-compatible services**: Defaults to `http://localhost:11434/v1/chat/completions`, suitable for local models or LAN-hosted compatible APIs.
+| Type | Use Case |
+| --- | --- |
+| OpenAI-compatible APIs | DeepSeek, OpenAI / ChatGPT, Kimi, Qwen, Zhipu GLM, Xiaomi MiMo, and other services compatible with `/v1/chat/completions`. |
+| Anthropic Claude | Claude Messages API. |
+| Google Gemini | Gemini API. If no endpoint is entered, the extension generates the Gemini request URL from the model name. |
+| Ollama / local OpenAI-compatible services | Defaults to `http://localhost:11434/v1/chat/completions`, suitable for local models or LAN-hosted compatible APIs. |
 
 Required values typically include endpoint, API key, model name, temperature, and maximum output tokens. Provider behavior varies, so confirm model names, quota limits, context windows, and safety policies in the provider console.
 
-### How to Use
+## How to Use
 
 1. Open a page with a video, captions, or transcript text.
 2. If the page matches the extension's detection logic, the `Video Caption AI` floating panel appears automatically.
@@ -162,7 +238,20 @@ Required values typically include endpoint, API key, model name, temperature, an
 
 When a platform provides a built-in transcript panel, open it first, then refresh the page or re-detect captions.
 
-### Privacy and Data Handling
+## Prompt Variables
+
+Custom prompts and output templates support these variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `{{title}}` | Video title |
+| `{{platform}}` | Video platform |
+| `{{url}}` | Current page URL |
+| `{{language}}` | Preferred output language |
+| `{{transcript}}` | Transcript body |
+| `{{outputTemplate}}` | Output structure template |
+
+## Privacy and Data Handling
 
 The extension sends the selected transcript to your configured AI service to generate a summary. Use a provider or self-hosted service you trust.
 
@@ -175,7 +264,7 @@ The extension sends the selected transcript to your configured AI service to gen
 
 For private, confidential, copyrighted, or regulated content, review your own requirements before sending transcripts to any third-party AI service.
 
-### Support Boundaries
+## Support Boundaries
 
 The extension can only read captions or text that the browser can access. Automatic extraction may fail when:
 
@@ -187,7 +276,7 @@ The extension can only read captions or text that the browser can access. Automa
 
 When caption loading fails, try another caption track, open the platform transcript panel, refresh the page, or use manual paste mode.
 
-### Repository Layout
+## Repository Layout
 
 ```text
 manifest.json          # Chromium Manifest V3 configuration
@@ -204,6 +293,8 @@ tests/fixtures/        # Local test page and caption fixtures
 tests/smoke-extension.mjs
 ```
 
-### Development Notes
+## Development Notes
 
 No build step is required. Load the repository directly as an unpacked extension. After editing source files, reload the extension from the browser extension management page and refresh the target video page to verify behavior.
+
+</details>
