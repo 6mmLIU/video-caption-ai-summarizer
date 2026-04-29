@@ -6,6 +6,7 @@
 
   const PANEL_ID = "vcs-root";
   const PAGE_STYLE_ID = "vcs-page-polish";
+  const SHORTS_EMBED_TARGET_ID = "vcs-shorts-embed-target";
   const AI_MARK_URL = chrome.runtime.getURL("icons/ai-mark.png");
   const DEFAULT_SETTINGS = {
     settingsVersion: 4,
@@ -176,6 +177,8 @@
     setInterval(() => {
       if (hasPageContextChanged()) {
         scheduleRefresh();
+      } else if (state.mounted && isYouTubeShortsPage() && shouldShowPanel()) {
+        placeRoot();
       }
     }, 1000);
   }
@@ -293,6 +296,9 @@
   function findEmbedTarget() {
     const host = location.hostname.replace(/^www\./, "");
     if (host.includes("youtube.com")) {
+      if (isYouTubeShortsPage()) {
+        return findYouTubeShortsEmbedTarget();
+      }
       return document.querySelector("#secondary-inner")
         || document.querySelector("#secondary")
         || document.documentElement;
@@ -304,6 +310,123 @@
         || document.documentElement;
     }
     return document.documentElement;
+  }
+
+  function findYouTubeShortsEmbedTarget() {
+    const commentsPanel = document.querySelector("ytd-shorts #anchored-panel");
+    if (isUsableShortsTarget(commentsPanel) && isElementInViewport(commentsPanel)) {
+      return commentsPanel;
+    }
+    return ensureYouTubeShortsSideTarget()
+      || commentsPanel
+      || document.querySelector("ytd-shorts")
+      || document.documentElement;
+  }
+
+  function ensureYouTubeShortsSideTarget() {
+    const shorts = document.querySelector("ytd-shorts");
+    const reel = getActiveYouTubeShortsReel();
+    if (!shorts || !reel) {
+      return null;
+    }
+
+    let target = document.getElementById(SHORTS_EMBED_TARGET_ID);
+    if (!target) {
+      target = document.createElement("div");
+      target.id = SHORTS_EMBED_TARGET_ID;
+      target.setAttribute("aria-label", "Video Caption AI Shorts panel");
+      shorts.appendChild(target);
+    }
+
+    positionYouTubeShortsSideTarget(target, shorts, reel);
+    return target;
+  }
+
+  function getActiveYouTubeShortsReel() {
+    return [...document.querySelectorAll("ytd-reel-video-renderer")]
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const visibleWidth = Math.max(0, Math.min(rect.right, innerWidth) - Math.max(rect.left, 0));
+        const visibleHeight = Math.max(0, Math.min(rect.bottom, innerHeight) - Math.max(rect.top, 0));
+        return { element, rect, area: visibleWidth * visibleHeight };
+      })
+      .filter((item) => item.area > 0 && item.rect.width >= 240 && item.rect.height >= 240)
+      .sort((a, b) => b.area - a.area)[0]?.element || null;
+  }
+
+  function positionYouTubeShortsSideTarget(target, shorts, reel) {
+    const shortsRect = shorts.getBoundingClientRect();
+    const reelRect = reel.getBoundingClientRect();
+    const actionsRect = getYouTubeShortsActionsRect(reel);
+    const navigationRect = document.querySelector("ytd-shorts .navigation-container")?.getBoundingClientRect();
+    const gap = 16;
+    const minWidth = 260;
+    const preferredWidth = 340;
+    const leftLimit = Math.max(shortsRect.left, 0) + gap;
+    const rightLimit = Math.min(navigationRect?.left || shortsRect.right, innerWidth) - gap;
+    const rightAnchor = Math.max(reelRect.right, actionsRect?.right || reelRect.right);
+    const rightSpace = rightLimit - rightAnchor - gap;
+    const leftSpace = reelRect.left - leftLimit - gap;
+    let width = Math.min(preferredWidth, Math.max(rightSpace, leftSpace));
+    let left = rightAnchor + gap;
+
+    if (rightSpace >= minWidth || rightSpace >= leftSpace) {
+      width = Math.max(180, Math.min(preferredWidth, rightSpace));
+      left = rightAnchor + gap;
+    } else {
+      width = Math.max(180, Math.min(preferredWidth, leftSpace));
+      left = reelRect.left - gap - width;
+    }
+
+    const top = Math.max(gap, reelRect.top - shortsRect.top);
+    const maxHeight = Math.max(220, Math.min(reelRect.height, innerHeight - top - gap));
+    target.style.cssText = [
+      "position: absolute",
+      `top: ${Math.round(top)}px`,
+      `left: ${Math.round(left - shortsRect.left)}px`,
+      `width: ${Math.round(width)}px`,
+      `max-height: ${Math.round(maxHeight)}px`,
+      "overflow: auto",
+      "z-index: 2",
+      "pointer-events: auto"
+    ].join("; ");
+  }
+
+  function getYouTubeShortsActionsRect(reel) {
+    return [
+      "#actions",
+      "#menu",
+      "ytd-reel-player-overlay-renderer #actions",
+      "ytd-reel-player-header-renderer"
+    ]
+      .map((selector) => reel.querySelector(selector)?.getBoundingClientRect())
+      .filter((rect) => rect && rect.width > 0 && rect.height > 0)
+      .sort((a, b) => b.right - a.right)[0] || null;
+  }
+
+  function isUsableShortsTarget(element) {
+    if (!element) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return rect.width >= 240
+      && rect.height >= 120
+      && style.display !== "none"
+      && style.visibility !== "hidden";
+  }
+
+  function isElementInViewport(element) {
+    if (!element) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.left < innerWidth && rect.right > 0 && rect.top < innerHeight && rect.bottom > 0;
+  }
+
+  function isYouTubeShortsPage() {
+    return location.hostname.replace(/^www\./, "").includes("youtube.com")
+      && location.pathname.startsWith("/shorts/");
   }
 
   function getRootInsertBefore(target) {
