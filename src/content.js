@@ -526,22 +526,305 @@
   }
 
   async function loadYouTubeTrackTranscript(track) {
+    const sourceUrls = uniqueValues([
+      ...getYouTubeRuntimeTimedTextUrls(track),
+      track.url
+    ]);
     const formats = ["json3", "srv3", "vtt", ""];
-    for (const format of formats) {
-      try {
-        const url = format ? addQueryParam(track.url, "fmt", format) : track.url;
-        const response = await extensionFetch(url);
-        const transcript = format === "vtt"
-          ? parseTextTrack(response.text)
-          : parseYouTubeTranscript(response.text) || parseTextTrack(response.text);
-        if (transcript.trim()) {
-          return transcript.trim();
+
+    for (const sourceUrl of sourceUrls) {
+      const candidateUrls = buildYouTubeTimedTextUrls(sourceUrl, formats);
+      for (const { url, format } of candidateUrls) {
+        try {
+          const response = await extensionFetch(url);
+          const transcript = format === "vtt"
+            ? parseTextTrack(response.text)
+            : parseYouTubeTranscript(response.text) || parseTextTrack(response.text);
+          if (transcript.trim()) {
+            return transcript.trim();
+          }
+        } catch (_error) {
+          // Try the next runtime URL, format, or fallback track.
         }
-      } catch (_error) {
-        // Try the next format or fallback track.
       }
     }
+
+    const transcriptPanelText = await loadYouTubeTranscriptPanelText();
+    if (transcriptPanelText) {
+      return transcriptPanelText;
+    }
+
     return "";
+  }
+
+  function getYouTubeRuntimeTimedTextUrls(track) {
+    const trackUrl = safeUrl(track?.url);
+    const wantedLanguage = trackUrl?.searchParams.get("lang") || track?.language || "";
+    const wantedName = trackUrl?.searchParams.get("name") || "";
+    const resources = performance.getEntriesByType("resource")
+      .filter((entry) => typeof entry.name === "string" && entry.name.includes("/api/timedtext"))
+      .map((entry, index) => ({
+        url: entry.name,
+        startTime: entry.startTime || index,
+        score: scoreYouTubeTimedTextUrl(entry.name, wantedLanguage, wantedName)
+      }))
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score || b.startTime - a.startTime);
+
+    return resources.map((entry) => entry.url);
+  }
+
+  function scoreYouTubeTimedTextUrl(url, wantedLanguage, wantedName) {
+    const parsed = safeUrl(url);
+    if (!parsed) {
+      return 0;
+    }
+
+    let score = 1;
+    const language = parsed.searchParams.get("lang") || "";
+    const name = parsed.searchParams.get("name") || "";
+    if (parsed.searchParams.has("pot")) {
+      score += 100;
+    }
+    if (parsed.searchParams.get("fmt") === "json3") {
+      score += 20;
+    }
+    if (wantedLanguage && language.toLowerCase() === wantedLanguage.toLowerCase()) {
+      score += 40;
+    }
+    if (wantedName && name === wantedName) {
+      score += 20;
+    }
+    return score;
+  }
+
+  function buildYouTubeTimedTextUrls(sourceUrl, formats) {
+    const urls = [];
+    const original = safeUrl(sourceUrl);
+    if (!original) {
+      return urls;
+    }
+
+    urls.push({
+      url: addYouTubeClientParams(original.toString()),
+      format: original.searchParams.get("fmt") || ""
+    });
+
+    for (const format of formats) {
+      const url = format ? addQueryParam(sourceUrl, "fmt", format) : sourceUrl;
+      urls.push({
+        url: addYouTubeClientParams(url),
+        format
+      });
+    }
+
+    const seen = new Set();
+    return urls.filter((item) => {
+      if (seen.has(item.url)) {
+        return false;
+      }
+      seen.add(item.url);
+      return true;
+    });
+  }
+
+  function addYouTubeClientParams(url) {
+    const parsed = safeUrl(url);
+    if (!parsed || !parsed.hostname.includes("youtube.com") || !parsed.pathname.includes("/api/timedtext")) {
+      return url;
+    }
+
+    const version = getYouTubeClientVersion();
+    const params = {
+      xorb: "2",
+      xobt: "3",
+      xovt: "3",
+      cbrand: "apple",
+      cbr: "Chrome",
+      c: "WEB",
+      cver: version,
+      cplayer: "UNIPLAYER",
+      cos: "Macintosh",
+      cosver: "10_15_7",
+      cplatform: "DESKTOP"
+    };
+
+    for (const [key, value] of Object.entries(params)) {
+      if (value && !parsed.searchParams.has(key)) {
+        parsed.searchParams.set(key, value);
+      }
+    }
+
+    return parsed.toString();
+  }
+
+  function getYouTubeClientVersion() {
+    try {
+      return window.ytcfg?.get?.("INNERTUBE_CLIENT_VERSION") || "2.20260428.00.00";
+    } catch (_error) {
+      return "2.20260428.00.00";
+    }
+  }
+
+  async function loadYouTubeTranscriptPanelText() {
+    const existing = getYouTubeTranscriptPanelText();
+    if (existing) {
+      return existing;
+    }
+
+    const opened = await openYouTubeTranscriptPanel();
+    if (!opened) {
+      return "";
+    }
+
+    await waitForCondition(() => Boolean(getYouTubeTranscriptPanelText()), 8000, 250);
+    return getYouTubeTranscriptPanelText();
+  }
+
+  async function openYouTubeTranscriptPanel() {
+    const transcriptTexts = [
+      "内容转文字",
+      "转写文稿",
+      "文字转写",
+      "Show transcript",
+      "Transcript"
+    ];
+
+    let button = findClickableByText(transcriptTexts);
+    if (button) {
+      clickElement(button);
+      return true;
+    }
+
+    const expandButton = findClickableByText(["...更多", "显示更多", "Show more"]);
+    if (expandButton) {
+      clickElement(expandButton);
+      await delay(450);
+      button = findClickableByText(transcriptTexts);
+      if (button) {
+        clickElement(button);
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function findClickableByText(texts) {
+    const normalizedNeedles = texts.map(normalizeSearchText).filter(Boolean);
+    const elements = [
+      ...document.querySelectorAll("button, ytd-button-renderer, tp-yt-paper-button, a[role='button'], yt-button-shape")
+    ];
+
+    return elements.find((element) => {
+      const value = normalizeSearchText([
+        element.getAttribute("aria-label") || "",
+        element.innerText || "",
+        element.textContent || ""
+      ].join(" "));
+      return normalizedNeedles.some((needle) => value.includes(needle));
+    }) || null;
+  }
+
+  function normalizeSearchText(value) {
+    return String(value || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function clickElement(element) {
+    const target = element.querySelector("button, a, tp-yt-paper-button") || element;
+    target.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      view: window
+    }));
+  }
+
+  function getYouTubeTranscriptPanelText() {
+    const segments = [...document.querySelectorAll("ytd-transcript-segment-renderer")]
+      .map(parseYouTubeTranscriptSegment)
+      .filter(Boolean);
+
+    if (segments.length >= 3) {
+      return uniqueValues(segments).join("\n");
+    }
+
+    const transcriptContainer = document.querySelector(
+      "ytd-transcript-renderer, ytd-transcript-search-panel-renderer, ytd-transcript-segment-list-renderer"
+    );
+    if (!transcriptContainer) {
+      return "";
+    }
+
+    const text = normalizeTranscriptPanelText(transcriptContainer.innerText || transcriptContainer.textContent || "");
+    return text.length > 120 ? text : "";
+  }
+
+  function parseYouTubeTranscriptSegment(segment) {
+    const lines = String(segment.innerText || segment.textContent || "")
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (!lines.length) {
+      return "";
+    }
+
+    const timeIndex = lines.findIndex((line) => isTimeLabel(line));
+    const time = timeIndex >= 0 ? lines[timeIndex] : "";
+    const content = lines
+      .filter((_line, index) => index !== timeIndex)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!content) {
+      return "";
+    }
+
+    return time ? `[${time}] ${content}` : content;
+  }
+
+  function normalizeTranscriptPanelText(text) {
+    const lines = String(text || "")
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const output = [];
+
+    for (let index = 0; index < lines.length; index += 1) {
+      if (!isTimeLabel(lines[index])) {
+        continue;
+      }
+      const time = lines[index];
+      const contentParts = [];
+      for (let next = index + 1; next < lines.length && !isTimeLabel(lines[next]); next += 1) {
+        contentParts.push(lines[next]);
+      }
+      const content = contentParts.join(" ").replace(/\s+/g, " ").trim();
+      if (content) {
+        output.push(`[${time}] ${content}`);
+      }
+    }
+
+    return uniqueValues(output).join("\n");
+  }
+
+  function isTimeLabel(value) {
+    return /^\d{1,2}:\d{2}(?::\d{2})?$/.test(String(value || "").trim());
+  }
+
+  async function waitForCondition(predicate, timeoutMs, intervalMs) {
+    const startedAt = performance.now();
+    while (performance.now() - startedAt < timeoutMs) {
+      if (predicate()) {
+        return true;
+      }
+      await delay(intervalMs);
+    }
+    return false;
   }
 
   async function extensionFetch(url) {
@@ -1145,6 +1428,18 @@
     const next = new URL(url, location.href);
     next.searchParams.set(key, value);
     return next.toString();
+  }
+
+  function safeUrl(url) {
+    try {
+      return new URL(url, location.href);
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function uniqueValues(values) {
+    return [...new Set(values.filter(Boolean))];
   }
 
   function normalizeUrl(url) {
