@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Video Caption AI Summarizer",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Summarize captions from YouTube, Bilibili, and other video sites with your own AI API.",
   "icons": {
     "16": "icons/icon16.png",

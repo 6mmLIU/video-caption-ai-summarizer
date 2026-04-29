@@ -114,6 +114,13 @@ assert.equal(transcriptMatchesTrackLanguage({ language: "en", label: "英语" },
 const chineseTranscript = "[0:00] 这是一段只有中文内容的字幕文本，用来确认不会误判成英文。";
 assert.equal(transcriptMatchesTrackLanguage({ language: "en", label: "English" }, chineseTranscript), false);
 
+const simplifiedTranscript = "[0:00] 这是一段简体中文字幕，这个视频会说明学习内容与实际决策。";
+const traditionalTranscript = "[0:00] 這是一段繁體中文字幕，這個影片會說明學習內容與實際決策。";
+assert.equal(transcriptMatchesTrackLanguage({ language: "zh-Hant", label: "中文（台灣）" }, simplifiedTranscript), false);
+assert.equal(transcriptMatchesTrackLanguage({ language: "zh-Hant", label: "中文（台灣）" }, traditionalTranscript), true);
+assert.equal(transcriptMatchesTrackLanguage({ language: "zh-Hans", label: "中文（简体）" }, simplifiedTranscript), true);
+assert.equal(transcriptMatchesTrackLanguage({ language: "zh-Hans", label: "中文（简体）" }, traditionalTranscript), false);
+
 function textSegment(text) {
   return {
     innerText: text,

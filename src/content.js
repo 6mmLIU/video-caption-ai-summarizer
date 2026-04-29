@@ -51,6 +51,7 @@
   let refreshTimer = null;
   let statusSwapTimer = null;
   let previewPromise = null;
+  let transcriptCache = new Map();
   let activeVideo = null;
   let lastActiveTranscriptIndex = -1;
   let transcriptPanelCloseTimer = null;
@@ -222,6 +223,7 @@
       refreshRunId += 1;
       transcriptRunId += 1;
       previewPromise = null;
+      transcriptCache.clear();
       state.tracks = [];
       state.selectedTrackId = "";
       state.transcript = "";
@@ -481,9 +483,10 @@
   async function refreshTracks() {
     const refreshId = ++refreshRunId;
     const pageKey = getPageKey();
-    const refreshStartedAt = performance.now();
+    const previousTrackKey = getTrackIdentityKey(getSelectedTrack());
     transcriptRunId += 1;
     previewPromise = null;
+    transcriptCache.clear();
     state.platform = detectPlatform() || {
       id: "generic",
       name: "Generic Video",
@@ -509,7 +512,7 @@
         return;
       }
       state.tracks = tracks;
-      state.selectedTrackId = chooseDefaultTrackId(tracks);
+      state.selectedTrackId = chooseTrackId(tracks, previousTrackKey);
       state.status = tracks.length
         ? t("content.status.foundTracks", { count: tracks.length })
         : t("content.status.noTracks");
@@ -523,10 +526,6 @@
       state.status = t("content.status.trackReadFailed", { message: error.message });
       state.statusTone = "error";
     } finally {
-      const remainingAnimationMs = 650 - (performance.now() - refreshStartedAt);
-      if (remainingAnimationMs > 0) {
-        await delay(remainingAnimationMs);
-      }
       if (!isCurrentRefresh(refreshId, pageKey)) {
         return;
       }
@@ -536,6 +535,20 @@
         hydrateTranscriptPreview({ silent: true, pageKey }).catch(() => {});
       }
     }
+  }
+
+  function chooseTrackId(tracks, preferredTrackKey = "") {
+    if (preferredTrackKey) {
+      const match = tracks.find((track) => getTrackIdentityKey(track) === preferredTrackKey);
+      if (match) {
+        return match.id;
+      }
+    }
+    return chooseDefaultTrackId(tracks);
+  }
+
+  function getSelectedTrack() {
+    return state.tracks.find((item) => item.id === state.selectedTrackId) || state.tracks[0] || null;
   }
 
   function isCurrentRefresh(refreshId, pageKey) {
@@ -644,6 +657,21 @@
     }
 
     return tracks[0].id;
+  }
+
+  function getTrackIdentityKey(track) {
+    if (!track) {
+      return "";
+    }
+    const trackUrl = safeUrl(track.url);
+    return [
+      track.source || "",
+      track.language || "",
+      track.label || "",
+      trackUrl?.searchParams.get("lang") || "",
+      trackUrl?.searchParams.get("name") || "",
+      trackUrl?.searchParams.get("kind") || ""
+    ].map(normalizeSearchText).join("|");
   }
 
   async function getYouTubeTracks() {
@@ -919,7 +947,7 @@
   }
 
   async function loadSelectedTranscript() {
-    const track = state.tracks.find((item) => item.id === state.selectedTrackId) || state.tracks[0];
+    const track = getSelectedTrack();
     if (!track) {
       const visibleTranscript = getVisibleTranscript();
       if (visibleTranscript) {
@@ -928,6 +956,20 @@
       throw new Error(t("content.error.noCaptions"));
     }
 
+    const cacheKey = getTranscriptCacheKey(track);
+    const cachedTranscript = cacheKey ? transcriptCache.get(cacheKey) : "";
+    if (cachedTranscript) {
+      return cachedTranscript;
+    }
+
+    const transcript = await loadTranscriptForTrack(track);
+    if (cacheKey && transcript) {
+      transcriptCache.set(cacheKey, transcript);
+    }
+    return transcript;
+  }
+
+  async function loadTranscriptForTrack(track) {
     if (track.text) {
       return track.text;
     }
@@ -958,13 +1000,25 @@
     throw new Error(t("content.error.unsupportedTrack", { source: track.source }));
   }
 
+  function getTranscriptCacheKey(track) {
+    const pageKey = getPageKey();
+    const trackKey = getTrackIdentityKey(track);
+    return pageKey && trackKey ? `${pageKey}|${trackKey}` : "";
+  }
+
   async function loadYouTubeTrackTranscript(track) {
+    await waitForYouTubeMainVideoReady();
+
     const sourceUrls = uniqueValues([
       track.url,
       ...getYouTubeRuntimeTimedTextUrls(track)
     ]);
 
-    const transcript = await fetchYouTubeTranscriptFromSourceUrls(sourceUrls);
+    let transcript = await fetchYouTubeTranscriptFromSourceUrls(sourceUrls);
+    if (!transcript && isYouTubeAdPlaying()) {
+      await waitForYouTubeMainVideoReady();
+      transcript = await fetchYouTubeTranscriptFromSourceUrls(sourceUrls);
+    }
     if (transcript) {
       return transcript;
     }
@@ -975,11 +1029,44 @@
     }
 
     const transcriptPanelText = await loadYouTubeTranscriptPanelText();
-    if (transcriptPanelText) {
+    if (transcriptPanelText && transcriptPanelMatchesTrack(track, transcriptPanelText)) {
       return transcriptPanelText;
     }
 
     return "";
+  }
+
+  async function waitForYouTubeMainVideoReady() {
+    if (!isYouTubeAdPlaying()) {
+      return true;
+    }
+
+    setStatus(t("content.status.waitingForAd"), "busy");
+    const ready = await waitForCondition(() => !isYouTubeAdPlaying(), 45000, 300);
+    if (!ready) {
+      throw new Error(t("content.error.youtubeAdPlaying"));
+    }
+    await delay(350);
+    return true;
+  }
+
+  function isYouTubeAdPlaying() {
+    const player = document.querySelector("#movie_player");
+    if (!player) {
+      return false;
+    }
+
+    const classes = player.classList;
+    if (classes.contains("ad-showing") || classes.contains("ad-interrupting")) {
+      return true;
+    }
+
+    try {
+      const adState = player.getAdState?.();
+      return Number.isFinite(adState) && adState > 0;
+    } catch (_error) {
+      return false;
+    }
   }
 
   async function fetchYouTubeTranscriptFromSourceUrls(sourceUrls) {
@@ -1156,10 +1243,38 @@
   function transcriptMatchesTrackLanguage(track, transcript) {
     const expected = getTrackLanguageFamily(track);
     const actual = detectTranscriptLanguageFamily(transcript);
+    if (expected === "zh" || actual === "zh" || actual === "mixed") {
+      if (!transcriptMatchesTrackChineseScript(track, transcript)) {
+        return false;
+      }
+    }
     if (actual === "mixed") {
       return true;
     }
     return !expected || !actual || expected === actual;
+  }
+
+  function transcriptPanelMatchesTrack(track, transcript) {
+    if (!transcriptMatchesTrackLanguage(track, transcript)) {
+      return false;
+    }
+
+    const expectedScript = getTrackChineseScript(track);
+    if (!expectedScript) {
+      return true;
+    }
+
+    return detectTranscriptChineseScript(transcript) === expectedScript;
+  }
+
+  function transcriptMatchesTrackChineseScript(track, transcript) {
+    const expectedScript = getTrackChineseScript(track);
+    if (!expectedScript) {
+      return true;
+    }
+
+    const actualScript = detectTranscriptChineseScript(transcript);
+    return !actualScript || actualScript === expectedScript;
   }
 
   function getTrackLanguageFamily(track) {
@@ -1169,6 +1284,17 @@
     }
     if (/(^|[^a-z])en([^a-z]|$)|english|英语|英文/.test(value)) {
       return "en";
+    }
+    return "";
+  }
+
+  function getTrackChineseScript(track) {
+    const value = normalizeSearchText(`${track?.language || ""} ${track?.label || ""}`);
+    if (/(zh[-_]?hant|zh[-_]?(tw|hk|mo)|繁|繁體|繁体|臺灣|台灣|台湾|台語|臺語)/.test(value)) {
+      return "hant";
+    }
+    if (/(zh[-_]?hans|zh[-_]?(cn|sg)|简|簡|简体|簡體|中国|中國|大陆|大陸|普通话|普通話)/.test(value)) {
+      return "hans";
     }
     return "";
   }
@@ -1198,6 +1324,27 @@
       return "en";
     }
     return "";
+  }
+
+  function detectTranscriptChineseScript(transcript) {
+    const sample = getTranscriptTextLines(transcript)
+      .slice(0, 60)
+      .join(" ");
+    const traditionalCount = countChars(sample, "這個為來後臺與國語學習體點還開關觀聽說讓選擇發現條軌錄轉經濟責任錯誤實際決策領導麼歲嗎對時會內容");
+    const simplifiedCount = countChars(sample, "这个为来后台与国语学习体点还开关观听说让选择发现条轨录转经济责任错误实际决策领导么岁吗对时会内容");
+
+    if (traditionalCount >= 2 && traditionalCount >= simplifiedCount * 1.4) {
+      return "hant";
+    }
+    if (simplifiedCount >= 2 && simplifiedCount >= traditionalCount * 1.4) {
+      return "hans";
+    }
+    return "";
+  }
+
+  function countChars(value, chars) {
+    const lookup = new Set([...chars]);
+    return [...String(value || "")].filter((char) => lookup.has(char)).length;
   }
 
   function buildYouTubeTimedTextUrls(sourceUrl, formats) {
@@ -1960,7 +2107,7 @@
         }
         state.transcript = cleanText;
         lastActiveTranscriptIndex = -1;
-        if (!silent) {
+        if (!silent || state.status === t("content.status.waitingForAd")) {
           setStatus(t("content.status.transcriptRead", { count: cleanText.length }), "done");
         }
         return cleanText;
@@ -2203,7 +2350,7 @@
       state.selectedTrackId = event.target.value;
       state.transcript = "";
       lastActiveTranscriptIndex = -1;
-      hydrateTranscriptPreview({ silent: true }).catch(() => {});
+      hydrateTranscriptPreview().catch(() => {});
     });
     shadow.querySelector("#vcs-summarize")?.addEventListener("click", summarize);
     shadow.querySelector("#vcs-copy-transcript")?.addEventListener("click", copyTranscript);
