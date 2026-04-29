@@ -9,6 +9,8 @@ const extensionDir = rootDir;
 const fixtureDir = join(rootDir, "tests", "fixtures");
 const outputDir = join(rootDir, "output", "playwright");
 const userDataDir = join(rootDir, "output", `chrome-profile-${Date.now()}`);
+const externalVideoUrl = process.env.VCS_TEST_URL || "";
+const externalNonVideoUrl = process.env.VCS_NON_VIDEO_URL || "";
 const chromeCandidates = [
   "/Users/liu/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
   "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
@@ -16,7 +18,7 @@ const chromeCandidates = [
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 ];
 const chromePath = await firstExisting(chromeCandidates);
-const debugPort = 9227;
+const debugPort = Number(process.env.VCS_DEBUG_PORT || 9227);
 
 class Cdp {
   static async connect(url) {
@@ -85,6 +87,9 @@ const server = createServer(async (request, response) => {
 await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
 const { port } = server.address();
 const baseUrl = `http://127.0.0.1:${port}`;
+const targetVideoUrl = externalVideoUrl || `${baseUrl}/video-page.html`;
+const targetNonVideoUrl = externalNonVideoUrl || `${baseUrl}/blank-page.html`;
+const waitTimeout = externalVideoUrl ? 30000 : 15000;
 
 const chrome = spawn(chromePath, [
   `--user-data-dir=${userDataDir}`,
@@ -108,7 +113,7 @@ try {
   const version = await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, 15000);
   browser = await Cdp.connect(version.webSocketDebuggerUrl);
 
-  const videoTarget = await createTarget(`${baseUrl}/video-page.html`);
+  const videoTarget = await createTarget(targetVideoUrl);
   const videoPage = await Cdp.connect(videoTarget.webSocketDebuggerUrl);
   await videoPage.send("Page.enable");
   await videoPage.send("Runtime.enable");
@@ -116,13 +121,13 @@ try {
 
   await waitForExpression(videoPage, `
     Boolean(document.querySelector("#vcs-root")?.shadowRoot?.querySelector(".vcs-panel"))
-  `, 15000);
+  `, waitTimeout);
   await waitForExpression(videoPage, `
     (() => {
       const status = document.querySelector("#vcs-root")?.shadowRoot?.querySelector("#vcs-status")?.textContent || "";
       return status.includes("已发现") || status.includes("粘贴") || status.includes("失败");
     })()
-  `, 15000);
+  `, waitTimeout);
 
   const panelState = await evaluate(videoPage, `
     const root = document.querySelector("#vcs-root");
@@ -130,23 +135,64 @@ try {
     return {
       extensionId: root.dataset.extensionId || "",
       status: shadow.querySelector("#vcs-status")?.textContent || "",
-      platform: shadow.querySelector(".vcs-chip")?.textContent || "",
+      platform: shadow.querySelector(".vcs-subtitle")?.textContent?.split("·")?.[0]?.trim()
+        || shadow.querySelector(".vcs-chip")?.textContent
+        || "",
       track: shadow.querySelector("#vcs-track")?.selectedOptions?.[0]?.textContent || "",
-      title: shadow.querySelector(".vcs-meta span")?.textContent || ""
+      title: shadow.querySelector(".vcs-meta-title")?.textContent
+        || shadow.querySelector(".vcs-meta span")?.textContent
+        || "",
+      collapsedByDefault: shadow.querySelector(".vcs-panel")?.classList.contains("is-collapsed") || false
     };
   `);
 
-  await capture(videoPage, join(outputDir, "video-panel.png"));
+  if (!panelState.collapsedByDefault) {
+    throw new Error("Panel should be collapsed by default.");
+  }
+
+  if (!panelState.status.includes("已发现")) {
+    throw new Error(`Expected readable captions, got status: ${panelState.status}`);
+  }
+
+  await capture(videoPage, join(outputDir, "video-panel-collapsed.png"));
 
   await evaluate(videoPage, `
-    document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-collapse").click();
+    document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-expand").click();
     return true;
   `);
   await waitForExpression(videoPage, `
-    document.querySelector("#vcs-root")?.shadowRoot?.querySelector(".vcs-panel")?.classList.contains("is-collapsed")
+    !document.querySelector("#vcs-root")?.shadowRoot?.querySelector(".vcs-panel")?.classList.contains("is-collapsed")
   `, 5000);
   await delay(280);
-  await capture(videoPage, join(outputDir, "video-panel-collapsed.png"));
+  await capture(videoPage, join(outputDir, "video-panel.png"));
+
+  await evaluate(videoPage, `
+    document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-refresh").click();
+    return true;
+  `);
+  await waitForExpression(videoPage, `
+    document.querySelector("#vcs-root")?.shadowRoot?.querySelector("#vcs-refresh")?.classList.contains("is-spinning")
+  `, 3000);
+
+  const refreshAnimated = await evaluate(videoPage, `
+    return document.querySelector("#vcs-root")?.shadowRoot?.querySelector("#vcs-refresh")?.classList.contains("is-spinning") || false;
+  `);
+
+  const nonVideoTarget = await createTarget(targetNonVideoUrl);
+  const nonVideoPage = await Cdp.connect(nonVideoTarget.webSocketDebuggerUrl);
+  await nonVideoPage.send("Page.enable");
+  await nonVideoPage.send("Runtime.enable");
+  await waitForPageReady(nonVideoPage);
+  await delay(1200);
+  const nonVideoState = await evaluate(nonVideoPage, `
+    return {
+      url: location.href,
+      hasPanel: Boolean(document.querySelector("#vcs-root")?.shadowRoot?.querySelector(".vcs-panel"))
+    };
+  `);
+  if (nonVideoState.hasPanel) {
+    throw new Error("Panel should not mount on non-video pages.");
+  }
 
   const extensionId = panelState.extensionId || await waitForExtensionId(browser);
 
@@ -173,11 +219,15 @@ try {
   console.log(JSON.stringify({
     ok: true,
     baseUrl,
+    targetVideoUrl,
+    targetNonVideoUrl,
     extensionId,
     panelState,
+    refreshAnimated,
+    nonVideoState,
     screenshots: [
-      "output/playwright/video-panel.png",
       "output/playwright/video-panel-collapsed.png",
+      "output/playwright/video-panel.png",
       "output/playwright/options-page.png",
       "output/playwright/popup.png"
     ]

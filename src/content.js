@@ -11,16 +11,18 @@
   const state = {
     settings: DEFAULT_SETTINGS,
     mounted: false,
-    collapsed: false,
+    embedded: false,
+    collapsed: true,
     platform: null,
     title: "",
     tracks: [],
     selectedTrackId: "",
     transcript: "",
     lastSummary: "",
-    status: "正在检测视频字幕",
+    status: "正在读取字幕",
     statusTone: "neutral",
-    progress: null
+    progress: null,
+    refreshing: false
   };
 
   let root = null;
@@ -53,8 +55,12 @@
       }
 
       if (message?.type === "VCS_TOGGLE_PANEL") {
+        if (!shouldShowPanel()) {
+          sendResponse({ ok: false, error: "当前不是视频播放页，面板不会自动显示。" });
+          return true;
+        }
         if (!state.mounted) {
-          maybeMount(true);
+          maybeMount();
         }
         state.collapsed = !state.collapsed;
         render();
@@ -63,6 +69,13 @@
       }
 
       if (message?.type === "VCS_SUMMARIZE_NOW") {
+        if (!shouldShowPanel()) {
+          sendResponse({ ok: false, error: "当前不是视频播放页。" });
+          return true;
+        }
+        if (!state.mounted) {
+          maybeMount();
+        }
         summarize().then(
           () => sendResponse({ ok: true }),
           (error) => sendResponse({ ok: false, error: error.message })
@@ -106,6 +119,8 @@
         scheduleRefresh();
       } else if (!state.mounted && shouldShowPanel()) {
         scheduleRefresh();
+      } else if (state.mounted && shouldShowPanel()) {
+        placeRoot();
       }
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
@@ -123,14 +138,22 @@
       state.tracks = [];
       state.transcript = "";
       state.lastSummary = "";
-      maybeMount();
-      refreshTracks();
+      state.platform = null;
+      state.collapsed = true;
+      if (shouldShowPanel()) {
+        const wasMounted = state.mounted;
+        maybeMount();
+        if (wasMounted) {
+          refreshTracks();
+        }
+      } else {
+        unmount();
+      }
     }, 450);
   }
 
   function shouldShowPanel() {
-    const platform = detectPlatform();
-    return Boolean(platform || document.querySelector("video"));
+    return Boolean(detectPlatform());
   }
 
   function maybeMount(force = false) {
@@ -143,9 +166,10 @@
       root = document.createElement("div");
       root.id = PANEL_ID;
       root.dataset.extensionId = chrome.runtime.id;
-      document.documentElement.appendChild(root);
       shadow = root.attachShadow({ mode: "open" });
     }
+
+    placeRoot();
 
     state.mounted = true;
     render();
@@ -154,7 +178,48 @@
     }
   }
 
+  function unmount() {
+    if (root?.parentElement) {
+      root.remove();
+    }
+    state.mounted = false;
+    state.embedded = false;
+    state.platform = null;
+  }
+
+  function placeRoot() {
+    const target = findEmbedTarget();
+    if (target && root.parentElement !== target) {
+      if (target === document.documentElement) {
+        target.appendChild(root);
+      } else {
+        target.insertBefore(root, target.firstChild);
+      }
+      state.embedded = target !== document.documentElement;
+    } else if (!root.parentElement) {
+      document.documentElement.appendChild(root);
+      state.embedded = false;
+    }
+  }
+
+  function findEmbedTarget() {
+    const host = location.hostname.replace(/^www\./, "");
+    if (host.includes("youtube.com")) {
+      return document.querySelector("#secondary-inner")
+        || document.querySelector("#secondary")
+        || document.documentElement;
+    }
+    if (host.includes("bilibili.com")) {
+      return document.querySelector(".right-container-inner")
+        || document.querySelector(".right-container")
+        || document.querySelector("#reco_list")
+        || document.documentElement;
+    }
+    return document.documentElement;
+  }
+
   async function refreshTracks() {
+    const refreshStartedAt = performance.now();
     state.platform = detectPlatform() || {
       id: "generic",
       name: "Generic Video",
@@ -164,12 +229,13 @@
     state.status = "正在读取字幕轨道";
     state.statusTone = "busy";
     state.progress = null;
+    state.refreshing = true;
     render();
 
     try {
       const tracks = await getTracksForPlatform(state.platform);
       state.tracks = tracks;
-      state.selectedTrackId = tracks[0]?.id || "";
+      state.selectedTrackId = chooseDefaultTrackId(tracks);
       state.status = tracks.length
         ? `已发现 ${tracks.length} 条字幕轨道`
         : "没有发现可直接读取的字幕，可粘贴字幕后总结";
@@ -178,18 +244,37 @@
       state.tracks = [];
       state.status = `字幕读取失败：${error.message}`;
       state.statusTone = "error";
+    } finally {
+      const remainingAnimationMs = 650 - (performance.now() - refreshStartedAt);
+      if (remainingAnimationMs > 0) {
+        await delay(remainingAnimationMs);
+      }
+      state.refreshing = false;
     }
 
     render();
   }
 
+  function delay(ms) {
+    return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+  }
+
   function detectPlatform() {
     const host = location.hostname.replace(/^www\./, "");
     if (host.includes("youtube.com") || host === "youtu.be") {
-      return { id: "youtube", name: "YouTube", kind: "youtube" };
+      if (location.pathname === "/watch" && new URLSearchParams(location.search).has("v")) {
+        return { id: "youtube", name: "YouTube", kind: "youtube" };
+      }
+      if (location.pathname.startsWith("/shorts/")) {
+        return { id: "youtube", name: "YouTube Shorts", kind: "youtube" };
+      }
+      return null;
     }
     if (host.includes("bilibili.com")) {
-      return { id: "bilibili", name: "Bilibili", kind: "bilibili" };
+      if (location.pathname.includes("/video/") || location.pathname.includes("/bangumi/play/")) {
+        return { id: "bilibili", name: "Bilibili", kind: "bilibili" };
+      }
+      return null;
     }
     if (host.includes("vimeo.com")) {
       return { id: "vimeo", name: "Vimeo", kind: "generic" };
@@ -200,15 +285,23 @@
     if (host.includes("ted.com")) {
       return { id: "ted", name: "TED", kind: "generic" };
     }
-    if (document.querySelector("video")) {
+    if (getVisibleVideoElement()) {
       return { id: "generic", name: "Generic Video", kind: "generic" };
     }
     return null;
   }
 
+  function getVisibleVideoElement() {
+    return [...document.querySelectorAll("video")]
+      .find((video) => {
+        const rect = video.getBoundingClientRect();
+        return isVisible(video) && rect.width >= 240 && rect.height >= 120;
+      }) || null;
+  }
+
   async function getTracksForPlatform(platform) {
     if (platform.kind === "youtube") {
-      const tracks = getYouTubeTracks();
+      const tracks = await getYouTubeTracks();
       if (tracks.length) {
         return tracks;
       }
@@ -242,16 +335,88 @@
     return [];
   }
 
-  function getYouTubeTracks() {
-    const response = getJsonAssignment("ytInitialPlayerResponse");
-    const captionTracks = response?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-    return captionTracks.map((track, index) => ({
-      id: `youtube-${index}`,
-      label: getLabelText(track.name) || track.languageCode || `Caption ${index + 1}`,
-      language: track.languageCode || "auto",
-      source: "youtube",
-      url: track.baseUrl
-    }));
+  function chooseDefaultTrackId(tracks) {
+    if (!tracks.length) {
+      return "";
+    }
+
+    const outputLanguage = String(state.settings.language || "").toLowerCase();
+    const wantsChinese = /中文|chinese|zh|简体|繁體/.test(outputLanguage);
+    const preferred = wantsChinese
+      ? ["zh-hans", "zh-cn", "zh", "chinese", "中文", "简体", "繁體", "zh-hant", "zh-tw", "en", "english"]
+      : ["en", "english"];
+
+    for (const needle of preferred) {
+      const match = tracks.find((track) => {
+        const haystack = `${track.language || ""} ${track.label || ""}`.toLowerCase();
+        return haystack.includes(needle);
+      });
+      if (match) {
+        return match.id;
+      }
+    }
+
+    return tracks[0].id;
+  }
+
+  async function getYouTubeTracks() {
+    const scriptsText = getPageScriptsText();
+    const response = getJsonAssignment("ytInitialPlayerResponse") || await fetchYouTubePlayerResponse();
+    let captionTracks = response?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+
+    if (!captionTracks.length) {
+      captionTracks = extractYouTubeCaptionTracks(scriptsText);
+    }
+
+    if (!captionTracks.length) {
+      const watchHtml = await fetchYouTubeWatchHtml();
+      captionTracks = extractYouTubeCaptionTracks(watchHtml);
+    }
+
+    return captionTracks
+      .filter((track) => track?.baseUrl)
+      .map((track, index) => ({
+        id: `youtube-${index}`,
+        label: getLabelText(track.name) || track.languageCode || `Caption ${index + 1}`,
+        language: track.languageCode || "auto",
+        source: "youtube",
+        url: normalizeUrl(track.baseUrl)
+      }));
+  }
+
+  async function fetchYouTubePlayerResponse() {
+    const html = await fetchYouTubeWatchHtml();
+    return getJsonAssignmentFromText(html, "ytInitialPlayerResponse");
+  }
+
+  async function fetchYouTubeWatchHtml() {
+    const videoId = getYouTubeVideoId();
+    if (!videoId) {
+      return "";
+    }
+
+    const url = new URL("https://www.youtube.com/watch");
+    url.searchParams.set("v", videoId);
+    url.searchParams.set("has_verified", "1");
+    url.searchParams.set("bpctr", "9999999999");
+
+    try {
+      const response = await extensionFetch(url.toString());
+      return response.text || "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function getYouTubeVideoId() {
+    const host = location.hostname.replace(/^www\./, "");
+    if (host === "youtu.be") {
+      return location.pathname.split("/").filter(Boolean)[0] || "";
+    }
+    if (location.pathname.startsWith("/shorts/")) {
+      return location.pathname.split("/").filter(Boolean)[1] || "";
+    }
+    return new URLSearchParams(location.search).get("v") || "";
   }
 
   async function getBilibiliTracks() {
@@ -419,62 +584,60 @@
     const progressWidth = state.progress?.total
       ? Math.round((state.progress.current / state.progress.total) * 100)
       : 0;
-    const summarizeLabel = state.statusTone === "busy" ? "Summarizing..." : "Ask AI to Summarize";
+    const summarizeLabel = state.statusTone === "busy" ? "正在解析…" : "解析字幕";
+
+    const trackCount = state.tracks.length
+      ? `字幕 · ${state.tracks.length}`
+      : "无字幕轨";
+    const embedClass = state.embedded ? "is-embedded" : "is-floating";
 
     shadow.innerHTML = `
       <style>${getPanelCss()}</style>
-      <aside class="vcs-panel ${state.collapsed ? "is-collapsed" : ""}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
+      <aside class="vcs-panel ${state.collapsed ? "is-collapsed" : ""} ${embedClass}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
+        <button id="vcs-expand" class="vcs-seal-collapsed" type="button" title="展开字幕摘要">
+          <span class="vcs-seal-char">AI 摘要</span>
+        </button>
+
         <header class="vcs-header">
           <div class="vcs-brand">
-            <div class="vcs-mark" aria-hidden="true"><span>AI</span></div>
-            <div>
-              <div class="vcs-title">Video Caption AI</div>
-              <div class="vcs-subtitle">${escapeHtml(state.platform?.name || "Video page")}</div>
+            <div class="vcs-seal" aria-hidden="true"><span>AI</span></div>
+            <div class="vcs-brand-text">
+              <div class="vcs-title">字幕摘要</div>
+              <div class="vcs-subtitle">${escapeHtml(state.platform?.name || "video")} · ${escapeHtml(activeProfile)}</div>
             </div>
           </div>
           <div class="vcs-actions">
-            <button id="vcs-refresh" class="vcs-icon-button" title="重新检测字幕" aria-label="重新检测字幕">${refreshIcon()}</button>
-            <button id="vcs-options" class="vcs-icon-button" title="打开设置" aria-label="打开设置">${settingsIcon()}</button>
-            <button id="vcs-collapse" class="vcs-icon-button" title="折叠面板" aria-label="折叠面板">${chevronIcon()}</button>
+            <button id="vcs-refresh" class="vcs-icon-button ${state.refreshing ? "is-spinning" : ""}" title="重新检测字幕" aria-label="重新检测">${refreshIcon()}</button>
+            <button id="vcs-options" class="vcs-icon-button" title="打开设置" aria-label="设置">${settingsIcon()}</button>
+            <button id="vcs-collapse" class="vcs-icon-button" title="收起" aria-label="收起">${closeIcon()}</button>
           </div>
         </header>
 
-        <div class="vcs-collapsed-tab">
-          <button id="vcs-expand" type="button">AI Summary</button>
-        </div>
-
         <section class="vcs-body">
-          <div class="vcs-chip-row" aria-label="视频摘要状态">
-            <span class="vcs-chip">${escapeHtml(state.platform?.name || "Video")}</span>
-            <span class="vcs-chip">${state.tracks.length ? `${state.tracks.length} tracks` : "manual ready"}</span>
-            <span class="vcs-chip">${escapeHtml(activeProfile)}</span>
+          <div class="vcs-meta-line">
+            <span class="vcs-meta-title" title="${escapeHtml(state.title)}">${escapeHtml(state.title || "未命名视频")}</span>
           </div>
-
-          <button id="vcs-summarize" class="vcs-primary" type="button">
-            <span class="vcs-primary-glow" aria-hidden="true"></span>
-            <span>${escapeHtml(summarizeLabel)}</span>
-          </button>
 
           <div class="vcs-status-wrap">
             <div id="vcs-status" class="vcs-status" data-tone="${escapeHtml(state.statusTone)}">${escapeHtml(state.status)}</div>
-            <div class="vcs-progress"><span id="vcs-progress-bar" style="width:${progressWidth}%"></span></div>
+            <div class="vcs-progress" data-tone="${escapeHtml(state.statusTone)}"><span id="vcs-progress-bar" style="width:${progressWidth}%"></span></div>
           </div>
 
-          <label class="vcs-label" for="vcs-track">Transcript</label>
-          <div class="vcs-row">
+          <button id="vcs-summarize" class="vcs-primary" type="button">
+            <span>${escapeHtml(summarizeLabel)}</span>
+          </button>
+
+          <div class="vcs-track-row">
+            <span class="vcs-track-label">${escapeHtml(trackCount)}</span>
             <select id="vcs-track" class="vcs-select" ${state.tracks.length ? "" : "disabled"}>
               ${trackOptions || "<option>未发现字幕轨道</option>"}
             </select>
             <button id="vcs-copy-transcript" class="vcs-tool-button" type="button" title="复制字幕">${copyIcon()}</button>
           </div>
 
-          <div class="vcs-meta">
-            <span title="${escapeHtml(state.title)}">${escapeHtml(state.title || "Untitled video")}</span>
-          </div>
-
           <details class="vcs-details">
             <summary>手动粘贴字幕</summary>
-            <textarea id="vcs-manual" class="vcs-textarea" placeholder="如果当前平台无法自动读取字幕，可以把字幕或转写文本粘贴到这里。"></textarea>
+            <textarea id="vcs-manual" class="vcs-textarea" placeholder="若当前页面无法自动读取，可在此粘贴字幕原文。"></textarea>
           </details>
 
           <details class="vcs-details" ${state.transcript ? "open" : ""}>
@@ -484,8 +647,8 @@
 
           <section class="vcs-result" ${state.lastSummary ? "" : "hidden"}>
             <div class="vcs-result-head">
-              <span>Summary</span>
-              <button id="vcs-copy-summary" class="vcs-tool-button" type="button" title="复制总结">${copyIcon()}</button>
+              <span class="vcs-result-title">摘要</span>
+              <button id="vcs-copy-summary" class="vcs-tool-button" type="button" title="复制摘要">${copyIcon()}</button>
             </div>
             <article id="vcs-summary">${markdownToHtml(state.lastSummary)}</article>
           </section>
@@ -572,25 +735,74 @@
 
   function getJsonAssignment(name) {
     for (const script of document.scripts) {
-      const text = script.textContent || "";
-      const markerIndex = text.indexOf(name);
-      if (markerIndex === -1) {
+      const value = getJsonAssignmentFromText(script.textContent || "", name);
+      if (value) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  function getPageScriptsText() {
+    return [...document.scripts]
+      .map((script) => script.textContent || "")
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  function extractYouTubeCaptionTracks(text) {
+    if (!text) {
+      return [];
+    }
+
+    let searchIndex = 0;
+    while (searchIndex < text.length) {
+      const keyIndex = text.indexOf('"captionTracks"', searchIndex);
+      if (keyIndex === -1) {
+        break;
+      }
+
+      const arrayText = extractBalancedArray(text, keyIndex);
+      if (arrayText) {
+        try {
+          const tracks = JSON.parse(arrayText);
+          if (Array.isArray(tracks) && tracks.some((track) => track?.baseUrl)) {
+            return tracks;
+          }
+        } catch (_error) {
+          // Keep scanning in case the first match is not the player caption list.
+        }
+      }
+
+      searchIndex = keyIndex + 15;
+    }
+
+    return [];
+  }
+
+  function getJsonAssignmentFromText(text, name) {
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const patterns = [
+      new RegExp(`${escapedName}\\s*=\\s*`, "m"),
+      new RegExp(`"${escapedName}"\\s*:\\s*`, "m")
+    ];
+
+    for (const pattern of patterns) {
+      const match = pattern.exec(text);
+      if (!match) {
         continue;
       }
-      const equalsIndex = text.indexOf("=", markerIndex);
-      if (equalsIndex === -1) {
-        continue;
-      }
-      const json = extractBalancedJson(text, equalsIndex + 1);
+      const json = extractBalancedJson(text, match.index + match[0].length);
       if (!json) {
         continue;
       }
       try {
         return JSON.parse(json);
       } catch (_error) {
-        continue;
+        // Try the next pattern.
       }
     }
+
     return null;
   }
 
@@ -632,6 +844,55 @@
         depth -= 1;
         if (depth === 0) {
           return text.slice(firstBrace, index + 1);
+        }
+      }
+    }
+
+    return "";
+  }
+
+  function extractBalancedArray(text, startIndex) {
+    const firstBracket = text.indexOf("[", startIndex);
+    if (firstBracket === -1) {
+      return "";
+    }
+
+    const stack = [];
+    let inString = false;
+    let quote = "";
+    let escaped = false;
+
+    for (let index = firstBracket; index < text.length; index += 1) {
+      const char = text[index];
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === quote) {
+          inString = false;
+          quote = "";
+        }
+        continue;
+      }
+
+      if (char === "\"" || char === "'") {
+        inString = true;
+        quote = char;
+        continue;
+      }
+
+      if (char === "[") {
+        stack.push("]");
+      } else if (char === "{") {
+        stack.push("}");
+      } else if (char === "]" || char === "}") {
+        if (stack.pop() !== char) {
+          return "";
+        }
+        if (!stack.length) {
+          return text.slice(firstBracket, index + 1);
         }
       }
     }
@@ -884,8 +1145,8 @@
     return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z'/><path d='M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1A2 2 0 1 1 4.2 17l.1-.1A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1A2 2 0 1 1 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3h.1a1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.6h.1a1.7 1.7 0 0 0 1.9-.3l.1-.1A2 2 0 1 1 19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.6 1h.1a2 2 0 1 1 0 4H21a1.7 1.7 0 0 0-1.6 1Z'/></svg>";
   }
 
-  function chevronIcon() {
-    return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='m18 15-6-6-6 6'/></svg>";
+  function closeIcon() {
+    return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M6 6l12 12M18 6L6 18'/></svg>";
   }
 
   function copyIcon() {
@@ -894,444 +1155,446 @@
 
   function getPanelCss() {
     return `
-      :host { all: initial; }
+      :host { all: initial; display: block; }
       * { box-sizing: border-box; }
+
       .vcs-panel {
-        --bg: rgba(248, 250, 252, 0.72);
-        --surface: rgba(255, 255, 255, 0.86);
-        --surface-strong: rgba(255, 255, 255, 0.96);
-        --text: #111827;
-        --muted: #647084;
-        --line: rgba(137, 150, 171, 0.34);
-        --line-strong: rgba(91, 109, 138, 0.42);
-        --primary: #5b5ff5;
-        --primary-strong: #4238c9;
-        --cyan: #0e9f9a;
-        --good: #087f6f;
-        --bad: #bf2f45;
-        --shadow: 0 28px 90px rgba(15, 23, 42, 0.24), 0 8px 24px rgba(15, 23, 42, 0.12);
-        position: fixed;
-        top: 80px;
-        right: 18px;
-        z-index: 2147483647;
-        width: min(430px, calc(100vw - 36px));
-        max-height: calc(100vh - 112px);
+        --washi: #f7f7f7;
+        --washi-soft: #f1f1f1;
+        --paper: #ffffff;
+        --sumi: #0f0f0f;
+        --sumi-soft: #3f3f3f;
+        --nezumi: #606060;
+        --haijiro: #dedede;
+        --haijiro-soft: #eeeeee;
+        --rikyu: #0f0f0f;
+        --shu: #0f0f0f;
+        --good: #107c41;
+        --bad: #cc0000;
+
+        --sans: -apple-system, BlinkMacSystemFont, "Roboto", "Arial", "PingFang SC", "Hiragino Sans", "Microsoft YaHei", sans-serif;
+        --serif: var(--sans);
+
+        position: relative;
+        display: block;
+        width: 100%;
+        margin: 0 0 16px;
+        color: var(--sumi);
+        background: var(--paper);
+        border: 1px solid var(--haijiro);
+        border-radius: 12px;
+        font: 13px/1.7 var(--sans);
+        letter-spacing: 0;
         overflow: hidden;
-        color: var(--text);
-        background:
-          linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.9)),
-          radial-gradient(circle at 16% 0%, rgba(91, 95, 245, 0.16), transparent 28%),
-          var(--surface);
-        border: 1px solid var(--line);
-        border-radius: 16px;
-        box-shadow: var(--shadow);
-        backdrop-filter: blur(22px) saturate(1.25);
-        -webkit-backdrop-filter: blur(22px) saturate(1.25);
-        font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        animation: vcs-panel-in 280ms cubic-bezier(.2,.8,.2,1);
-        transform-origin: top right;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
       }
-      .vcs-panel::before {
-        content: "";
-        position: absolute;
-        inset: 0 0 auto;
-        height: 1px;
-        background: linear-gradient(90deg, transparent, rgba(91, 95, 245, 0.72), rgba(14, 159, 154, 0.72), transparent);
-        pointer-events: none;
+
+      .vcs-panel.is-floating {
+        position: fixed;
+        top: 84px;
+        right: 20px;
+        width: 380px;
+        max-height: calc(100vh - 120px);
+        z-index: 2147483647;
+        margin: 0;
       }
+
       .vcs-panel[data-theme="dark"] {
-        --bg: rgba(16, 22, 33, 0.74);
-        --surface: rgba(19, 25, 38, 0.86);
-        --surface-strong: rgba(23, 31, 46, 0.96);
-        --text: #f6f8fb;
-        --muted: #a9b3c3;
-        --line: rgba(148, 163, 184, 0.22);
-        --line-strong: rgba(148, 163, 184, 0.34);
-        --primary: #8b8cff;
-        --primary-strong: #7470f8;
-        --cyan: #28d7cb;
-        --good: #36d5bf;
-        --bad: #fb7185;
-        --shadow: 0 32px 96px rgba(0, 0, 0, 0.46), 0 10px 32px rgba(0, 0, 0, 0.28);
-        background:
-          linear-gradient(180deg, rgba(18, 24, 37, 0.72), rgba(17, 24, 39, 0.92)),
-          radial-gradient(circle at 16% 0%, rgba(139, 140, 255, 0.2), transparent 30%),
-          var(--surface);
+        --washi: #181818;
+        --washi-soft: #202020;
+        --paper: #0f0f0f;
+        --sumi: #f1f1f1;
+        --sumi-soft: #d0d0d0;
+        --nezumi: #a0a0a0;
+        --haijiro: #303030;
+        --haijiro-soft: #242424;
+        --rikyu: #ffffff;
+        --shu: #ffffff;
+        --good: #64d884;
+        --bad: #ff6b6b;
       }
+
       .vcs-header {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 14px;
-        padding: 15px 15px 13px;
-        border-bottom: 1px solid var(--line);
-        background:
-          linear-gradient(180deg, var(--surface-strong), var(--bg));
+        gap: 12px;
+        padding: 14px 16px 12px;
+        border-bottom: 1px solid var(--haijiro);
       }
+
       .vcs-brand {
         display: flex;
         align-items: center;
-        gap: 10px;
+        gap: 12px;
         min-width: 0;
       }
-      .vcs-mark {
+
+      .vcs-seal {
+        flex: 0 0 auto;
         display: grid;
         place-items: center;
-        width: 36px;
-        height: 36px;
-        flex: 0 0 auto;
-        color: #fff;
-        background:
-          linear-gradient(145deg, rgba(255, 255, 255, 0.2), transparent 42%),
-          linear-gradient(135deg, var(--primary), var(--cyan));
-        border: 1px solid rgba(255, 255, 255, 0.34);
-        border-radius: 12px;
-        box-shadow: 0 10px 28px rgba(91, 95, 245, 0.28);
-        font-weight: 780;
+        width: 30px;
+        height: 30px;
+        color: var(--paper);
+        background: var(--shu);
+        border-radius: 8px;
+        font: 700 12px/1 var(--sans);
         letter-spacing: 0;
+        user-select: none;
       }
-      .vcs-mark span {
-        transform: translateY(-.5px);
+      .vcs-panel[data-theme="dark"] .vcs-seal {
+        color: var(--paper);
+        background: var(--sumi);
       }
+      .vcs-seal span { transform: translateY(0.5px); }
+
+      .vcs-brand-text { min-width: 0; }
       .vcs-title {
-        color: var(--text);
-        font-size: 14.5px;
-        font-weight: 760;
+        color: var(--sumi);
+        font: 650 14px/1.3 var(--sans);
+        letter-spacing: 0;
         white-space: nowrap;
       }
-      .vcs-subtitle, .vcs-meta {
-        color: var(--muted);
-        font-size: 12px;
-        min-width: 0;
+      .vcs-subtitle {
+        color: var(--nezumi);
+        font-size: 11px;
+        line-height: 1.4;
+        letter-spacing: 0;
+        margin-top: 2px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 220px;
       }
-      .vcs-actions, .vcs-row, .vcs-result-head {
+
+      .vcs-actions {
         display: flex;
         align-items: center;
-        gap: 8px;
+        gap: 2px;
       }
+
       .vcs-icon-button, .vcs-tool-button {
         display: inline-grid;
         place-items: center;
-        width: 32px;
-        height: 32px;
+        width: 26px;
+        height: 26px;
         padding: 0;
-        color: var(--muted);
-        background: rgba(255, 255, 255, 0.34);
-        border: 1px solid var(--line);
-        border-radius: 10px;
+        color: var(--nezumi);
+        background: transparent;
+        border: 0;
+        border-radius: 999px;
         cursor: pointer;
-        transition: transform 150ms ease, border-color 150ms ease, background 150ms ease, color 150ms ease;
+        transition: color 180ms ease, background 180ms ease, transform 180ms ease;
       }
       .vcs-icon-button:hover, .vcs-tool-button:hover {
-        color: var(--text);
-        background: rgba(91, 95, 245, 0.1);
-        border-color: var(--line-strong);
+        color: var(--sumi);
+        background: var(--washi-soft);
         transform: translateY(-1px);
       }
-      .vcs-icon-button:active, .vcs-tool-button:active {
+      .vcs-icon-button:active, .vcs-tool-button:active,
+      .vcs-primary:active, .vcs-seal-collapsed:active {
         transform: translateY(0) scale(0.98);
       }
+      .vcs-icon-button.is-spinning svg {
+        animation: vcs-spin 700ms cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
+        transform-origin: 50% 50%;
+      }
+
       svg {
-        width: 17px;
-        height: 17px;
+        width: 14px;
+        height: 14px;
         fill: none;
         stroke: currentColor;
         stroke-width: 1.8;
         stroke-linecap: round;
         stroke-linejoin: round;
       }
+
       .vcs-body {
         display: grid;
-        gap: 13px;
-        max-height: calc(100vh - 178px);
+        gap: 14px;
+        padding: 16px;
+        max-height: 78vh;
         overflow: auto;
-        padding: 15px;
-        background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.18));
       }
+      .vcs-panel.is-floating .vcs-body {
+        max-height: calc(100vh - 200px);
+      }
+
       .vcs-body::-webkit-scrollbar,
       #vcs-summary::-webkit-scrollbar,
       .vcs-textarea::-webkit-scrollbar {
-        width: 10px;
-        height: 10px;
+        width: 6px;
+        height: 6px;
       }
       .vcs-body::-webkit-scrollbar-thumb,
       #vcs-summary::-webkit-scrollbar-thumb,
       .vcs-textarea::-webkit-scrollbar-thumb {
-        background: rgba(100, 112, 132, 0.26);
-        border: 3px solid transparent;
-        border-radius: 999px;
-        background-clip: padding-box;
+        background: var(--haijiro);
+        border-radius: 0;
       }
-      .vcs-chip-row {
-        display: flex;
-        gap: 7px;
-        overflow: hidden;
+
+      .vcs-meta-line {
+        font-size: 12px;
+        color: var(--sumi-soft);
+        line-height: 1.5;
       }
-      .vcs-chip {
-        min-width: 0;
-        max-width: 142px;
+      .vcs-meta-title {
+        display: block;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-        padding: 5px 8px;
-        color: var(--muted);
-        background: rgba(255, 255, 255, 0.42);
-        border: 1px solid var(--line);
-        border-radius: 999px;
-        font-size: 11.5px;
-        font-weight: 680;
+        font-family: var(--sans);
+        letter-spacing: 0;
       }
-      .vcs-primary {
-        position: relative;
-        display: grid;
-        place-items: center;
-        width: 100%;
-        height: 46px;
-        overflow: hidden;
-        color: #fff;
-        background:
-          linear-gradient(135deg, var(--primary), var(--primary-strong) 56%, var(--cyan));
-        border: 0;
-        border-radius: 12px;
-        box-shadow: 0 14px 32px rgba(91, 95, 245, 0.28);
-        font-size: 14px;
-        font-weight: 760;
-        cursor: pointer;
-        transition: transform 160ms ease, box-shadow 160ms ease, filter 160ms ease;
-      }
-      .vcs-primary span:last-child {
-        position: relative;
-        z-index: 1;
-      }
-      .vcs-primary-glow {
-        position: absolute;
-        inset: 0;
-        background: linear-gradient(100deg, transparent 0%, rgba(255,255,255,.34) 42%, transparent 70%);
-        transform: translateX(-120%);
-        animation: vcs-shine 4.4s ease-in-out infinite;
-      }
-      .vcs-primary:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 18px 40px rgba(91, 95, 245, 0.34);
-        filter: saturate(1.04);
-      }
-      .vcs-primary:active {
-        transform: translateY(0) scale(0.99);
-      }
+
       .vcs-status-wrap {
         display: grid;
-        gap: 7px;
-        padding: 10px 11px;
-        background: rgba(255, 255, 255, 0.36);
-        border: 1px solid var(--line);
-        border-radius: 12px;
+        gap: 8px;
       }
       .vcs-status {
-        color: var(--muted);
-        min-height: 20px;
-        font-size: 12.5px;
+        color: var(--nezumi);
+        font-size: 12px;
+        letter-spacing: 0;
+        min-height: 18px;
       }
-      .vcs-status[data-tone="busy"] { color: var(--primary); }
+      .vcs-status[data-tone="busy"] { color: var(--rikyu); }
       .vcs-status[data-tone="done"] { color: var(--good); }
       .vcs-status[data-tone="error"] { color: var(--bad); }
+
       .vcs-progress {
         position: relative;
-        height: 4px;
-        overflow: hidden;
-        background: rgba(91, 95, 245, 0.1);
+        height: 2px;
         border-radius: 999px;
+        overflow: hidden;
+        background: var(--haijiro);
       }
       .vcs-progress span {
         display: block;
         width: 0;
         height: 100%;
-        background: linear-gradient(90deg, var(--primary), var(--cyan), var(--good));
-        border-radius: inherit;
-        transition: width 220ms ease;
+        background: var(--rikyu);
+        transition: width 280ms ease;
       }
+      .vcs-progress[data-tone="done"] span { background: var(--good); }
+      .vcs-progress[data-tone="error"] span { background: var(--bad); width: 100% !important; }
       .vcs-panel[data-tone="busy"] .vcs-progress span {
-        width: 45% !important;
-        animation: vcs-indeterminate 1.25s ease-in-out infinite;
+        width: 35% !important;
+        animation: vcs-indeterminate 1.6s ease-in-out infinite;
       }
-      .vcs-label {
-        color: var(--text);
-        font-size: 12px;
-        font-weight: 740;
+
+      .vcs-primary {
+        width: 100%;
+        height: 40px;
+        color: var(--paper);
+        background: var(--sumi);
+        border: 1px solid var(--sumi);
+        border-radius: 999px;
+        font: 650 13px/1 var(--sans);
+        letter-spacing: 0;
+        cursor: pointer;
+        transition: background 180ms ease, color 180ms ease, transform 180ms ease;
+      }
+      .vcs-primary:hover {
+        background: #000000;
+        border-color: #000000;
+        transform: translateY(-1px);
+      }
+      .vcs-panel[data-theme="dark"] .vcs-primary {
+        background: var(--sumi);
+        color: var(--paper);
+      }
+      .vcs-panel[data-theme="dark"] .vcs-primary:hover {
+        background: #ffffff;
+        border-color: #ffffff;
+        color: #0f0f0f;
+      }
+
+      .vcs-track-row {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        align-items: center;
+        gap: 8px;
+        padding-top: 4px;
+        border-top: 1px solid var(--haijiro-soft);
+      }
+      .vcs-track-label {
+        font-size: 11px;
+        color: var(--nezumi);
+        letter-spacing: 0;
+        font-family: var(--sans);
       }
       .vcs-select {
         width: 100%;
         min-width: 0;
-        height: 38px;
-        padding: 0 11px;
-        color: var(--text);
-        background: var(--surface-strong);
-        border: 1px solid var(--line);
+        height: 28px;
+        padding: 0 6px;
+        color: var(--sumi);
+        background: transparent;
+        border: 0;
+        border-bottom: 1px solid var(--haijiro);
+        border-radius: 0;
+        outline: none;
+        font-family: var(--sans);
+        font-size: 12px;
+      }
+      .vcs-select:focus { border-bottom-color: var(--rikyu); }
+
+      .vcs-details {
+        border: 0;
+        border-top: 1px solid var(--haijiro-soft);
+        padding-top: 8px;
+        background: transparent;
+      }
+      .vcs-details summary {
+        padding: 4px 0;
+        color: var(--sumi-soft);
+        font: 550 12px/1.5 var(--sans);
+        letter-spacing: 0;
+        cursor: pointer;
+        list-style: none;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .vcs-details summary::-webkit-details-marker { display: none; }
+      .vcs-details summary::after {
+        content: "＋";
+        color: var(--nezumi);
+        font-size: 12px;
+        line-height: 1;
+        font-weight: 400;
+        transition: transform 200ms ease;
+      }
+      .vcs-details[open] summary::after { content: "－"; }
+      .vcs-details summary:hover { color: var(--sumi); }
+
+      .vcs-textarea {
+        display: block;
+        width: 100%;
+        min-height: 110px;
+        margin-top: 8px;
+        padding: 10px;
+        resize: vertical;
+        color: var(--sumi);
+        background: var(--washi);
+        border: 1px solid var(--haijiro);
         border-radius: 10px;
         outline: none;
+        font: 12px/1.7 var(--sans);
       }
-      .vcs-select:focus,
-      .vcs-textarea:focus {
-        border-color: rgba(14, 159, 154, 0.62);
-        box-shadow: 0 0 0 3px rgba(14, 159, 154, 0.12);
+      .vcs-textarea:focus { border-color: var(--rikyu); }
+
+      .vcs-result {
+        display: grid;
+        gap: 10px;
+        padding-top: 12px;
+        border-top: 1px solid var(--sumi);
+        margin-top: 4px;
       }
-      .vcs-meta span {
+      .vcs-result[hidden] { display: none; }
+
+      .vcs-result-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .vcs-result-title {
+        font: 650 13px/1 var(--sans);
+        letter-spacing: 0;
+        color: var(--sumi);
+      }
+
+      #vcs-summary {
+        color: var(--sumi);
+        background: transparent;
+        max-height: 360px;
+        overflow: auto;
+        font: 13px/1.85 var(--sans);
+        letter-spacing: 0;
+      }
+      #vcs-summary h3, #vcs-summary h4 {
+        margin: 16px 0 6px;
+        font: 650 13px/1.5 var(--sans);
+        letter-spacing: 0;
+        color: var(--sumi);
+        padding-bottom: 4px;
+        border-bottom: 1px solid var(--haijiro-soft);
+      }
+      #vcs-summary h3:first-child, #vcs-summary h4:first-child { margin-top: 0; }
+      #vcs-summary p { margin: 0 0 10px; color: var(--sumi-soft); }
+      #vcs-summary ul { margin: 0 0 10px; padding-left: 18px; color: var(--sumi-soft); }
+      #vcs-summary li { margin-bottom: 4px; }
+
+      .vcs-seal-collapsed {
+        display: none;
+        width: 112px;
+        height: 36px;
+        padding: 0 14px;
+        color: var(--paper);
+        background: var(--shu);
+        border: 0;
+        border-radius: 999px;
+        cursor: pointer;
+        font: 650 12px/1 var(--sans);
+        letter-spacing: 0;
+        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.14);
+        transition: opacity 180ms ease, transform 180ms ease, box-shadow 180ms ease;
+      }
+      .vcs-seal-collapsed:hover {
+        opacity: 0.92;
+        transform: translateY(-1px);
+        box-shadow: 0 14px 30px rgba(0, 0, 0, 0.18);
+      }
+      .vcs-seal-char {
         display: block;
+        transform: translateY(0.5px);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
       }
-      .vcs-details {
-        border: 1px solid var(--line);
-        border-radius: 12px;
-        background: var(--bg);
-        transition: border-color 160ms ease, background 160ms ease;
-      }
-      .vcs-details[open] {
-        border-color: var(--line-strong);
-        background: rgba(255, 255, 255, 0.42);
-      }
-      .vcs-details summary {
-        padding: 10px 12px;
-        color: var(--text);
-        font-size: 12.5px;
-        font-weight: 730;
-        cursor: pointer;
-        list-style: none;
-      }
-      .vcs-details summary::-webkit-details-marker { display: none; }
-      .vcs-details summary::after {
-        content: "";
-        float: right;
-        width: 8px;
-        height: 8px;
-        margin-top: 5px;
-        border-right: 1.8px solid var(--muted);
-        border-bottom: 1.8px solid var(--muted);
-        transform: rotate(45deg);
-        transition: transform 160ms ease;
-      }
-      .vcs-details[open] summary::after {
-        transform: rotate(225deg) translate(-3px, -3px);
-      }
-      .vcs-textarea {
-        display: block;
-        width: calc(100% - 20px);
-        min-height: 120px;
-        margin: 0 10px 10px;
-        padding: 10px;
-        resize: vertical;
-        color: var(--text);
-        background: var(--surface-strong);
-        border: 1px solid var(--line);
-        border-radius: 10px;
-        outline: none;
-        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      }
-      .vcs-result {
-        display: grid;
-        gap: 10px;
-        border-top: 1px solid var(--line);
-        padding-top: 12px;
-        animation: vcs-result-in 260ms ease;
-      }
-      .vcs-result[hidden] { display: none; }
-      .vcs-result-head {
-        justify-content: space-between;
-        font-weight: 760;
-      }
-      #vcs-summary {
-        color: var(--text);
-        background: var(--surface-strong);
-        border: 1px solid var(--line);
-        border-radius: 12px;
-        padding: 13px;
-        max-height: 340px;
-        overflow: auto;
-        box-shadow: inset 0 1px 0 rgba(255,255,255,.42);
-      }
-      #vcs-summary h3, #vcs-summary h4 {
-        margin: 13px 0 7px;
-        font-size: 14px;
-        line-height: 1.35;
-      }
-      #vcs-summary p {
-        margin: 0 0 10px;
-      }
-      #vcs-summary ul {
-        margin: 0 0 10px;
-        padding-left: 18px;
-      }
-      .vcs-collapsed-tab { display: none; }
+
       .vcs-panel.is-collapsed {
         width: auto;
-        border-radius: 999px;
         background: transparent;
-        border-color: transparent;
-        box-shadow: none;
-        animation: vcs-tab-in 220ms ease;
+        border: 0;
+        overflow: visible;
       }
       .vcs-panel.is-collapsed .vcs-header,
       .vcs-panel.is-collapsed .vcs-body {
         display: none;
       }
-      .vcs-panel.is-collapsed .vcs-collapsed-tab {
-        display: block;
+      .vcs-panel.is-collapsed .vcs-seal-collapsed {
+        display: grid;
+        place-items: center;
       }
-      .vcs-collapsed-tab button {
-        height: 42px;
-        padding: 0 17px;
-        color: #fff;
-        background: linear-gradient(135deg, var(--primary), var(--cyan));
-        border: 0;
-        border-radius: 999px;
-        font-weight: 760;
-        cursor: pointer;
-        box-shadow: 0 16px 34px rgba(91, 95, 245, 0.36);
+      .vcs-panel.is-floating.is-collapsed {
+        top: 84px;
+        right: 20px;
       }
-      @keyframes vcs-panel-in {
-        from { opacity: 0; transform: translate3d(10px, -8px, 0) scale(.985); }
-        to { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
-      }
-      @keyframes vcs-result-in {
-        from { opacity: 0; transform: translateY(8px); }
-        to { opacity: 1; transform: translateY(0); }
-      }
-      @keyframes vcs-tab-in {
-        from { opacity: .35; transform: translateX(8px) scale(.96); }
-        to { opacity: 1; transform: translateX(0) scale(1); }
-      }
-      @keyframes vcs-shine {
-        0%, 52% { transform: translateX(-120%); }
-        72%, 100% { transform: translateX(120%); }
-      }
+
       @keyframes vcs-indeterminate {
-        0% { transform: translateX(-85%); }
-        52% { transform: translateX(80%); }
-        100% { transform: translateX(180%); }
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(280%); }
       }
+
+      @keyframes vcs-spin {
+        100% { transform: rotate(360deg); }
+      }
+
       @media (prefers-reduced-motion: reduce) {
-        .vcs-panel,
-        .vcs-result,
-        .vcs-primary-glow,
-        .vcs-panel[data-tone="busy"] .vcs-progress span {
-          animation: none;
-        }
-        .vcs-primary,
-        .vcs-icon-button,
-        .vcs-tool-button {
-          transition: none;
-        }
+        .vcs-panel[data-tone="busy"] .vcs-progress span { animation: none; }
+        .vcs-icon-button.is-spinning svg { animation: none; }
+        .vcs-primary, .vcs-icon-button, .vcs-tool-button, .vcs-seal-collapsed { transition: none; }
       }
-      @media (max-width: 720px) {
-        .vcs-panel {
+
+      @media (max-width: 1100px) {
+        .vcs-panel.is-floating {
           top: auto;
-          right: 10px;
-          bottom: 10px;
-          width: calc(100vw - 20px);
-          max-height: min(78vh, 680px);
-        }
-        .vcs-body {
-          max-height: calc(78vh - 66px);
+          right: 16px;
+          bottom: 16px;
+          width: min(360px, calc(100vw - 32px));
         }
       }
     `;

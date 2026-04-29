@@ -272,6 +272,46 @@ function profilePreset(name) {
       temperature: 0.2,
       maxTokens: 4096
     },
+    kimi: {
+      id: "kimi",
+      name: "Kimi (Moonshot)",
+      provider: "openai-compatible",
+      endpoint: "https://api.moonshot.cn/v1/chat/completions",
+      apiKey: "",
+      model: "moonshot-v1-32k",
+      temperature: 0.2,
+      maxTokens: 4096
+    },
+    qwen: {
+      id: "qwen",
+      name: "通义千问",
+      provider: "openai-compatible",
+      endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+      apiKey: "",
+      model: "qwen-plus",
+      temperature: 0.2,
+      maxTokens: 4096
+    },
+    glm: {
+      id: "glm",
+      name: "智谱 GLM",
+      provider: "openai-compatible",
+      endpoint: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      apiKey: "",
+      model: "glm-4-plus",
+      temperature: 0.2,
+      maxTokens: 4096
+    },
+    mimo: {
+      id: "mimo",
+      name: "小米 MiMo (本地)",
+      provider: "openai-compatible",
+      endpoint: "http://localhost:11434/v1/chat/completions",
+      apiKey: "",
+      model: "mimo",
+      temperature: 0.2,
+      maxTokens: 4096
+    },
     ollama: {
       id: "ollama",
       name: "Ollama Local",
