@@ -64,7 +64,10 @@
       normalizeTranscriptPanelText,
       cleanTranscriptSegmentContent,
       transcriptMatchesTrackLanguage,
-      detectTranscriptLanguageFamily
+      detectTranscriptLanguageFamily,
+      detectPlatform,
+      shouldShowPanel,
+      isYouTubeShortsPage
     };
   } else {
     init();
@@ -245,7 +248,7 @@
   }
 
   function shouldShowPanel() {
-    return Boolean(detectPlatform());
+    return !isYouTubeShortsPage() && Boolean(detectPlatform());
   }
 
   function maybeMount(force = false) {
@@ -276,6 +279,7 @@
     if (root?.parentElement) {
       root.remove();
     }
+    removeYouTubeShortsEmbedTarget();
     clearTimeout(transcriptPanelCloseTimer);
     resetSummaryStream();
     endYouTubeTranscriptProbe();
@@ -308,9 +312,6 @@
   function findEmbedTarget() {
     const host = location.hostname.replace(/^www\./, "");
     if (host.includes("youtube.com")) {
-      if (isYouTubeShortsPage()) {
-        return findYouTubeShortsEmbedTarget();
-      }
       return document.querySelector("#secondary-inner")
         || document.querySelector("#secondary")
         || document.documentElement;
@@ -441,6 +442,10 @@
       && location.pathname.startsWith("/shorts/");
   }
 
+  function removeYouTubeShortsEmbedTarget() {
+    document.getElementById(SHORTS_EMBED_TARGET_ID)?.remove();
+  }
+
   function getRootInsertBefore(target) {
     if (!target || target === document.documentElement) {
       return null;
@@ -566,7 +571,7 @@
         return { id: "youtube", name: "YouTube", kind: "youtube" };
       }
       if (location.pathname.startsWith("/shorts/")) {
-        return { id: "youtube", name: "YouTube Shorts", kind: "youtube" };
+        return null;
       }
       return null;
     }

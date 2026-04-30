@@ -55,7 +55,10 @@ const {
   normalizeTranscriptPanelText,
   cleanTranscriptSegmentContent,
   transcriptMatchesTrackLanguage,
-  detectTranscriptLanguageFamily
+  detectTranscriptLanguageFamily,
+  detectPlatform,
+  shouldShowPanel,
+  isYouTubeShortsPage
 } = context.__VCS_TEST_HOOKS__;
 
 assert.equal(
@@ -121,6 +124,16 @@ assert.equal(transcriptMatchesTrackLanguage({ language: "zh-Hant", label: "中�
 assert.equal(transcriptMatchesTrackLanguage({ language: "zh-Hans", label: "中文（简体）" }, simplifiedTranscript), true);
 assert.equal(transcriptMatchesTrackLanguage({ language: "zh-Hans", label: "中文（简体）" }, traditionalTranscript), false);
 
+setLocation("https://www.youtube.com/watch?v=test-video");
+assert.equal(isYouTubeShortsPage(), false);
+assert.equal(JSON.stringify(detectPlatform()), JSON.stringify({ id: "youtube", name: "YouTube", kind: "youtube" }));
+assert.equal(shouldShowPanel(), true);
+
+setLocation("https://www.youtube.com/shorts/test-short");
+assert.equal(isYouTubeShortsPage(), true);
+assert.equal(detectPlatform(), null);
+assert.equal(shouldShowPanel(), false);
+
 function textSegment(text) {
   return {
     innerText: text,
@@ -132,6 +145,10 @@ function textSegment(text) {
       return null;
     }
   };
+}
+
+function setLocation(url) {
+  context.location = new URL(url);
 }
 
 function structuredSegment(time, content) {
