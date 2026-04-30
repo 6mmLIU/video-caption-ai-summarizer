@@ -118,10 +118,10 @@ try {
     Boolean(document.querySelector("#vcs-root")?.shadowRoot?.querySelector(".vcs-panel"))
   `, 15000);
   await waitForExpression(videoPage, `
-    {
+    (() => {
       const status = document.querySelector("#vcs-root")?.shadowRoot?.querySelector("#vcs-status")?.textContent || "";
-      status.includes("已发现") || status.includes("粘贴") || status.includes("失败");
-    }
+      return status.includes("已发现") || status.includes("粘贴") || status.includes("失败");
+    })()
   `, 15000);
 
   const panelState = await evaluate(videoPage, `
@@ -131,7 +131,7 @@ try {
       status: shadow.querySelector("#vcs-status")?.textContent || "",
       platform: shadow.querySelector(".vcs-chip")?.textContent || "",
       track: shadow.querySelector("#vcs-track")?.selectedOptions?.[0]?.textContent || "",
-      title: shadow.querySelector(".vcs-meta span")?.textContent || ""
+      title: shadow.querySelector(".vcs-meta-title")?.textContent || ""
     };
   `);
 

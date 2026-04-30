@@ -49,9 +49,11 @@
   let shadow = null;
   let lastUrl = location.href;
   let lastPageKey = getPageKey();
+  let trustedTitlePageKey = "";
   let refreshRunId = 0;
   let transcriptRunId = 0;
   let refreshTimer = null;
+  let titleSyncTimer = null;
   let statusSwapTimer = null;
   let previewPromise = null;
   let transcriptCache = new Map();
@@ -74,6 +76,11 @@
       setTestTracks: (tracks) => {
         state.tracks = tracks;
       },
+      setTestPlatform: (platform) => {
+        state.platform = platform;
+      },
+      getVideoTitle,
+      getStatusPayload,
       detectPlatform,
       shouldShowPanel,
       isYouTubeShortsPage
@@ -101,15 +108,9 @@
     observeNavigation();
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (message?.type === "VCS_GET_STATUS") {
-        sendResponse({
-          ok: true,
-          payload: {
-            mounted: state.mounted,
-            platform: state.platform?.name || "Unknown",
-            tracks: state.tracks.length,
-            title: state.title
-          }
-        });
+        getStatusPayload()
+          .then((payload) => sendResponse({ ok: true, payload }))
+          .catch((error) => sendResponse({ ok: false, error: error.message }));
         return true;
       }
 
@@ -186,6 +187,21 @@
     return normalizeSettings(result.vcsSettings);
   }
 
+  async function getStatusPayload() {
+    if (hasPageContextChanged()) {
+      scheduleRefresh();
+    }
+    syncCurrentTitleFromPage({ render: false });
+    await syncTrustedTitleFromNetwork({ render: false });
+
+    return {
+      mounted: state.mounted,
+      platform: (state.platform || detectPlatform())?.name || "Unknown",
+      tracks: state.tracks.length,
+      title: state.title
+    };
+  }
+
   function observeNavigation() {
     const observer = new MutationObserver(() => {
       if (hasPageContextChanged()) {
@@ -193,6 +209,7 @@
       } else if (!state.mounted && shouldShowPanel()) {
         scheduleRefresh();
       } else if (state.mounted && shouldShowPanel()) {
+        syncCurrentTitleFromPage({ render: true });
         placeRoot();
       }
     });
@@ -251,6 +268,7 @@
         if (wasMounted) {
           refreshTracks();
         }
+        scheduleTitleSync();
       } else {
         unmount();
       }
@@ -290,6 +308,7 @@
       root.remove();
     }
     removeYouTubeShortsEmbedTarget();
+    clearTimeout(titleSyncTimer);
     clearTimeout(transcriptPanelCloseTimer);
     resetSummaryStream();
     endYouTubeTranscriptProbe();
@@ -511,7 +530,7 @@
     if (state.platform.kind === "youtube") {
       scheduleCloseYouTubeTranscriptPanel({ attempts: 4, delayMs: 120 });
     }
-    state.title = getVideoTitle();
+    syncCurrentTitleFromPage({ render: false });
     state.tracks = [];
     state.selectedTrackId = "";
     state.transcript = "";
@@ -527,6 +546,7 @@
       if (!isCurrentRefresh(refreshId, pageKey)) {
         return;
       }
+      syncCurrentTitleFromPage({ render: false });
       state.tracks = tracks;
       state.selectedTrackId = chooseTrackId(tracks, previousTrackKey);
       state.status = tracks.length
@@ -550,6 +570,7 @@
       if (state.tracks.length) {
         hydrateTranscriptPreview({ silent: true, pageKey }).catch(() => {});
       }
+      scheduleTitleSync({ pageKey });
     }
   }
 
@@ -573,6 +594,68 @@
 
   function delay(ms) {
     return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+  }
+
+  function syncCurrentTitleFromPage(options = {}) {
+    const platform = options.platform || state.platform || detectPlatform();
+    const trustedTitle = getTrustedVideoTitle(platform);
+    if (trustedTitle) {
+      return updateStateTitle(trustedTitle, {
+        shouldRender: Boolean(options.render),
+        trusted: true
+      });
+    }
+
+    return updateStateTitle(getVideoTitle(platform), { shouldRender: Boolean(options.render) });
+  }
+
+  function updateStateTitle(title, options = {}) {
+    const cleanTitle = normalizePageTitle(title);
+    if (!cleanTitle) {
+      return state.title;
+    }
+
+    if (!options.trusted && trustedTitlePageKey === getPageKey() && state.title && state.title !== cleanTitle) {
+      return state.title;
+    }
+
+    if (state.title === cleanTitle) {
+      if (options.trusted) {
+        trustedTitlePageKey = getPageKey();
+      }
+      return state.title;
+    }
+
+    state.title = cleanTitle;
+    if (options.trusted) {
+      trustedTitlePageKey = getPageKey();
+    }
+    if (options.shouldRender && state.mounted) {
+      render();
+    }
+    return state.title;
+  }
+
+  function scheduleTitleSync(options = {}) {
+    clearTimeout(titleSyncTimer);
+    const pageKey = options.pageKey || getPageKey();
+    let attempts = Number(options.attempts || 6);
+    const delayMs = Number(options.delayMs || 500);
+
+    const syncOnce = async () => {
+      if (pageKey !== getPageKey()) {
+        return;
+      }
+
+      syncCurrentTitleFromPage({ render: true });
+      await syncTrustedTitleFromNetwork({ pageKey, render: true });
+      attempts -= 1;
+      if (attempts > 0) {
+        titleSyncTimer = setTimeout(syncOnce, delayMs);
+      }
+    };
+
+    titleSyncTimer = setTimeout(syncOnce, delayMs);
   }
 
   function detectPlatform() {
@@ -695,6 +778,10 @@
     const response = getCurrentYouTubePlayerResponse(videoId)
       || await fetchYouTubePlayerResponse(videoId)
       || getJsonAssignment("ytInitialPlayerResponse", (value) => isYouTubePlayerResponseForVideo(value, videoId));
+    updateStateTitle(getYouTubeTitleFromPlayerResponse(response, videoId), {
+      shouldRender: false,
+      trusted: true
+    });
     let captionTracks = getYouTubeCaptionTracksFromResponse(response, videoId);
 
     if (!captionTracks.length) {
@@ -1973,6 +2060,7 @@
 
   async function summarize() {
     try {
+      syncCurrentTitleFromPage({ render: true });
       setStatus(t("content.status.preparing"), "busy");
       const transcript = await hydrateTranscriptPreview();
       const streamId = `summary-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -2847,21 +2935,104 @@
     return profile.model || profile.name || "AI model";
   }
 
-  function getVideoTitle() {
-    if (state.platform?.kind === "youtube") {
-      return document.querySelector("h1.ytd-watch-metadata yt-formatted-string")?.textContent?.trim()
-        || document.querySelector("h1.title")?.textContent?.trim()
-        || document.title.replace(/ - YouTube$/, "").trim();
+  function getVideoTitle(platform = state.platform || detectPlatform()) {
+    if (platform?.kind === "youtube") {
+      return getTrustedVideoTitle(platform)
+        || getYouTubeDomTitle()
+        || normalizePageTitle(document.title.replace(/ - YouTube$/, ""));
     }
 
-    if (state.platform?.kind === "bilibili") {
-      const initialState = getJsonAssignment("__INITIAL_STATE__") || {};
-      return initialState.videoData?.title
-        || document.querySelector(".video-title")?.textContent?.trim()
-        || document.title.replace(/_哔哩哔哩_bilibili$/, "").trim();
+    if (platform?.kind === "bilibili") {
+      return getBilibiliDomTitle()
+        || getBilibiliInitialStateTitle()
+        || normalizePageTitle(document.title.replace(/_哔哩哔哩_bilibili$/, ""));
     }
 
-    return document.querySelector("h1")?.textContent?.trim() || document.title.trim();
+    return normalizePageTitle(document.querySelector("h1")?.textContent || document.title);
+  }
+
+  function getTrustedVideoTitle(platform = state.platform || detectPlatform()) {
+    if (platform?.kind === "youtube") {
+      const videoId = getYouTubeVideoId();
+      return getYouTubeTitleFromPlayerResponse(getCurrentYouTubePlayerResponse(videoId), videoId);
+    }
+
+    return "";
+  }
+
+  async function syncTrustedTitleFromNetwork(options = {}) {
+    const platform = options.platform || state.platform || detectPlatform();
+    if (platform?.kind !== "youtube") {
+      return state.title;
+    }
+
+    const pageKey = options.pageKey || getPageKey();
+    if (trustedTitlePageKey === pageKey && state.title) {
+      return state.title;
+    }
+
+    const videoId = getYouTubeVideoId();
+    if (!videoId) {
+      return state.title;
+    }
+
+    try {
+      const response = await fetchYouTubePlayerResponse(videoId);
+      if (pageKey !== getPageKey()) {
+        return state.title;
+      }
+      return updateStateTitle(getYouTubeTitleFromPlayerResponse(response, videoId), {
+        shouldRender: Boolean(options.render),
+        trusted: true
+      });
+    } catch (_error) {
+      return state.title;
+    }
+  }
+
+  function getYouTubeTitleFromPlayerResponse(response, videoId = getYouTubeVideoId()) {
+    if (!isYouTubePlayerResponseForVideo(response, videoId)) {
+      return "";
+    }
+
+    return normalizePageTitle(
+      response?.videoDetails?.title
+      || getLabelText(response?.microformat?.playerMicroformatRenderer?.title)
+    );
+  }
+
+  function getYouTubeDomTitle() {
+    return normalizePageTitle(
+      document.querySelector("h1.ytd-watch-metadata yt-formatted-string")?.textContent
+      || document.querySelector("h1.title")?.textContent
+    );
+  }
+
+  function getBilibiliDomTitle() {
+    return normalizePageTitle(
+      document.querySelector(".video-title")?.textContent
+      || document.querySelector("h1.video-title")?.textContent
+      || document.querySelector("h1")?.textContent
+    );
+  }
+
+  function getBilibiliInitialStateTitle() {
+    const initialState = getJsonAssignment("__INITIAL_STATE__") || {};
+    const videoData = initialState.videoData || initialState.videoInfo || {};
+    const currentBvid = getBvidFromUrl();
+    const stateBvid = videoData.bvid || initialState.bvid || "";
+
+    if (currentBvid && stateBvid && currentBvid !== stateBvid) {
+      return "";
+    }
+
+    return normalizePageTitle(videoData.title);
+  }
+
+  function normalizePageTitle(title) {
+    return String(title || "")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   function getJsonAssignment(name, validator = null) {

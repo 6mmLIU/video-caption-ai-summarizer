@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Video Caption AI Summarizer",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqSQyPns/EmOmoCxtWexa4Tl9ITXv/UYA08F9Os2EpLvXhVxc8bSGwAbYfTi/KiHPJtZY1EZzC0Hs2ahEdZcHOzZQfMMwIWJ7zec7mk6iwy0BRAVZvtrOkDQzGdmvDtGJ4yh3K/jXN9jfLgBiCKQOySy3K3RSljxolQnQu/ItN6JMaau9Q9CFZjffRPnViQQuH1b9kTVfqH4aaYmbghmcojNSTKrtwXdzPIeNx+V0lLOJjx//ZRHWbw+t+0Gfy7sb43YmcaJ9PPPhDur3JPlKDGNWqcTUliPMd1WKHpBVrnh3OV33f/SVP9BW6ZOOyhuiyUC0lxvolnpJrSmflH2AwwIDAQAB",
   "description": "Summarize captions from YouTube, Bilibili, and other video sites with your own AI API.",
   "icons": {
@@ -55,7 +55,9 @@
         "*://youtu.be/*",
         "*://*.bilibili.com/*",
         "*://*.vimeo.com/*",
-        "*://*.ted.com/*"
+        "*://*.ted.com/*",
+        "http://localhost/*",
+        "http://127.0.0.1/*"
       ],
       "js": [
         "src/i18n.js",

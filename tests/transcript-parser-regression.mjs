@@ -17,6 +17,7 @@ const context = {
     }
   },
   document: {
+    title: "",
     documentElement: {
       dataset: {},
       appendChild() {}
@@ -59,6 +60,8 @@ const {
   getTrackLanguageFamily,
   getYouTubeTranslationSourceTracks,
   setTestTracks,
+  setTestPlatform,
+  getVideoTitle,
   detectPlatform,
   shouldShowPanel,
   isYouTubeShortsPage
@@ -150,6 +153,42 @@ setLocation("https://www.youtube.com/shorts/test-short");
 assert.equal(isYouTubeShortsPage(), true);
 assert.equal(detectPlatform(), null);
 assert.equal(shouldShowPanel(), false);
+
+setLocation("https://www.youtube.com/watch?v=current-video");
+setTestPlatform({ id: "youtube", name: "YouTube", kind: "youtube" });
+context.document.title = "Previous Video - YouTube";
+context.document.querySelector = (selector) => (
+  selector.includes("h1") ? { textContent: "Previous Video" } : null
+);
+context.ytInitialPlayerResponse = {
+  videoDetails: {
+    videoId: "current-video",
+    title: "Current Video"
+  }
+};
+assert.equal(getVideoTitle(), "Current Video");
+
+context.ytInitialPlayerResponse = {
+  videoDetails: {
+    videoId: "previous-video",
+    title: "Previous Video"
+  }
+};
+assert.equal(getVideoTitle(), "Previous Video");
+
+setLocation("https://www.bilibili.com/video/BVNEW");
+setTestPlatform({ id: "bilibili", name: "Bilibili", kind: "bilibili" });
+context.document.title = "Current Bilibili_哔哩哔哩_bilibili";
+context.document.scripts = [{
+  textContent: 'window.__INITIAL_STATE__={"videoData":{"bvid":"BVOLD","title":"Old Bilibili"}};'
+}];
+context.document.querySelector = (selector) => (
+  selector.includes("video-title") ? { textContent: "Current Bilibili" } : null
+);
+assert.equal(getVideoTitle(), "Current Bilibili");
+
+context.document.querySelector = () => null;
+assert.equal(getVideoTitle(), "Current Bilibili");
 
 function textSegment(text) {
   return {
