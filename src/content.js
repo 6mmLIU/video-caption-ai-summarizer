@@ -67,6 +67,7 @@
   if (globalThis.__VCS_TEST_MODE__) {
     globalThis.__VCS_TEST_HOOKS__ = {
       parseYouTubeTranscriptSegment,
+      parseYouTubeTimedTextResponse,
       normalizeTranscriptPanelText,
       cleanTranscriptSegmentContent,
       transcriptMatchesTrackLanguage,
@@ -3319,15 +3320,97 @@
       // Fall back to XML parsing below.
     }
 
-    const xml = new DOMParser().parseFromString(text, "text/xml");
-    const lines = [...xml.querySelectorAll("text")]
-      .map((node) => {
-        const start = formatSeconds(Number(node.getAttribute("start")) || 0);
-        const content = node.textContent.replace(/\s+/g, " ").trim();
-        return content ? `[${start}] ${content}` : "";
+    const timedTextLines = [
+      ...parseYouTubeSrv3TranscriptLines(text),
+      ...parseYouTubeLegacyTimedTextLines(text)
+    ];
+    if (timedTextLines.length) {
+      return timedTextLines.join("\n");
+    }
+
+    if (typeof DOMParser === "undefined") {
+      return "";
+    }
+
+    try {
+      const xml = new DOMParser().parseFromString(text, "text/xml");
+      const lines = [...xml.querySelectorAll("text")]
+        .map((node) => {
+          const start = formatSeconds(Number(node.getAttribute("start")) || 0);
+          const content = node.textContent.replace(/\s+/g, " ").trim();
+          return content ? `[${start}] ${content}` : "";
+        })
+        .filter(Boolean);
+      return lines.join("\n");
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function parseYouTubeSrv3TranscriptLines(text) {
+    return [...String(text || "").matchAll(/<p\b([^>]*)>([\s\S]*?)<\/p>/gi)]
+      .map((match) => {
+        const startMs = Number(getXmlAttributeValue(match[1], "t")) || 0;
+        const content = cleanXmlCueContent(match[2]);
+        return content ? `[${formatSeconds(startMs / 1000)}] ${content}` : "";
       })
       .filter(Boolean);
-    return lines.join("\n");
+  }
+
+  function parseYouTubeLegacyTimedTextLines(text) {
+    return [...String(text || "").matchAll(/<text\b([^>]*)>([\s\S]*?)<\/text>/gi)]
+      .map((match) => {
+        const start = Number(getXmlAttributeValue(match[1], "start")) || 0;
+        const content = cleanXmlCueContent(match[2]);
+        return content ? `[${formatSeconds(start)}] ${content}` : "";
+      })
+      .filter(Boolean);
+  }
+
+  function getXmlAttributeValue(attributes, name) {
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = String(attributes || "").match(new RegExp(`\\b${escapedName}\\s*=\\s*(['"])(.*?)\\1`, "i"));
+    return match?.[2] || "";
+  }
+
+  function cleanXmlCueContent(value) {
+    return decodeXmlEntities(
+      String(value || "")
+        .replace(/<[^>]+>/g, "")
+        .replace(/\s+/g, " ")
+    ).trim();
+  }
+
+  function decodeXmlEntities(value) {
+    const namedEntities = {
+      amp: "&",
+      lt: "<",
+      gt: ">",
+      quot: "\"",
+      apos: "'"
+    };
+
+    return String(value || "").replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (entity, name) => {
+      const normalizedName = name.toLowerCase();
+      if (normalizedName.startsWith("#x")) {
+        return decodeXmlCodePoint(entity, parseInt(normalizedName.slice(2), 16));
+      }
+      if (normalizedName.startsWith("#")) {
+        return decodeXmlCodePoint(entity, parseInt(normalizedName.slice(1), 10));
+      }
+      return namedEntities[normalizedName] || entity;
+    });
+  }
+
+  function decodeXmlCodePoint(fallback, codePoint) {
+    if (!Number.isFinite(codePoint)) {
+      return fallback;
+    }
+    try {
+      return String.fromCodePoint(codePoint);
+    } catch (_error) {
+      return fallback;
+    }
   }
 
   function parseBilibiliTranscript(text) {
@@ -3371,7 +3454,20 @@
       }
     }
 
-    return lines.join("\n") || clean;
+    if (lines.length) {
+      return lines.join("\n");
+    }
+
+    return looksLikeMarkupDocument(clean) ? "" : clean.trim();
+  }
+
+  function looksLikeMarkupDocument(text) {
+    const value = String(text || "").trim();
+    return /^<\?xml\b/i.test(value)
+      || /^<transcript\b/i.test(value)
+      || /^<timedtext\b/i.test(value)
+      || /^<window\b/i.test(value)
+      || /<(?:p|text)\b[^>]*(?:\bt=|\bstart=)/i.test(value);
   }
 
   function parseTimestamp(value) {

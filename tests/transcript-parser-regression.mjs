@@ -53,6 +53,7 @@ vm.runInContext(source, context, { filename: "src/content.js" });
 
 const {
   parseYouTubeTranscriptSegment,
+  parseYouTubeTimedTextResponse,
   normalizeTranscriptPanelText,
   cleanTranscriptSegmentContent,
   transcriptMatchesTrackLanguage,
@@ -111,6 +112,38 @@ assert.equal(
 assert.equal(
   cleanTranscriptSegmentContent("11 seconds We will come to care today.", "0:11"),
   "We will come to care today."
+);
+
+assert.equal(
+  parseYouTubeTimedTextResponse(`
+    <?xml version="1.0" encoding="utf-8" ?>
+    <timedtext>
+      <body>
+        <p t="64700" d="866">這些農民協會呢</p>
+        <p t="65566" d="1967"><s>就變成了</s><s>西腊新的基層組織</s></p>
+        <p t="67533" d="2200">農民協會舉行了&#x5BA3;&#x50B3;系列的吐苦水</p>
+      </body>
+    </timedtext>
+  `, "srv3"),
+  [
+    "[1:04] 這些農民協會呢",
+    "[1:05] 就變成了西腊新的基層組織",
+    "[1:07] 農民協會舉行了宣傳系列的吐苦水"
+  ].join("\n")
+);
+
+assert.equal(
+  parseYouTubeTimedTextResponse(`
+    <transcript>
+      <text start="7.5" dur="1.2">Tom &amp; team explain captions.</text>
+    </transcript>
+  `, ""),
+  "[0:07] Tom & team explain captions."
+);
+
+assert.equal(
+  parseYouTubeTimedTextResponse("<timedtext><body></body></timedtext>", "srv3"),
+  ""
 );
 
 const bilingualTranscript = [
