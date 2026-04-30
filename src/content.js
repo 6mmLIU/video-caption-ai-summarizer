@@ -11,6 +11,8 @@
   const MAX_YOUTUBE_TIMEDTEXT_SOURCE_URLS = 3;
   const MAX_YOUTUBE_TRANSLATION_SOURCE_TRACKS = 2;
   const YOUTUBE_TIMEDTEXT_FETCH_TIMEOUT_MS = 4500;
+  const TRANSCRIPT_AUTO_SCROLL_IDLE_MS = 3500;
+  const TRANSCRIPT_PROGRAMMATIC_SCROLL_GRACE_MS = 1200;
   const DEFAULT_SETTINGS = {
     settingsVersion: 4,
     theme: "auto",
@@ -61,6 +63,10 @@
   let activeVideo = null;
   let lastActiveTranscriptIndex = -1;
   let transcriptPanelCloseTimer = null;
+  let transcriptUserInteracting = false;
+  let transcriptAutoScrollPausedUntil = 0;
+  let transcriptProgrammaticScrollUntil = 0;
+  let transcriptAutoScrollResumeTimer = null;
   let summaryScrollFrame = null;
   let summaryTargetText = "";
 
@@ -315,6 +321,7 @@
     endYouTubeTranscriptProbe();
     removePagePolish();
     unbindVideoSync();
+    resetTranscriptAutoScrollPause();
     state.mounted = false;
     state.embedded = false;
     state.platform = null;
@@ -2592,7 +2599,9 @@
       event.stopPropagation();
       copySummary();
     });
-    shadow.querySelector("#vcs-preview")?.addEventListener("click", handleTranscriptClick);
+    const preview = shadow.querySelector("#vcs-preview");
+    preview?.addEventListener("click", handleTranscriptClick);
+    bindTranscriptPreviewScrollControls(preview);
   }
 
   function renderTranscriptPreview(transcript) {
@@ -2659,6 +2668,93 @@
     }
 
     seekVideoTo(seconds);
+  }
+
+  function bindTranscriptPreviewScrollControls(preview) {
+    if (!preview) {
+      return;
+    }
+
+    preview.addEventListener("scroll", handleTranscriptPreviewScroll, { passive: true });
+    preview.addEventListener("wheel", pauseTranscriptAutoScroll, { passive: true });
+    preview.addEventListener("touchstart", beginTranscriptUserInteraction, { passive: true });
+    preview.addEventListener("touchmove", pauseTranscriptAutoScroll, { passive: true });
+    preview.addEventListener("touchend", endTranscriptUserInteraction, { passive: true });
+    preview.addEventListener("touchcancel", endTranscriptUserInteraction, { passive: true });
+    preview.addEventListener("pointerdown", beginTranscriptPointerInteraction);
+    preview.addEventListener("pointermove", handleTranscriptPointerMove);
+    preview.addEventListener("pointerup", endTranscriptUserInteraction);
+    preview.addEventListener("pointercancel", endTranscriptUserInteraction);
+    preview.addEventListener("keydown", handleTranscriptPreviewKeydown);
+  }
+
+  function beginTranscriptPointerInteraction(event) {
+    if (event.pointerType === "mouse" && event.button !== 0) {
+      return;
+    }
+    beginTranscriptUserInteraction();
+  }
+
+  function handleTranscriptPointerMove(event) {
+    if (transcriptUserInteracting || event.buttons) {
+      pauseTranscriptAutoScroll();
+    }
+  }
+
+  function handleTranscriptPreviewKeydown(event) {
+    if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", "Space"].includes(event.code)
+      || event.key === " ") {
+      pauseTranscriptAutoScroll();
+    }
+  }
+
+  function handleTranscriptPreviewScroll() {
+    if (performance.now() < transcriptProgrammaticScrollUntil) {
+      return;
+    }
+    pauseTranscriptAutoScroll();
+  }
+
+  function beginTranscriptUserInteraction() {
+    transcriptUserInteracting = true;
+    pauseTranscriptAutoScroll();
+  }
+
+  function endTranscriptUserInteraction() {
+    transcriptUserInteracting = false;
+    pauseTranscriptAutoScroll();
+  }
+
+  function pauseTranscriptAutoScroll() {
+    const now = performance.now();
+    transcriptAutoScrollPausedUntil = Math.max(
+      transcriptAutoScrollPausedUntil,
+      now + TRANSCRIPT_AUTO_SCROLL_IDLE_MS
+    );
+    scheduleTranscriptAutoScrollResume();
+  }
+
+  function scheduleTranscriptAutoScrollResume() {
+    clearTimeout(transcriptAutoScrollResumeTimer);
+    const delayMs = Math.max(0, transcriptAutoScrollPausedUntil - performance.now()) + 50;
+    transcriptAutoScrollResumeTimer = setTimeout(() => {
+      transcriptAutoScrollResumeTimer = null;
+      transcriptUserInteracting = false;
+      transcriptAutoScrollPausedUntil = 0;
+      syncTranscriptToVideo(true);
+    }, delayMs);
+  }
+
+  function resetTranscriptAutoScrollPause() {
+    clearTimeout(transcriptAutoScrollResumeTimer);
+    transcriptAutoScrollResumeTimer = null;
+    transcriptUserInteracting = false;
+    transcriptAutoScrollPausedUntil = 0;
+    transcriptProgrammaticScrollUntil = 0;
+  }
+
+  function isTranscriptAutoScrollPaused() {
+    return transcriptUserInteracting || performance.now() < transcriptAutoScrollPausedUntil;
   }
 
   function bindVideoSync() {
@@ -2729,6 +2825,7 @@
     }
 
     const currentTime = Number(video.currentTime) || 0;
+    const shouldAutoScroll = !isTranscriptAutoScrollPaused();
     let activeRow = rows[0];
     for (const row of rows) {
       const seconds = Number(row.dataset.seconds);
@@ -2741,6 +2838,11 @@
 
     const activeIndex = Number(activeRow.dataset.index);
     if (!shouldForce && activeIndex === lastActiveTranscriptIndex) {
+      if (shouldAutoScroll && !isElementInsideContainer(activeRow, preview)) {
+        scrollElementInsideContainer(activeRow, preview, {
+          behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
+        });
+      }
       return;
     }
 
@@ -2752,7 +2854,7 @@
     activeRow.setAttribute("aria-current", "true");
     lastActiveTranscriptIndex = activeIndex;
 
-    if (!isElementInsideContainer(activeRow, preview)) {
+    if (shouldAutoScroll && !isElementInsideContainer(activeRow, preview)) {
       scrollElementInsideContainer(activeRow, preview, {
         behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
       });
@@ -2784,6 +2886,7 @@
       return;
     }
 
+    transcriptProgrammaticScrollUntil = performance.now() + TRANSCRIPT_PROGRAMMATIC_SCROLL_GRACE_MS;
     container.scrollTo({
       top: nextScrollTop,
       behavior: options.behavior || "auto"
