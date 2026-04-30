@@ -8,6 +8,9 @@
   const PAGE_STYLE_ID = "vcs-page-polish";
   const SHORTS_EMBED_TARGET_ID = "vcs-shorts-embed-target";
   const AI_MARK_URL = chrome.runtime.getURL("icons/ai-mark.png");
+  const MAX_YOUTUBE_TIMEDTEXT_SOURCE_URLS = 3;
+  const MAX_YOUTUBE_TRANSLATION_SOURCE_TRACKS = 2;
+  const YOUTUBE_TIMEDTEXT_FETCH_TIMEOUT_MS = 4500;
   const DEFAULT_SETTINGS = {
     settingsVersion: 4,
     theme: "auto",
@@ -52,6 +55,7 @@
   let statusSwapTimer = null;
   let previewPromise = null;
   let transcriptCache = new Map();
+  let transcriptLoadPromises = new Map();
   let activeVideo = null;
   let lastActiveTranscriptIndex = -1;
   let transcriptPanelCloseTimer = null;
@@ -65,6 +69,11 @@
       cleanTranscriptSegmentContent,
       transcriptMatchesTrackLanguage,
       detectTranscriptLanguageFamily,
+      getTrackLanguageFamily,
+      getYouTubeTranslationSourceTracks,
+      setTestTracks: (tracks) => {
+        state.tracks = tracks;
+      },
       detectPlatform,
       shouldShowPanel,
       isYouTubeShortsPage
@@ -227,6 +236,7 @@
       transcriptRunId += 1;
       previewPromise = null;
       transcriptCache.clear();
+      transcriptLoadPromises.clear();
       state.tracks = [];
       state.selectedTrackId = "";
       state.transcript = "";
@@ -492,6 +502,7 @@
     transcriptRunId += 1;
     previewPromise = null;
     transcriptCache.clear();
+    transcriptLoadPromises.clear();
     state.platform = detectPlatform() || {
       id: "generic",
       name: "Generic Video",
@@ -956,7 +967,7 @@
     if (!track) {
       const visibleTranscript = getVisibleTranscript();
       if (visibleTranscript) {
-        return visibleTranscript;
+        return normalizeLoadedTranscript(visibleTranscript);
       }
       throw new Error(t("content.error.noCaptions"));
     }
@@ -967,11 +978,32 @@
       return cachedTranscript;
     }
 
-    const transcript = await loadTranscriptForTrack(track);
-    if (cacheKey && transcript) {
-      transcriptCache.set(cacheKey, transcript);
+    const pendingTranscript = cacheKey ? transcriptLoadPromises.get(cacheKey) : null;
+    if (pendingTranscript) {
+      return pendingTranscript;
     }
-    return transcript;
+
+    const transcriptPromise = loadTranscriptForTrack(track)
+      .then((transcript) => {
+        const cleanText = normalizeLoadedTranscript(transcript);
+        if (!cleanText) {
+          throw new Error(t("content.error.noTranscript"));
+        }
+        if (cacheKey) {
+          transcriptCache.set(cacheKey, cleanText);
+        }
+        return cleanText;
+      })
+      .finally(() => {
+        if (cacheKey) {
+          transcriptLoadPromises.delete(cacheKey);
+        }
+      });
+
+    if (cacheKey) {
+      transcriptLoadPromises.set(cacheKey, transcriptPromise);
+    }
+    return transcriptPromise;
   }
 
   async function loadTranscriptForTrack(track) {
@@ -1074,26 +1106,59 @@
     }
   }
 
-  async function fetchYouTubeTranscriptFromSourceUrls(sourceUrls) {
-    const formats = ["json3", "srv3", "vtt", ""];
-    for (const sourceUrl of sourceUrls) {
+  async function fetchYouTubeTranscriptFromSourceUrls(sourceUrls, options = {}) {
+    const formats = options.formats || ["json3", "vtt", "srv3", ""];
+    const maxSources = options.maxSources || MAX_YOUTUBE_TIMEDTEXT_SOURCE_URLS;
+    const timeoutMs = options.timeoutMs || YOUTUBE_TIMEDTEXT_FETCH_TIMEOUT_MS;
+    for (const sourceUrl of uniqueValues(sourceUrls).slice(0, maxSources)) {
       const candidateUrls = buildYouTubeTimedTextUrls(sourceUrl, formats);
-      for (const { url, format } of candidateUrls) {
-        try {
-          const response = await extensionFetch(url);
-          const transcript = format === "vtt"
-            ? parseTextTrack(response.text)
-            : parseYouTubeTranscript(response.text) || parseTextTrack(response.text);
-          if (transcript.trim()) {
-            return transcript.trim();
-          }
-        } catch (_error) {
-          // Try the next runtime URL or format.
-        }
+      const transcript = await fetchFirstYouTubeTranscriptCandidate(candidateUrls, timeoutMs);
+      if (transcript) {
+        return transcript;
       }
     }
 
     return "";
+  }
+
+  async function fetchFirstYouTubeTranscriptCandidate(candidateUrls, timeoutMs) {
+    try {
+      return await Promise.any(candidateUrls.map(({ url, format }) => (
+        extensionFetchWithTimeout(url, timeoutMs)
+          .then((response) => parseYouTubeTimedTextResponse(response.text, format))
+          .then((transcript) => {
+            const cleanText = transcript.trim();
+            if (!cleanText) {
+              throw new Error("Empty YouTube timedtext response.");
+            }
+            return cleanText;
+          })
+      )));
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function parseYouTubeTimedTextResponse(text, format) {
+    return format === "vtt"
+      ? parseTextTrack(text)
+      : parseYouTubeTranscript(text) || parseTextTrack(text);
+  }
+
+  async function extensionFetchWithTimeout(url, timeoutMs) {
+    let timeoutId = null;
+    try {
+      return await Promise.race([
+        extensionFetch(url),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error("Timed out reading YouTube timedtext.")), timeoutMs);
+        })
+      ]);
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
   }
 
   async function loadYouTubeTranslatedTrackTranscript(track) {
@@ -1102,15 +1167,51 @@
       return "";
     }
 
-    const sourceUrls = state.tracks
-      .filter((sourceTrack) => sourceTrack.source === "youtube" && sourceTrack.id !== track.id)
-      .flatMap((sourceTrack) => [
-        sourceTrack.url,
-        ...getYouTubeRuntimeTimedTextUrls(sourceTrack)
-      ])
+    const sourceTracks = getYouTubeTranslationSourceTracks(track);
+    const sourceUrls = [
+      ...sourceTracks.map((sourceTrack) => sourceTrack.url),
+      ...sourceTracks.flatMap((sourceTrack) => getYouTubeRuntimeTimedTextUrls(sourceTrack).slice(0, 1))
+    ]
       .map((url) => addYouTubeTranslationParam(url, targetLanguage));
-    const transcript = await fetchYouTubeTranscriptFromSourceUrls(uniqueValues(sourceUrls));
+    const transcript = await fetchYouTubeTranscriptFromSourceUrls(uniqueValues(sourceUrls), {
+      maxSources: Math.max(MAX_YOUTUBE_TRANSLATION_SOURCE_TRACKS, sourceTracks.length * 2)
+    });
     return transcript && transcriptMatchesTrackLanguage(track, transcript) ? transcript : "";
+  }
+
+  function getYouTubeTranslationSourceTracks(track) {
+    const targetLanguage = normalizeYouTubeTimedTextParam(getYouTubeTranslationTargetLanguage(track));
+    return state.tracks
+      .filter((sourceTrack) => sourceTrack.source === "youtube" && sourceTrack.id !== track?.id)
+      .filter((sourceTrack) => {
+        const sourceLanguage = normalizeYouTubeTimedTextParam(getYouTubeTranslationTargetLanguage(sourceTrack));
+        return !targetLanguage || !sourceLanguage || sourceLanguage !== targetLanguage;
+      })
+      .sort((a, b) => scoreYouTubeTranslationSourceTrack(b) - scoreYouTubeTranslationSourceTrack(a))
+      .slice(0, MAX_YOUTUBE_TRANSLATION_SOURCE_TRACKS);
+  }
+
+  function scoreYouTubeTranslationSourceTrack(track) {
+    const trackUrl = safeUrl(track?.url);
+    const language = normalizeYouTubeTimedTextParam(getYouTubeTranslationTargetLanguage(track));
+    const kind = normalizeYouTubeTimedTextParam(trackUrl?.searchParams.get("kind") || "");
+    let score = 0;
+
+    if (trackUrl && !trackUrl.searchParams.has("tlang")) {
+      score += 20;
+    }
+    if (trackUrl?.searchParams.has("fmt")) {
+      score += 4;
+    }
+    if (kind === "asr") {
+      score += 8;
+    }
+    if (language === "en") {
+      score += 6;
+    } else if (language.startsWith("zh")) {
+      score += 4;
+    }
+    return score;
   }
 
   function getYouTubeTranslationTargetLanguage(track) {
@@ -1290,6 +1391,9 @@
     if (/(^|[^a-z])en([^a-z]|$)|english|英语|英文/.test(value)) {
       return "en";
     }
+    if (/(^|[^a-z])ja([^a-z]|$)|japanese|日本語|日语|日語|日文/.test(value)) {
+      return "ja";
+    }
     return "";
   }
 
@@ -1309,13 +1413,20 @@
       .slice(0, 40)
       .join(" ");
     const cjkCount = (sample.match(/[\u3400-\u9fff]/g) || []).length;
+    const kanaCount = (sample.match(/[\u3040-\u30ff]/g) || []).length;
     const latinWordCount = (sample.match(/[a-z][a-z']+/gi) || []).length;
     const latinCharCount = (sample.match(/[a-z]/gi) || []).length;
 
+    if (kanaCount >= 4 && latinWordCount >= 8 && latinCharCount >= kanaCount * 0.35) {
+      return "mixed";
+    }
     if (cjkCount >= 8 && latinWordCount >= 8 && latinCharCount >= cjkCount * 0.35) {
       return "mixed";
     }
 
+    if (kanaCount >= 4) {
+      return "ja";
+    }
     if (cjkCount >= 8 && cjkCount >= latinWordCount) {
       return "zh";
     }
@@ -1436,7 +1547,7 @@
     }
 
     try {
-      await waitForCondition(() => Boolean(getYouTubeTranscriptPanelText()), 8000, 250);
+      await waitForCondition(() => Boolean(getYouTubeTranscriptPanelText()), 3500, 150);
       return getYouTubeTranscriptPanelText();
     } finally {
       scheduleCloseYouTubeTranscriptPanel();
@@ -2095,6 +2206,18 @@
 
     const loadId = ++transcriptRunId;
     const pageKey = options.pageKey || getPageKey();
+    const cachedTranscript = getSelectedCachedTranscript();
+    if (cachedTranscript) {
+      state.previewLoading = false;
+      state.transcript = cachedTranscript;
+      lastActiveTranscriptIndex = -1;
+      if (!silent) {
+        setStatus(t("content.status.transcriptRead", { count: cachedTranscript.length }), "done");
+      }
+      render();
+      return cachedTranscript;
+    }
+
     state.previewLoading = true;
     if (!silent) {
       setStatus(t("content.status.readingTranscript"), "busy");
@@ -2109,6 +2232,10 @@
         const cleanText = normalizeLoadedTranscript(transcript);
         if (!cleanText) {
           throw new Error(t("content.error.noTranscript"));
+        }
+        const cacheKey = getTranscriptCacheKey(getSelectedTrack());
+        if (cacheKey) {
+          transcriptCache.set(cacheKey, cleanText);
         }
         state.transcript = cleanText;
         lastActiveTranscriptIndex = -1;
@@ -2133,6 +2260,12 @@
       });
 
     return previewPromise;
+  }
+
+  function getSelectedCachedTranscript() {
+    const track = getSelectedTrack();
+    const cacheKey = getTranscriptCacheKey(track);
+    return cacheKey ? transcriptCache.get(cacheKey) || "" : "";
   }
 
   function normalizeLoadedTranscript(transcript) {
