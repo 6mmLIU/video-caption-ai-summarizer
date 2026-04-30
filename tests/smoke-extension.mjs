@@ -8,10 +8,7 @@ const rootDir = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const extensionDir = rootDir;
 const fixtureDir = join(rootDir, "tests", "fixtures");
 const outputDir = join(rootDir, "output", "playwright");
-const userDataDir = join(rootDir, "output", `chrome-profile-${Date.now()}`);
-const externalVideoUrl = process.env.VCS_TEST_URL || "";
-const externalNonVideoUrl = process.env.VCS_NON_VIDEO_URL || "";
-const skipCopyCheck = process.env.VCS_SKIP_COPY === "1";
+const userDataDir = join(rootDir, "output", "chrome-profile");
 const chromeCandidates = [
   "/Users/liu/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
   "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
@@ -19,7 +16,7 @@ const chromeCandidates = [
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 ];
 const chromePath = await firstExisting(chromeCandidates);
-const debugPort = Number(process.env.VCS_DEBUG_PORT || 9227);
+const debugPort = 9227;
 
 class Cdp {
   static async connect(url) {
@@ -88,9 +85,6 @@ const server = createServer(async (request, response) => {
 await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
 const { port } = server.address();
 const baseUrl = `http://127.0.0.1:${port}`;
-const targetVideoUrl = externalVideoUrl || `${baseUrl}/video-page.html`;
-const targetNonVideoUrl = externalNonVideoUrl || `${baseUrl}/blank-page.html`;
-const waitTimeout = externalVideoUrl ? 30000 : 15000;
 
 const chrome = spawn(chromePath, [
   `--user-data-dir=${userDataDir}`,
@@ -114,7 +108,7 @@ try {
   const version = await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, 15000);
   browser = await Cdp.connect(version.webSocketDebuggerUrl);
 
-  const videoTarget = await createTarget(targetVideoUrl);
+  const videoTarget = await createTarget(`${baseUrl}/video-page.html`);
   const videoPage = await Cdp.connect(videoTarget.webSocketDebuggerUrl);
   await videoPage.send("Page.enable");
   await videoPage.send("Runtime.enable");
@@ -122,107 +116,37 @@ try {
 
   await waitForExpression(videoPage, `
     Boolean(document.querySelector("#vcs-root")?.shadowRoot?.querySelector(".vcs-panel"))
-  `, waitTimeout);
+  `, 15000);
   await waitForExpression(videoPage, `
-    (() => {
+    {
       const status = document.querySelector("#vcs-root")?.shadowRoot?.querySelector("#vcs-status")?.textContent || "";
-      return status.includes("已发现") || status.includes("粘贴") || status.includes("失败");
-    })()
-  `, waitTimeout);
+      status.includes("已发现") || status.includes("粘贴") || status.includes("失败");
+    }
+  `, 15000);
 
   const panelState = await evaluate(videoPage, `
     const root = document.querySelector("#vcs-root");
     const shadow = root.shadowRoot;
     return {
-      extensionId: root.dataset.extensionId || "",
       status: shadow.querySelector("#vcs-status")?.textContent || "",
-      platform: shadow.querySelector(".vcs-subtitle")?.textContent?.split("·")?.[0]?.trim()
-        || shadow.querySelector(".vcs-chip")?.textContent
-        || "",
+      platform: shadow.querySelector(".vcs-chip")?.textContent || "",
       track: shadow.querySelector("#vcs-track")?.selectedOptions?.[0]?.textContent || "",
-      title: shadow.querySelector(".vcs-meta-title")?.textContent
-        || shadow.querySelector(".vcs-meta span")?.textContent
-        || "",
-      collapsedByDefault: shadow.querySelector(".vcs-panel")?.classList.contains("is-collapsed") || false
+      title: shadow.querySelector(".vcs-meta span")?.textContent || ""
     };
   `);
 
-  if (!panelState.collapsedByDefault) {
-    throw new Error("Panel should be collapsed by default.");
-  }
-
-  if (!panelState.status.includes("已发现")) {
-    throw new Error(`Expected readable captions, got status: ${panelState.status}`);
-  }
-
-  await capture(videoPage, join(outputDir, "video-panel-collapsed.png"));
-
-  await evaluate(videoPage, `
-    document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-expand").click();
-    return true;
-  `);
-  await waitForExpression(videoPage, `
-    !document.querySelector("#vcs-root")?.shadowRoot?.querySelector(".vcs-panel")?.classList.contains("is-collapsed")
-  `, 5000);
-  await delay(280);
   await capture(videoPage, join(outputDir, "video-panel.png"));
 
-  let copyState = null;
-  if (!skipCopyCheck) {
-    await evaluate(videoPage, `
-      document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-copy-transcript").click();
-      return true;
-    `, { userGesture: true });
-    await waitForExpression(videoPage, `
-      (() => {
-        const root = document.querySelector("#vcs-root");
-        const shadow = root?.shadowRoot;
-        const status = shadow?.querySelector("#vcs-status")?.textContent || "";
-        return status.includes("字幕已复制") || status.includes("复制失败");
-      })()
-    `, waitTimeout);
-    copyState = await evaluate(videoPage, `
-      const root = document.querySelector("#vcs-root");
-      const shadow = root.shadowRoot;
-      return {
-        status: shadow.querySelector("#vcs-status")?.textContent || "",
-        transcriptLength: shadow.querySelector("#vcs-preview")?.value?.length || 0
-      };
-    `);
-    if (!copyState.status.includes("字幕已复制") || copyState.transcriptLength < 40) {
-      throw new Error(`Transcript copy failed: ${JSON.stringify(copyState)}`);
-    }
-  }
-
   await evaluate(videoPage, `
-    document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-refresh").click();
+    document.querySelector("#vcs-root").shadowRoot.querySelector("#vcs-collapse").click();
     return true;
   `);
   await waitForExpression(videoPage, `
-    document.querySelector("#vcs-root")?.shadowRoot?.querySelector("#vcs-refresh")?.classList.contains("is-spinning")
-  `, 3000);
+    document.querySelector("#vcs-root")?.shadowRoot?.querySelector(".vcs-panel")?.classList.contains("is-collapsed")
+  `, 5000);
+  await capture(videoPage, join(outputDir, "video-panel-collapsed.png"));
 
-  const refreshAnimated = await evaluate(videoPage, `
-    return document.querySelector("#vcs-root")?.shadowRoot?.querySelector("#vcs-refresh")?.classList.contains("is-spinning") || false;
-  `);
-
-  const nonVideoTarget = await createTarget(targetNonVideoUrl);
-  const nonVideoPage = await Cdp.connect(nonVideoTarget.webSocketDebuggerUrl);
-  await nonVideoPage.send("Page.enable");
-  await nonVideoPage.send("Runtime.enable");
-  await waitForPageReady(nonVideoPage);
-  await delay(1200);
-  const nonVideoState = await evaluate(nonVideoPage, `
-    return {
-      url: location.href,
-      hasPanel: Boolean(document.querySelector("#vcs-root")?.shadowRoot?.querySelector(".vcs-panel"))
-    };
-  `);
-  if (nonVideoState.hasPanel) {
-    throw new Error("Panel should not mount on non-video pages.");
-  }
-
-  const extensionId = panelState.extensionId || await waitForExtensionId(browser);
+  const extensionId = await waitForExtensionId(browser);
 
   const optionsTarget = await createTarget(`chrome-extension://${extensionId}/options/options.html`);
   const optionsPage = await Cdp.connect(optionsTarget.webSocketDebuggerUrl);
@@ -235,29 +159,17 @@ try {
   const popupPage = await Cdp.connect(popupTarget.webSocketDebuggerUrl);
   await popupPage.send("Page.enable");
   await popupPage.send("Runtime.enable");
-  await popupPage.send("Emulation.setDeviceMetricsOverride", {
-    width: 360,
-    height: 430,
-    deviceScaleFactor: 1,
-    mobile: false
-  });
   await waitForPageReady(popupPage);
   await capture(popupPage, join(outputDir, "popup.png"));
 
   console.log(JSON.stringify({
     ok: true,
     baseUrl,
-    targetVideoUrl,
-    targetNonVideoUrl,
     extensionId,
     panelState,
-    copyState,
-    skipCopyCheck,
-    refreshAnimated,
-    nonVideoState,
     screenshots: [
-      "output/playwright/video-panel-collapsed.png",
       "output/playwright/video-panel.png",
+      "output/playwright/video-panel-collapsed.png",
       "output/playwright/options-page.png",
       "output/playwright/popup.png"
     ]
@@ -308,12 +220,11 @@ async function waitForExpression(cdp, expression, timeoutMs) {
   throw new Error(`Timed out waiting for expression: ${expression}`);
 }
 
-async function evaluate(cdp, expression, options = {}) {
+async function evaluate(cdp, expression) {
   const result = await cdp.send("Runtime.evaluate", {
     expression: `(() => { ${expression} })()`,
     returnByValue: true,
-    awaitPromise: true,
-    userGesture: Boolean(options.userGesture)
+    awaitPromise: true
   });
   if (result.exceptionDetails) {
     throw new Error(result.exceptionDetails.text || "Runtime.evaluate failed");

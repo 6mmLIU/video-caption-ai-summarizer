@@ -1,11 +1,25 @@
 (() => {
+  if (window.__VCS_CONTENT_LOADED__) {
+    return;
+  }
+  window.__VCS_CONTENT_LOADED__ = true;
+
   const PANEL_ID = "vcs-root";
+  const PAGE_STYLE_ID = "vcs-page-polish";
+  const SHORTS_EMBED_TARGET_ID = "vcs-shorts-embed-target";
+  const AI_MARK_URL = chrome.runtime.getURL("icons/ai-mark.png");
+  const MAX_YOUTUBE_TIMEDTEXT_SOURCE_URLS = 3;
+  const MAX_YOUTUBE_TRANSLATION_SOURCE_TRACKS = 2;
+  const YOUTUBE_TIMEDTEXT_FETCH_TIMEOUT_MS = 4500;
   const DEFAULT_SETTINGS = {
+    settingsVersion: 4,
     theme: "auto",
+    uiLanguage: "zh-CN",
     language: "中文（简体）",
-    activeProfileId: "deepseek",
+    activeProfileId: "custom",
     panelEnabled: true,
-    includeTimestamps: true
+    includeTimestamps: true,
+    saveHistory: true
   };
 
   const state = {
@@ -19,23 +33,66 @@
     selectedTrackId: "",
     transcript: "",
     lastSummary: "",
-    status: "正在读取字幕",
+    status: "",
     statusTone: "neutral",
     progress: null,
     refreshing: false,
+    previewLoading: false,
     copyingTranscript: false,
-    copyingSummary: false
+    copyingSummary: false,
+    summaryCollapsed: false,
+    summaryStreaming: false,
+    summaryStreamId: ""
   };
 
   let root = null;
   let shadow = null;
   let lastUrl = location.href;
+  let lastPageKey = getPageKey();
+  let refreshRunId = 0;
+  let transcriptRunId = 0;
   let refreshTimer = null;
+  let statusSwapTimer = null;
+  let previewPromise = null;
+  let transcriptCache = new Map();
+  let transcriptLoadPromises = new Map();
+  let activeVideo = null;
+  let lastActiveTranscriptIndex = -1;
+  let transcriptPanelCloseTimer = null;
+  let summaryScrollFrame = null;
+  let summaryTargetText = "";
 
-  init();
+  if (globalThis.__VCS_TEST_MODE__) {
+    globalThis.__VCS_TEST_HOOKS__ = {
+      parseYouTubeTranscriptSegment,
+      normalizeTranscriptPanelText,
+      cleanTranscriptSegmentContent,
+      transcriptMatchesTrackLanguage,
+      detectTranscriptLanguageFamily,
+      getTrackLanguageFamily,
+      getYouTubeTranslationSourceTracks,
+      setTestTracks: (tracks) => {
+        state.tracks = tracks;
+      },
+      detectPlatform,
+      shouldShowPanel,
+      isYouTubeShortsPage
+    };
+  } else {
+    init();
+  }
+
+  function i18n() {
+    return globalThis.VCS_I18N.create(state.settings);
+  }
+
+  function t(key, variables) {
+    return i18n().t(key, variables);
+  }
 
   async function init() {
     state.settings = await loadSettings();
+    state.status = t("content.status.readingCaptions");
     if (state.settings.panelEnabled === false) {
       return;
     }
@@ -58,7 +115,7 @@
 
       if (message?.type === "VCS_TOGGLE_PANEL") {
         if (!shouldShowPanel()) {
-          sendResponse({ ok: false, error: "当前不是视频播放页，面板不会自动显示。" });
+          sendResponse({ ok: false, error: t("content.status.currentNotVideoPanel") });
           return true;
         }
         if (!state.mounted) {
@@ -72,7 +129,7 @@
 
       if (message?.type === "VCS_SUMMARIZE_NOW") {
         if (!shouldShowPanel()) {
-          sendResponse({ ok: false, error: "当前不是视频播放页。" });
+          sendResponse({ ok: false, error: t("content.status.currentNotVideo") });
           return true;
         }
         if (!state.mounted) {
@@ -87,7 +144,14 @@
 
       if (message?.type === "VCS_PROGRESS") {
         const progress = message.progress;
-        setStatus(progress?.label || "正在处理", "busy", progress);
+        setStatus(progress?.label || t("content.status.processing"), "busy", progress);
+        sendResponse({ ok: true });
+        return false;
+      }
+
+      if (message?.type === "VCS_SUMMARY_STREAM") {
+        appendSummaryStreamDelta(message.streamId, message.delta);
+        sendResponse({ ok: true });
         return false;
       }
 
@@ -96,28 +160,35 @@
 
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area === "local" && changes.vcsSettings) {
-        state.settings = {
-          ...DEFAULT_SETTINGS,
-          ...changes.vcsSettings.newValue
-        };
+        state.settings = normalizeSettings(changes.vcsSettings.newValue);
+        if (state.settings.panelEnabled === false) {
+          unmount();
+          return;
+        }
+        if (!state.mounted && shouldShowPanel()) {
+          maybeMount();
+          return;
+        }
         applyTheme();
         render();
+      }
+    });
+
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+      if (state.settings.theme === "auto" && state.mounted) {
+        applyTheme();
       }
     });
   }
 
   async function loadSettings() {
     const result = await chrome.storage.local.get("vcsSettings");
-    return {
-      ...DEFAULT_SETTINGS,
-      ...(result.vcsSettings || {})
-    };
+    return normalizeSettings(result.vcsSettings);
   }
 
   function observeNavigation() {
     const observer = new MutationObserver(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
+      if (hasPageContextChanged()) {
         scheduleRefresh();
       } else if (!state.mounted && shouldShowPanel()) {
         scheduleRefresh();
@@ -127,20 +198,52 @@
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
     setInterval(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
+      if (hasPageContextChanged()) {
         scheduleRefresh();
+      } else if (state.mounted && isYouTubeShortsPage() && shouldShowPanel()) {
+        placeRoot();
       }
     }, 1000);
+  }
+
+  function hasPageContextChanged() {
+    const nextUrl = location.href;
+    const nextPageKey = getPageKey();
+    if (nextUrl !== lastUrl || nextPageKey !== lastPageKey) {
+      lastUrl = nextUrl;
+      lastPageKey = nextPageKey;
+      return true;
+    }
+    return false;
+  }
+
+  function getPageKey() {
+    const host = location.hostname.replace(/^www\./, "");
+    if (host.includes("youtube.com") || host === "youtu.be") {
+      return `youtube:${getYouTubeVideoId() || location.pathname}`;
+    }
+    if (host.includes("bilibili.com")) {
+      const pageNumber = new URLSearchParams(location.search).get("p") || "1";
+      return `bilibili:${getBvidFromUrl() || location.pathname}:${pageNumber}`;
+    }
+    return `${location.origin}${location.pathname}${location.search}`;
   }
 
   function scheduleRefresh() {
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => {
+      refreshRunId += 1;
+      transcriptRunId += 1;
+      previewPromise = null;
+      transcriptCache.clear();
+      transcriptLoadPromises.clear();
       state.tracks = [];
+      state.selectedTrackId = "";
       state.transcript = "";
       state.lastSummary = "";
+      resetSummaryStream();
       state.platform = null;
+      state.previewLoading = false;
       state.collapsed = true;
       if (shouldShowPanel()) {
         const wasMounted = state.mounted;
@@ -155,13 +258,15 @@
   }
 
   function shouldShowPanel() {
-    return Boolean(detectPlatform());
+    return !isYouTubeShortsPage() && Boolean(detectPlatform());
   }
 
   function maybeMount(force = false) {
     if (!force && !shouldShowPanel()) {
       return;
     }
+
+    applyPagePolish();
 
     const wasMounted = state.mounted;
     if (!root) {
@@ -184,6 +289,12 @@
     if (root?.parentElement) {
       root.remove();
     }
+    removeYouTubeShortsEmbedTarget();
+    clearTimeout(transcriptPanelCloseTimer);
+    resetSummaryStream();
+    endYouTubeTranscriptProbe();
+    removePagePolish();
+    unbindVideoSync();
     state.mounted = false;
     state.embedded = false;
     state.platform = null;
@@ -191,11 +302,15 @@
 
   function placeRoot() {
     const target = findEmbedTarget();
-    if (target && root.parentElement !== target) {
+    const before = target ? getRootInsertBefore(target) : null;
+    if (target && target !== document.documentElement && (root.parentElement !== target || root.nextSibling !== before)) {
+      target.insertBefore(root, before);
+      state.embedded = true;
+    } else if (target && root.parentElement !== target) {
       if (target === document.documentElement) {
         target.appendChild(root);
       } else {
-        target.insertBefore(root, target.firstChild);
+        target.insertBefore(root, before);
       }
       state.embedded = target !== document.documentElement;
     } else if (!root.parentElement) {
@@ -220,41 +335,240 @@
     return document.documentElement;
   }
 
+  function findYouTubeShortsEmbedTarget() {
+    const commentsPanel = document.querySelector("ytd-shorts #anchored-panel");
+    if (isUsableShortsTarget(commentsPanel) && isElementInViewport(commentsPanel)) {
+      return commentsPanel;
+    }
+    return ensureYouTubeShortsSideTarget()
+      || commentsPanel
+      || document.querySelector("ytd-shorts")
+      || document.documentElement;
+  }
+
+  function ensureYouTubeShortsSideTarget() {
+    const shorts = document.querySelector("ytd-shorts");
+    const reel = getActiveYouTubeShortsReel();
+    if (!shorts || !reel) {
+      return null;
+    }
+
+    let target = document.getElementById(SHORTS_EMBED_TARGET_ID);
+    if (!target) {
+      target = document.createElement("div");
+      target.id = SHORTS_EMBED_TARGET_ID;
+      target.setAttribute("aria-label", "Video Caption AI Shorts panel");
+      shorts.appendChild(target);
+    }
+
+    positionYouTubeShortsSideTarget(target, shorts, reel);
+    return target;
+  }
+
+  function getActiveYouTubeShortsReel() {
+    return [...document.querySelectorAll("ytd-reel-video-renderer")]
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const visibleWidth = Math.max(0, Math.min(rect.right, innerWidth) - Math.max(rect.left, 0));
+        const visibleHeight = Math.max(0, Math.min(rect.bottom, innerHeight) - Math.max(rect.top, 0));
+        return { element, rect, area: visibleWidth * visibleHeight };
+      })
+      .filter((item) => item.area > 0 && item.rect.width >= 240 && item.rect.height >= 240)
+      .sort((a, b) => b.area - a.area)[0]?.element || null;
+  }
+
+  function positionYouTubeShortsSideTarget(target, shorts, reel) {
+    const shortsRect = shorts.getBoundingClientRect();
+    const reelRect = reel.getBoundingClientRect();
+    const actionsRect = getYouTubeShortsActionsRect(reel);
+    const navigationRect = document.querySelector("ytd-shorts .navigation-container")?.getBoundingClientRect();
+    const gap = 16;
+    const minWidth = 260;
+    const preferredWidth = 340;
+    const leftLimit = Math.max(shortsRect.left, 0) + gap;
+    const rightLimit = Math.min(navigationRect?.left || shortsRect.right, innerWidth) - gap;
+    const rightAnchor = Math.max(reelRect.right, actionsRect?.right || reelRect.right);
+    const rightSpace = rightLimit - rightAnchor - gap;
+    const leftSpace = reelRect.left - leftLimit - gap;
+    let width = Math.min(preferredWidth, Math.max(rightSpace, leftSpace));
+    let left = rightAnchor + gap;
+
+    if (rightSpace >= minWidth || rightSpace >= leftSpace) {
+      width = Math.max(180, Math.min(preferredWidth, rightSpace));
+      left = rightAnchor + gap;
+    } else {
+      width = Math.max(180, Math.min(preferredWidth, leftSpace));
+      left = reelRect.left - gap - width;
+    }
+
+    const top = Math.max(gap, reelRect.top - shortsRect.top);
+    const maxHeight = Math.max(220, Math.min(reelRect.height, innerHeight - top - gap));
+    target.style.cssText = [
+      "position: absolute",
+      `top: ${Math.round(top)}px`,
+      `left: ${Math.round(left - shortsRect.left)}px`,
+      `width: ${Math.round(width)}px`,
+      `max-height: ${Math.round(maxHeight)}px`,
+      "overflow: auto",
+      "z-index: 2",
+      "pointer-events: auto"
+    ].join("; ");
+  }
+
+  function getYouTubeShortsActionsRect(reel) {
+    return [
+      "#actions",
+      "#menu",
+      "ytd-reel-player-overlay-renderer #actions",
+      "ytd-reel-player-header-renderer"
+    ]
+      .map((selector) => reel.querySelector(selector)?.getBoundingClientRect())
+      .filter((rect) => rect && rect.width > 0 && rect.height > 0)
+      .sort((a, b) => b.right - a.right)[0] || null;
+  }
+
+  function isUsableShortsTarget(element) {
+    if (!element) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return rect.width >= 240
+      && rect.height >= 120
+      && style.display !== "none"
+      && style.visibility !== "hidden";
+  }
+
+  function isElementInViewport(element) {
+    if (!element) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.left < innerWidth && rect.right > 0 && rect.top < innerHeight && rect.bottom > 0;
+  }
+
+  function isYouTubeShortsPage() {
+    return location.hostname.replace(/^www\./, "").includes("youtube.com")
+      && location.pathname.startsWith("/shorts/");
+  }
+
+  function removeYouTubeShortsEmbedTarget() {
+    document.getElementById(SHORTS_EMBED_TARGET_ID)?.remove();
+  }
+
+  function getRootInsertBefore(target) {
+    if (!target || target === document.documentElement) {
+      return null;
+    }
+    if (isBilibiliPage()) {
+      return getBilibiliPanelInsertBefore(target);
+    }
+    return target.firstElementChild === root ? root.nextSibling : target.firstChild;
+  }
+
+  function getBilibiliPanelInsertBefore(target) {
+    const children = [...target.children].filter((child) => child !== root);
+    const authorCard = children.find(isBilibiliAuthorCard) || children[0];
+    let next = authorCard?.nextSibling || null;
+    while (next === root) {
+      next = next.nextSibling;
+    }
+    return next;
+  }
+
+  function isBilibiliAuthorCard(element) {
+    const value = `${element.id || ""} ${element.className || ""}`.toLowerCase();
+    if (/(^|\s)(up|owner|author|user|member|staff)(-|_|$|\s)/i.test(value)) {
+      return true;
+    }
+    return Boolean(element.querySelector?.([
+      "[class*='up-info' i]",
+      "[class*='up-name' i]",
+      "[class*='owner' i]",
+      "[class*='author' i]",
+      "[class*='avatar' i]",
+      "[data-v-][class*='up' i]"
+    ].join(",")));
+  }
+
+  function isBilibiliPage() {
+    return location.hostname.replace(/^www\./, "").includes("bilibili.com");
+  }
+
   async function refreshTracks() {
-    const refreshStartedAt = performance.now();
+    const refreshId = ++refreshRunId;
+    const pageKey = getPageKey();
+    const previousTrackKey = getTrackIdentityKey(getSelectedTrack());
+    transcriptRunId += 1;
+    previewPromise = null;
+    transcriptCache.clear();
+    transcriptLoadPromises.clear();
     state.platform = detectPlatform() || {
       id: "generic",
       name: "Generic Video",
       kind: "generic"
     };
+    if (state.platform.kind === "youtube") {
+      scheduleCloseYouTubeTranscriptPanel({ attempts: 4, delayMs: 120 });
+    }
     state.title = getVideoTitle();
-    state.status = "正在读取字幕轨道";
+    state.tracks = [];
+    state.selectedTrackId = "";
+    state.transcript = "";
+    state.status = t("content.status.readingTracks");
     state.statusTone = "busy";
     state.progress = null;
     state.refreshing = true;
+    lastActiveTranscriptIndex = -1;
     render();
 
     try {
       const tracks = await getTracksForPlatform(state.platform);
+      if (!isCurrentRefresh(refreshId, pageKey)) {
+        return;
+      }
       state.tracks = tracks;
-      state.selectedTrackId = chooseDefaultTrackId(tracks);
+      state.selectedTrackId = chooseTrackId(tracks, previousTrackKey);
       state.status = tracks.length
-        ? `已发现 ${tracks.length} 条字幕轨道`
-        : "没有发现可直接读取的字幕，可粘贴字幕后总结";
+        ? t("content.status.foundTracks", { count: tracks.length })
+        : t("content.status.noTracks");
       state.statusTone = tracks.length ? "done" : "neutral";
     } catch (error) {
+      if (!isCurrentRefresh(refreshId, pageKey)) {
+        return;
+      }
       state.tracks = [];
-      state.status = `字幕读取失败：${error.message}`;
+      state.selectedTrackId = "";
+      state.status = t("content.status.trackReadFailed", { message: error.message });
       state.statusTone = "error";
     } finally {
-      const remainingAnimationMs = 650 - (performance.now() - refreshStartedAt);
-      if (remainingAnimationMs > 0) {
-        await delay(remainingAnimationMs);
+      if (!isCurrentRefresh(refreshId, pageKey)) {
+        return;
       }
       state.refreshing = false;
+      render();
+      if (state.tracks.length) {
+        hydrateTranscriptPreview({ silent: true, pageKey }).catch(() => {});
+      }
     }
+  }
 
-    render();
+  function chooseTrackId(tracks, preferredTrackKey = "") {
+    if (preferredTrackKey) {
+      const match = tracks.find((track) => getTrackIdentityKey(track) === preferredTrackKey);
+      if (match) {
+        return match.id;
+      }
+    }
+    return chooseDefaultTrackId(tracks);
+  }
+
+  function getSelectedTrack() {
+    return state.tracks.find((item) => item.id === state.selectedTrackId) || state.tracks[0] || null;
+  }
+
+  function isCurrentRefresh(refreshId, pageKey) {
+    return refreshId === refreshRunId && pageKey === getPageKey();
   }
 
   function delay(ms) {
@@ -268,7 +582,7 @@
         return { id: "youtube", name: "YouTube", kind: "youtube" };
       }
       if (location.pathname.startsWith("/shorts/")) {
-        return { id: "youtube", name: "YouTube Shorts", kind: "youtube" };
+        return null;
       }
       return null;
     }
@@ -326,7 +640,7 @@
       return [
         {
           id: "visible-transcript",
-          label: "页面可见字幕 / Transcript",
+          label: t("content.label.pageVisibleTranscript"),
           language: "auto",
           source: "visible",
           text: visibleTranscript
@@ -361,18 +675,35 @@
     return tracks[0].id;
   }
 
+  function getTrackIdentityKey(track) {
+    if (!track) {
+      return "";
+    }
+    const trackUrl = safeUrl(track.url);
+    return [
+      track.source || "",
+      track.language || "",
+      track.label || "",
+      trackUrl?.searchParams.get("lang") || "",
+      trackUrl?.searchParams.get("name") || "",
+      trackUrl?.searchParams.get("kind") || ""
+    ].map(normalizeSearchText).join("|");
+  }
+
   async function getYouTubeTracks() {
-    const scriptsText = getPageScriptsText();
-    const response = getJsonAssignment("ytInitialPlayerResponse") || await fetchYouTubePlayerResponse();
-    let captionTracks = response?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    const videoId = getYouTubeVideoId();
+    const response = getCurrentYouTubePlayerResponse(videoId)
+      || await fetchYouTubePlayerResponse(videoId)
+      || getJsonAssignment("ytInitialPlayerResponse", (value) => isYouTubePlayerResponseForVideo(value, videoId));
+    let captionTracks = getYouTubeCaptionTracksFromResponse(response, videoId);
 
     if (!captionTracks.length) {
-      captionTracks = extractYouTubeCaptionTracks(scriptsText);
+      captionTracks = extractYouTubeCaptionTracks(getPageScriptsText(), videoId);
     }
 
     if (!captionTracks.length) {
-      const watchHtml = await fetchYouTubeWatchHtml();
-      captionTracks = extractYouTubeCaptionTracks(watchHtml);
+      const watchHtml = await fetchYouTubeWatchHtml(videoId);
+      captionTracks = extractYouTubeCaptionTracks(watchHtml, videoId);
     }
 
     return captionTracks
@@ -386,13 +717,34 @@
       }));
   }
 
-  async function fetchYouTubePlayerResponse() {
-    const html = await fetchYouTubeWatchHtml();
-    return getJsonAssignmentFromText(html, "ytInitialPlayerResponse");
+  function getCurrentYouTubePlayerResponse(videoId) {
+    const candidates = [
+      () => globalThis.ytInitialPlayerResponse,
+      () => document.querySelector("ytd-watch-flexy")?.playerResponse,
+      () => document.querySelector("ytd-watch-flexy")?.playerData?.playerResponse,
+      () => document.querySelector("#movie_player")?.getPlayerResponse?.()
+    ];
+
+    for (const readCandidate of candidates) {
+      try {
+        const value = readCandidate();
+        if (isYouTubePlayerResponseForVideo(value, videoId)) {
+          return value;
+        }
+      } catch (_error) {
+        // Page-owned player objects are not always accessible from the content script.
+      }
+    }
+    return null;
   }
 
-  async function fetchYouTubeWatchHtml() {
-    const videoId = getYouTubeVideoId();
+  async function fetchYouTubePlayerResponse(videoId = getYouTubeVideoId()) {
+    const html = await fetchYouTubeWatchHtml(videoId);
+    const response = getJsonAssignmentFromText(html, "ytInitialPlayerResponse");
+    return isYouTubePlayerResponseForVideo(response, videoId) ? response : null;
+  }
+
+  async function fetchYouTubeWatchHtml(videoId = getYouTubeVideoId()) {
     if (!videoId) {
       return "";
     }
@@ -410,6 +762,33 @@
     }
   }
 
+  function getYouTubeCaptionTracksFromResponse(response, videoId) {
+    if (!isYouTubePlayerResponseForVideo(response, videoId)) {
+      return [];
+    }
+    return filterYouTubeCaptionTracksForVideo(
+      response?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [],
+      videoId
+    );
+  }
+
+  function isYouTubePlayerResponseForVideo(response, videoId) {
+    if (!response || typeof response !== "object") {
+      return false;
+    }
+    if (!videoId) {
+      return true;
+    }
+
+    const responseVideoId = response.videoDetails?.videoId || response.videoDetails?.externalVideoId || "";
+    if (responseVideoId && responseVideoId === videoId) {
+      return true;
+    }
+
+    const tracks = response?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    return filterYouTubeCaptionTracksForVideo(tracks, videoId).length > 0;
+  }
+
   function getYouTubeVideoId() {
     const host = location.hostname.replace(/^www\./, "");
     if (host === "youtu.be") {
@@ -423,36 +802,152 @@
 
   async function getBilibiliTracks() {
     const initialState = getJsonAssignment("__INITIAL_STATE__") || {};
-    const videoData = initialState.videoData || initialState.videoInfo || {};
-    const bvid = videoData.bvid || initialState.bvid || getBvidFromUrl();
-    const aid = videoData.aid || initialState.aid;
-    const cid = videoData.cid || initialState.cid || getCidFromPage(initialState);
+    const playInfo = getJsonAssignment("__playinfo__") || {};
+    const pageTracks = normalizeBilibiliSubtitleTracks([
+      ...collectBilibiliSubtitleItems(initialState),
+      ...collectBilibiliSubtitleItems(playInfo)
+    ]);
 
-    if (!cid || (!bvid && !aid)) {
-      return [];
+    if (pageTracks.length) {
+      return pageTracks;
     }
 
-    const api = new URL("https://api.bilibili.com/x/player/v2");
-    api.searchParams.set("cid", cid);
-    if (bvid) {
-      api.searchParams.set("bvid", bvid);
-    } else {
-      api.searchParams.set("aid", aid);
+    const identity = getBilibiliVideoIdentity(initialState);
+    const apiUrls = getBilibiliPlayerApiUrls(identity);
+    for (const url of apiUrls) {
+      try {
+        const response = await extensionFetch(url);
+        const data = JSON.parse(response.text);
+        const tracks = normalizeBilibiliSubtitleTracks(collectBilibiliSubtitleItems(data));
+        if (tracks.length) {
+          return tracks;
+        }
+      } catch (_error) {
+        // Bilibili may reject unsigned or stale player API URLs. Try the next source.
+      }
     }
 
-    const response = await extensionFetch(api.toString());
-    const data = JSON.parse(response.text);
-    const subtitles = data?.data?.subtitle?.subtitles || [];
+    return [];
+  }
 
-    return subtitles
-      .filter((item) => item.subtitle_url)
-      .map((item, index) => ({
+  function collectBilibiliSubtitleItems(value, depth = 0, output = []) {
+    if (!value || depth > 8) {
+      return output;
+    }
+
+    if (Array.isArray(value)) {
+      if (value.some(isBilibiliSubtitleItem)) {
+        output.push(...value.filter(isBilibiliSubtitleItem));
+        return output;
+      }
+      value.forEach((item) => collectBilibiliSubtitleItems(item, depth + 1, output));
+      return output;
+    }
+
+    if (typeof value !== "object") {
+      return output;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      if (/^(subtitle|subtitles|subtitleList|subtitle_list|list|data|result|videoData|videoInfo|epInfo)$/i.test(key)) {
+        collectBilibiliSubtitleItems(child, depth + 1, output);
+      } else if (depth < 3 && child && typeof child === "object") {
+        collectBilibiliSubtitleItems(child, depth + 1, output);
+      }
+    }
+
+    return output;
+  }
+
+  function isBilibiliSubtitleItem(item) {
+    return Boolean(
+      item
+      && typeof item === "object"
+      && (item.subtitle_url || item.url)
+      && (item.lan || item.lan_doc || item.id)
+    );
+  }
+
+  function normalizeBilibiliSubtitleTracks(items) {
+    const seen = new Set();
+    return items
+      .map((item, index) => {
+        const url = normalizeBilibiliSubtitleUrl(item.subtitle_url || item.url || "");
+        if (!url || seen.has(url)) {
+          return null;
+        }
+        seen.add(url);
+        return {
+          item,
+          index,
+          url
+        };
+      })
+      .filter(Boolean)
+      .map(({ item, index, url }) => ({
         id: `bilibili-${index}`,
         label: item.lan_doc || item.lan || `Subtitle ${index + 1}`,
         language: item.lan || "auto",
         source: "bilibili",
-        url: normalizeUrl(item.subtitle_url)
+        url
       }));
+  }
+
+  function normalizeBilibiliSubtitleUrl(url) {
+    const value = String(url || "").trim();
+    if (!value) {
+      return "";
+    }
+    return normalizeUrl(value);
+  }
+
+  function getBilibiliVideoIdentity(initialState) {
+    const videoData = initialState.videoData || initialState.videoInfo || {};
+    const epInfo = initialState.epInfo || {};
+    const idsFromText = getBilibiliIdsFromText(getPageScriptsText());
+    return {
+      bvid: videoData.bvid || initialState.bvid || idsFromText.bvid || getBvidFromUrl(),
+      aid: videoData.aid || initialState.aid || idsFromText.aid,
+      cid: videoData.cid || epInfo.cid || initialState.cid || getCidFromPage(initialState) || idsFromText.cid || getBilibiliCidFromRuntimeUrls()
+    };
+  }
+
+  function getBilibiliPlayerApiUrls(identity) {
+    const urls = [];
+    urls.push(...getBilibiliRuntimePlayerApiUrls(identity.cid));
+
+    if (identity.cid && (identity.bvid || identity.aid)) {
+      for (const pathname of ["/x/player/v2", "/x/player/wbi/v2"]) {
+        const api = new URL(`https://api.bilibili.com${pathname}`);
+        api.searchParams.set("cid", identity.cid);
+        if (identity.bvid) {
+          api.searchParams.set("bvid", identity.bvid);
+        } else {
+          api.searchParams.set("aid", identity.aid);
+        }
+        urls.push(api.toString());
+      }
+    }
+
+    return uniqueValues(urls);
+  }
+
+  function getBilibiliRuntimePlayerApiUrls(cid = "") {
+    return performance.getEntriesByType("resource")
+      .map((entry) => entry.name || "")
+      .filter(Boolean)
+      .filter((url) => {
+        const parsed = safeUrl(url);
+        if (!parsed || !parsed.hostname.includes("bilibili.com")) {
+          return false;
+        }
+        const isPlayerApi = parsed.pathname.includes("/x/player/v2")
+          || parsed.pathname.includes("/x/player/wbi/v2");
+        if (!isPlayerApi || !parsed.searchParams.has("cid")) {
+          return false;
+        }
+        return !cid || parsed.searchParams.get("cid") === String(cid);
+      });
   }
 
   function getHtml5Tracks() {
@@ -468,20 +963,50 @@
   }
 
   async function loadSelectedTranscript() {
-    const manual = getManualTranscript();
-    if (manual) {
-      return manual;
-    }
-
-    const track = state.tracks.find((item) => item.id === state.selectedTrackId) || state.tracks[0];
+    const track = getSelectedTrack();
     if (!track) {
       const visibleTranscript = getVisibleTranscript();
       if (visibleTranscript) {
-        return visibleTranscript;
+        return normalizeLoadedTranscript(visibleTranscript);
       }
-      throw new Error("没有可用字幕。你可以在面板底部粘贴字幕文本。");
+      throw new Error(t("content.error.noCaptions"));
     }
 
+    const cacheKey = getTranscriptCacheKey(track);
+    const cachedTranscript = cacheKey ? transcriptCache.get(cacheKey) : "";
+    if (cachedTranscript) {
+      return cachedTranscript;
+    }
+
+    const pendingTranscript = cacheKey ? transcriptLoadPromises.get(cacheKey) : null;
+    if (pendingTranscript) {
+      return pendingTranscript;
+    }
+
+    const transcriptPromise = loadTranscriptForTrack(track)
+      .then((transcript) => {
+        const cleanText = normalizeLoadedTranscript(transcript);
+        if (!cleanText) {
+          throw new Error(t("content.error.noTranscript"));
+        }
+        if (cacheKey) {
+          transcriptCache.set(cacheKey, cleanText);
+        }
+        return cleanText;
+      })
+      .finally(() => {
+        if (cacheKey) {
+          transcriptLoadPromises.delete(cacheKey);
+        }
+      });
+
+    if (cacheKey) {
+      transcriptLoadPromises.set(cacheKey, transcriptPromise);
+    }
+    return transcriptPromise;
+  }
+
+  async function loadTranscriptForTrack(track) {
     if (track.text) {
       return track.text;
     }
@@ -492,20 +1017,7 @@
         return transcript;
       }
 
-      for (const fallbackTrack of state.tracks.filter((item) => item.source === "youtube" && item.id !== track.id)) {
-        const fallbackTranscript = await loadYouTubeTrackTranscript(fallbackTrack);
-        if (fallbackTranscript) {
-          state.selectedTrackId = fallbackTrack.id;
-          return fallbackTranscript;
-        }
-      }
-
-      const visibleTranscript = getVisibleTranscript();
-      if (visibleTranscript) {
-        return visibleTranscript;
-      }
-
-      throw new Error("已找到字幕轨道，但 YouTube 返回了空字幕内容。请换一条字幕轨，或打开 YouTube 转写文稿后再试。");
+      throw new Error(t("content.error.emptyYouTube"));
     }
 
     if (track.source === "bilibili") {
@@ -522,80 +1034,433 @@
       return track.text;
     }
 
-    throw new Error(`不支持的字幕来源：${track.source}`);
+    throw new Error(t("content.error.unsupportedTrack", { source: track.source }));
+  }
+
+  function getTranscriptCacheKey(track) {
+    const pageKey = getPageKey();
+    const trackKey = getTrackIdentityKey(track);
+    return pageKey && trackKey ? `${pageKey}|${trackKey}` : "";
   }
 
   async function loadYouTubeTrackTranscript(track) {
-    const sourceUrls = uniqueValues([
-      ...getYouTubeRuntimeTimedTextUrls(track),
-      track.url
-    ]);
-    const formats = ["json3", "srv3", "vtt", ""];
+    await waitForYouTubeMainVideoReady();
 
-    for (const sourceUrl of sourceUrls) {
-      const candidateUrls = buildYouTubeTimedTextUrls(sourceUrl, formats);
-      for (const { url, format } of candidateUrls) {
-        try {
-          const response = await extensionFetch(url);
-          const transcript = format === "vtt"
-            ? parseTextTrack(response.text)
-            : parseYouTubeTranscript(response.text) || parseTextTrack(response.text);
-          if (transcript.trim()) {
-            return transcript.trim();
-          }
-        } catch (_error) {
-          // Try the next runtime URL, format, or fallback track.
-        }
-      }
+    const sourceUrls = uniqueValues([
+      track.url,
+      ...getYouTubeRuntimeTimedTextUrls(track)
+    ]);
+
+    let transcript = await fetchYouTubeTranscriptFromSourceUrls(sourceUrls);
+    if (!transcript && isYouTubeAdPlaying()) {
+      await waitForYouTubeMainVideoReady();
+      transcript = await fetchYouTubeTranscriptFromSourceUrls(sourceUrls);
+    }
+    if (transcript) {
+      return transcript;
+    }
+
+    const translatedTranscript = await loadYouTubeTranslatedTrackTranscript(track);
+    if (translatedTranscript) {
+      return translatedTranscript;
     }
 
     const transcriptPanelText = await loadYouTubeTranscriptPanelText();
-    if (transcriptPanelText) {
+    if (transcriptPanelText && transcriptPanelMatchesTrack(track, transcriptPanelText)) {
       return transcriptPanelText;
     }
 
     return "";
   }
 
+  async function waitForYouTubeMainVideoReady() {
+    if (!isYouTubeAdPlaying()) {
+      return true;
+    }
+
+    setStatus(t("content.status.waitingForAd"), "busy");
+    const ready = await waitForCondition(() => !isYouTubeAdPlaying(), 45000, 300);
+    if (!ready) {
+      throw new Error(t("content.error.youtubeAdPlaying"));
+    }
+    await delay(350);
+    return true;
+  }
+
+  function isYouTubeAdPlaying() {
+    const player = document.querySelector("#movie_player");
+    if (!player) {
+      return false;
+    }
+
+    const classes = player.classList;
+    if (classes.contains("ad-showing") || classes.contains("ad-interrupting")) {
+      return true;
+    }
+
+    try {
+      const adState = player.getAdState?.();
+      return Number.isFinite(adState) && adState > 0;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async function fetchYouTubeTranscriptFromSourceUrls(sourceUrls, options = {}) {
+    const formats = options.formats || ["json3", "vtt", "srv3", ""];
+    const maxSources = options.maxSources || MAX_YOUTUBE_TIMEDTEXT_SOURCE_URLS;
+    const timeoutMs = options.timeoutMs || YOUTUBE_TIMEDTEXT_FETCH_TIMEOUT_MS;
+    for (const sourceUrl of uniqueValues(sourceUrls).slice(0, maxSources)) {
+      const candidateUrls = buildYouTubeTimedTextUrls(sourceUrl, formats);
+      const transcript = await fetchFirstYouTubeTranscriptCandidate(candidateUrls, timeoutMs);
+      if (transcript) {
+        return transcript;
+      }
+    }
+
+    return "";
+  }
+
+  async function fetchFirstYouTubeTranscriptCandidate(candidateUrls, timeoutMs) {
+    try {
+      return await Promise.any(candidateUrls.map(({ url, format }) => (
+        extensionFetchWithTimeout(url, timeoutMs)
+          .then((response) => parseYouTubeTimedTextResponse(response.text, format))
+          .then((transcript) => {
+            const cleanText = transcript.trim();
+            if (!cleanText) {
+              throw new Error("Empty YouTube timedtext response.");
+            }
+            return cleanText;
+          })
+      )));
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function parseYouTubeTimedTextResponse(text, format) {
+    return format === "vtt"
+      ? parseTextTrack(text)
+      : parseYouTubeTranscript(text) || parseTextTrack(text);
+  }
+
+  async function extensionFetchWithTimeout(url, timeoutMs) {
+    let timeoutId = null;
+    try {
+      return await Promise.race([
+        extensionFetch(url),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error("Timed out reading YouTube timedtext.")), timeoutMs);
+        })
+      ]);
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
+  }
+
+  async function loadYouTubeTranslatedTrackTranscript(track) {
+    const targetLanguage = getYouTubeTranslationTargetLanguage(track);
+    if (!targetLanguage) {
+      return "";
+    }
+
+    const sourceTracks = getYouTubeTranslationSourceTracks(track);
+    const sourceUrls = [
+      ...sourceTracks.map((sourceTrack) => sourceTrack.url),
+      ...sourceTracks.flatMap((sourceTrack) => getYouTubeRuntimeTimedTextUrls(sourceTrack).slice(0, 1))
+    ]
+      .map((url) => addYouTubeTranslationParam(url, targetLanguage));
+    const transcript = await fetchYouTubeTranscriptFromSourceUrls(uniqueValues(sourceUrls), {
+      maxSources: Math.max(MAX_YOUTUBE_TRANSLATION_SOURCE_TRACKS, sourceTracks.length * 2)
+    });
+    return transcript && transcriptMatchesTrackLanguage(track, transcript) ? transcript : "";
+  }
+
+  function getYouTubeTranslationSourceTracks(track) {
+    const targetLanguage = normalizeYouTubeTimedTextParam(getYouTubeTranslationTargetLanguage(track));
+    return state.tracks
+      .filter((sourceTrack) => sourceTrack.source === "youtube" && sourceTrack.id !== track?.id)
+      .filter((sourceTrack) => {
+        const sourceLanguage = normalizeYouTubeTimedTextParam(getYouTubeTranslationTargetLanguage(sourceTrack));
+        return !targetLanguage || !sourceLanguage || sourceLanguage !== targetLanguage;
+      })
+      .sort((a, b) => scoreYouTubeTranslationSourceTrack(b) - scoreYouTubeTranslationSourceTrack(a))
+      .slice(0, MAX_YOUTUBE_TRANSLATION_SOURCE_TRACKS);
+  }
+
+  function scoreYouTubeTranslationSourceTrack(track) {
+    const trackUrl = safeUrl(track?.url);
+    const language = normalizeYouTubeTimedTextParam(getYouTubeTranslationTargetLanguage(track));
+    const kind = normalizeYouTubeTimedTextParam(trackUrl?.searchParams.get("kind") || "");
+    let score = 0;
+
+    if (trackUrl && !trackUrl.searchParams.has("tlang")) {
+      score += 20;
+    }
+    if (trackUrl?.searchParams.has("fmt")) {
+      score += 4;
+    }
+    if (kind === "asr") {
+      score += 8;
+    }
+    if (language === "en") {
+      score += 6;
+    } else if (language.startsWith("zh")) {
+      score += 4;
+    }
+    return score;
+  }
+
+  function getYouTubeTranslationTargetLanguage(track) {
+    const trackUrl = safeUrl(track?.url);
+    return trackUrl?.searchParams.get("lang") || track?.language || "";
+  }
+
+  function addYouTubeTranslationParam(url, targetLanguage) {
+    const parsed = safeUrl(url);
+    if (!parsed || !targetLanguage) {
+      return "";
+    }
+    parsed.searchParams.set("tlang", targetLanguage);
+    return parsed.toString();
+  }
+
   function getYouTubeRuntimeTimedTextUrls(track) {
     const trackUrl = safeUrl(track?.url);
-    const wantedLanguage = trackUrl?.searchParams.get("lang") || track?.language || "";
-    const wantedName = trackUrl?.searchParams.get("name") || "";
+    const wantedTrack = getYouTubeTimedTextTrackIdentity(track, trackUrl);
+    const currentVideoId = getYouTubeVideoId();
     const resources = performance.getEntriesByType("resource")
       .filter((entry) => typeof entry.name === "string" && entry.name.includes("/api/timedtext"))
-      .map((entry, index) => ({
-        url: entry.name,
-        startTime: entry.startTime || index,
-        score: scoreYouTubeTimedTextUrl(entry.name, wantedLanguage, wantedName)
-      }))
-      .filter((entry) => entry.score > 0)
+      .map((entry, index) => {
+        const scopedUrl = scopeYouTubeRuntimeTimedTextUrlToTrack(entry.name, trackUrl);
+        return {
+          originalUrl: entry.name,
+          url: scopedUrl,
+          startTime: entry.startTime || index,
+          score: scoreYouTubeTimedTextUrl(scopedUrl, wantedTrack)
+        };
+      })
+      .filter((entry) => entry.score > 0
+        && isYouTubeTimedTextUrlForVideo(entry.originalUrl, currentVideoId)
+        && isYouTubeTimedTextUrlForVideo(entry.url, currentVideoId))
       .sort((a, b) => b.score - a.score || b.startTime - a.startTime);
 
     return resources.map((entry) => entry.url);
   }
 
-  function scoreYouTubeTimedTextUrl(url, wantedLanguage, wantedName) {
+  function getYouTubeTimedTextTrackIdentity(track, trackUrl = safeUrl(track?.url)) {
+    return {
+      language: trackUrl?.searchParams.get("lang") || track?.language || "",
+      name: trackUrl?.searchParams.get("name") || "",
+      kind: trackUrl?.searchParams.get("kind") || ""
+    };
+  }
+
+  function scopeYouTubeRuntimeTimedTextUrlToTrack(runtimeUrl, trackUrl) {
+    const runtime = safeUrl(runtimeUrl);
+    if (!runtime || !trackUrl) {
+      return runtimeUrl;
+    }
+
+    const scoped = new URL(trackUrl.toString());
+    const transferableParams = [
+      "pot",
+      "c",
+      "cver",
+      "cplayer",
+      "cplatform",
+      "cbrand",
+      "cbr",
+      "cos",
+      "cosver",
+      "xorb",
+      "xobt",
+      "xovt"
+    ];
+
+    for (const key of transferableParams) {
+      const value = runtime.searchParams.get(key);
+      if (value) {
+        scoped.searchParams.set(key, value);
+      }
+    }
+
+    const runtimeFormat = runtime.searchParams.get("fmt");
+    if (runtimeFormat) {
+      scoped.searchParams.set("fmt", runtimeFormat);
+    }
+
+    return scoped.toString();
+  }
+
+  function isYouTubeTimedTextUrlForVideo(url, videoId) {
+    const urlVideoId = getYouTubeUrlVideoId(url);
+    return !videoId || !urlVideoId || urlVideoId === videoId;
+  }
+
+  function scoreYouTubeTimedTextUrl(url, wantedTrack) {
     const parsed = safeUrl(url);
     if (!parsed) {
       return 0;
     }
 
     let score = 1;
-    const language = parsed.searchParams.get("lang") || "";
+    const language = normalizeYouTubeTimedTextParam(parsed.searchParams.get("lang") || "");
     const name = parsed.searchParams.get("name") || "";
+    const kind = normalizeYouTubeTimedTextParam(parsed.searchParams.get("kind") || "");
+    const wantedLanguage = normalizeYouTubeTimedTextParam(wantedTrack.language);
+    const wantedName = wantedTrack.name || "";
+    const wantedKind = normalizeYouTubeTimedTextParam(wantedTrack.kind);
+
+    if (wantedLanguage) {
+      if (language !== wantedLanguage) {
+        return 0;
+      }
+      score += 40;
+    }
+    if (wantedName) {
+      if (name !== wantedName) {
+        return 0;
+      }
+      score += 20;
+    }
+    if (wantedKind) {
+      if (kind !== wantedKind) {
+        return 0;
+      }
+      score += 8;
+    }
     if (parsed.searchParams.has("pot")) {
       score += 100;
     }
     if (parsed.searchParams.get("fmt") === "json3") {
       score += 20;
     }
-    if (wantedLanguage && language.toLowerCase() === wantedLanguage.toLowerCase()) {
-      score += 40;
-    }
-    if (wantedName && name === wantedName) {
-      score += 20;
-    }
     return score;
+  }
+
+  function normalizeYouTubeTimedTextParam(value) {
+    return String(value || "").trim().toLowerCase();
+  }
+
+  function transcriptMatchesTrackLanguage(track, transcript) {
+    const expected = getTrackLanguageFamily(track);
+    const actual = detectTranscriptLanguageFamily(transcript);
+    if (expected === "zh" || actual === "zh" || actual === "mixed") {
+      if (!transcriptMatchesTrackChineseScript(track, transcript)) {
+        return false;
+      }
+    }
+    if (actual === "mixed") {
+      return true;
+    }
+    return !expected || !actual || expected === actual;
+  }
+
+  function transcriptPanelMatchesTrack(track, transcript) {
+    if (!transcriptMatchesTrackLanguage(track, transcript)) {
+      return false;
+    }
+
+    const expectedScript = getTrackChineseScript(track);
+    if (!expectedScript) {
+      return true;
+    }
+
+    return detectTranscriptChineseScript(transcript) === expectedScript;
+  }
+
+  function transcriptMatchesTrackChineseScript(track, transcript) {
+    const expectedScript = getTrackChineseScript(track);
+    if (!expectedScript) {
+      return true;
+    }
+
+    const actualScript = detectTranscriptChineseScript(transcript);
+    return !actualScript || actualScript === expectedScript;
+  }
+
+  function getTrackLanguageFamily(track) {
+    const value = normalizeSearchText(`${track?.language || ""} ${track?.label || ""}`);
+    if (/(^|[^a-z])zh([^a-z]|$)|chinese|中文|汉语|漢語|普通话|國語|国语|简体|繁体|繁體/.test(value)) {
+      return "zh";
+    }
+    if (/(^|[^a-z])en([^a-z]|$)|english|英语|英文/.test(value)) {
+      return "en";
+    }
+    if (/(^|[^a-z])ja([^a-z]|$)|japanese|日本語|日语|日語|日文/.test(value)) {
+      return "ja";
+    }
+    return "";
+  }
+
+  function getTrackChineseScript(track) {
+    const value = normalizeSearchText(`${track?.language || ""} ${track?.label || ""}`);
+    if (/(zh[-_]?hant|zh[-_]?(tw|hk|mo)|繁|繁體|繁体|臺灣|台灣|台湾|台語|臺語)/.test(value)) {
+      return "hant";
+    }
+    if (/(zh[-_]?hans|zh[-_]?(cn|sg)|简|簡|简体|簡體|中国|中國|大陆|大陸|普通话|普通話)/.test(value)) {
+      return "hans";
+    }
+    return "";
+  }
+
+  function detectTranscriptLanguageFamily(transcript) {
+    const sample = getTranscriptTextLines(transcript)
+      .slice(0, 40)
+      .join(" ");
+    const cjkCount = (sample.match(/[\u3400-\u9fff]/g) || []).length;
+    const kanaCount = (sample.match(/[\u3040-\u30ff]/g) || []).length;
+    const latinWordCount = (sample.match(/[a-z][a-z']+/gi) || []).length;
+    const latinCharCount = (sample.match(/[a-z]/gi) || []).length;
+
+    if (kanaCount >= 4 && latinWordCount >= 8 && latinCharCount >= kanaCount * 0.35) {
+      return "mixed";
+    }
+    if (cjkCount >= 8 && latinWordCount >= 8 && latinCharCount >= cjkCount * 0.35) {
+      return "mixed";
+    }
+
+    if (kanaCount >= 4) {
+      return "ja";
+    }
+    if (cjkCount >= 8 && cjkCount >= latinWordCount) {
+      return "zh";
+    }
+    if (latinWordCount >= 10 && cjkCount < latinWordCount * 0.25) {
+      return "en";
+    }
+    if (cjkCount >= 4) {
+      return "zh";
+    }
+    if (latinWordCount >= 6) {
+      return "en";
+    }
+    return "";
+  }
+
+  function detectTranscriptChineseScript(transcript) {
+    const sample = getTranscriptTextLines(transcript)
+      .slice(0, 60)
+      .join(" ");
+    const traditionalCount = countChars(sample, "這個為來後臺與國語學習體點還開關觀聽說讓選擇發現條軌錄轉經濟責任錯誤實際決策領導麼歲嗎對時會內容");
+    const simplifiedCount = countChars(sample, "这个为来后台与国语学习体点还开关观听说让选择发现条轨录转经济责任错误实际决策领导么岁吗对时会内容");
+
+    if (traditionalCount >= 2 && traditionalCount >= simplifiedCount * 1.4) {
+      return "hant";
+    }
+    if (simplifiedCount >= 2 && simplifiedCount >= traditionalCount * 1.4) {
+      return "hans";
+    }
+    return "";
+  }
+
+  function countChars(value, chars) {
+    const lookup = new Set([...chars]);
+    return [...String(value || "")].filter((char) => lookup.has(char)).length;
   }
 
   function buildYouTubeTimedTextUrls(sourceUrl, formats) {
@@ -669,16 +1534,24 @@
   async function loadYouTubeTranscriptPanelText() {
     const existing = getYouTubeTranscriptPanelText();
     if (existing) {
+      beginYouTubeTranscriptProbe();
+      scheduleCloseYouTubeTranscriptPanel();
       return existing;
     }
 
+    beginYouTubeTranscriptProbe();
     const opened = await openYouTubeTranscriptPanel();
     if (!opened) {
+      endYouTubeTranscriptProbe();
       return "";
     }
 
-    await waitForCondition(() => Boolean(getYouTubeTranscriptPanelText()), 8000, 250);
-    return getYouTubeTranscriptPanelText();
+    try {
+      await waitForCondition(() => Boolean(getYouTubeTranscriptPanelText()), 3500, 150);
+      return getYouTubeTranscriptPanelText();
+    } finally {
+      scheduleCloseYouTubeTranscriptPanel();
+    }
   }
 
   async function openYouTubeTranscriptPanel() {
@@ -742,8 +1615,107 @@
     }));
   }
 
+  function beginYouTubeTranscriptProbe() {
+    document.documentElement.dataset.vcsTranscriptProbe = "true";
+  }
+
+  function endYouTubeTranscriptProbe() {
+    delete document.documentElement.dataset.vcsTranscriptProbe;
+  }
+
+  function scheduleCloseYouTubeTranscriptPanel(options = {}) {
+    const attempts = options.attempts ?? 12;
+    const delayMs = options.delayMs ?? 180;
+    let count = 0;
+
+    clearTimeout(transcriptPanelCloseTimer);
+
+    const tick = () => {
+      const panel = getYouTubeTranscriptPanelElement();
+      if (!panel) {
+        endYouTubeTranscriptProbe();
+        return;
+      }
+
+      closeYouTubeTranscriptPanel(panel);
+      count += 1;
+
+      if (count >= attempts) {
+        suppressYouTubeTranscriptPanel(panel);
+        endYouTubeTranscriptProbe();
+        return;
+      }
+
+      transcriptPanelCloseTimer = window.setTimeout(tick, delayMs);
+    };
+
+    transcriptPanelCloseTimer = window.setTimeout(tick, delayMs);
+  }
+
+  function closeYouTubeTranscriptPanel(panel = null) {
+    const targetPanel = panel || getYouTubeTranscriptPanelElement();
+    if (!targetPanel) {
+      return false;
+    }
+
+    const closeButton = findTranscriptCloseButton(targetPanel);
+    if (!closeButton) {
+      return false;
+    }
+
+    clickElement(closeButton);
+    return true;
+  }
+
+  function suppressYouTubeTranscriptPanel(panel = null) {
+    const targetPanel = panel || getYouTubeTranscriptPanelElement();
+    if (!targetPanel) {
+      return false;
+    }
+
+    const container = targetPanel.closest?.("ytd-engagement-panel-section-list-renderer") || targetPanel;
+    container.dataset.vcsSuppressed = "true";
+    container.setAttribute("hidden", "");
+    container.style.display = "none";
+    return true;
+  }
+
+  function getYouTubeTranscriptPanelElement() {
+    const element = document.querySelector([
+      "ytd-engagement-panel-section-list-renderer[target-id*='transcript' i]",
+      "ytd-engagement-panel-section-list-renderer[visibility='ENGAGEMENT_PANEL_VISIBILITY_EXPANDED'] ytd-transcript-renderer",
+      "ytd-transcript-renderer",
+      "ytd-transcript-search-panel-renderer"
+    ].join(","));
+    return element?.closest?.("ytd-engagement-panel-section-list-renderer") || element;
+  }
+
+  function findTranscriptCloseButton(panel) {
+    const container = panel.closest?.("ytd-engagement-panel-section-list-renderer") || panel;
+    const buttons = [
+      ...container.querySelectorAll("button, tp-yt-paper-icon-button, yt-icon-button, ytd-button-renderer")
+    ];
+    const closeWords = ["关闭", "關閉", "隐藏", "隱藏", "收起", "close", "dismiss", "hide"];
+
+    return buttons.find((button) => {
+      const value = normalizeSearchText([
+        button.id || "",
+        button.className || "",
+        button.getAttribute("aria-label") || "",
+        button.getAttribute("title") || "",
+        button.getAttribute("tooltip") || "",
+        button.textContent || ""
+      ].join(" "));
+      return closeWords.some((word) => value.includes(word));
+    }) || null;
+  }
+
   function getYouTubeTranscriptPanelText() {
-    const segments = [...document.querySelectorAll("ytd-transcript-segment-renderer")]
+    const segments = [...document.querySelectorAll([
+      "ytd-transcript-segment-renderer",
+      "ytd-transcript-segment-list-renderer [role='button']",
+      "[target-id*='transcript' i] [role='button']"
+    ].join(","))]
       .map(parseYouTubeTranscriptSegment)
       .filter(Boolean);
 
@@ -751,69 +1723,228 @@
       return uniqueValues(segments).join("\n");
     }
 
-    const transcriptContainer = document.querySelector(
-      "ytd-transcript-renderer, ytd-transcript-search-panel-renderer, ytd-transcript-segment-list-renderer"
-    );
-    if (!transcriptContainer) {
-      return "";
+    const transcriptContainers = [
+      ...document.querySelectorAll([
+        "ytd-transcript-renderer",
+        "ytd-transcript-search-panel-renderer",
+        "ytd-transcript-segment-list-renderer",
+        "ytd-engagement-panel-section-list-renderer[target-id*='transcript' i]",
+        "ytd-engagement-panel-section-list-renderer[visibility='ENGAGEMENT_PANEL_VISIBILITY_EXPANDED']",
+        "[aria-label*='转写' i]",
+        "[aria-label*='transcript' i]"
+      ].join(","))
+    ].filter((element) => !root?.contains(element));
+
+    for (const container of transcriptContainers) {
+      const text = normalizeTranscriptPanelText(container.innerText || container.textContent || "");
+      if (text.length > 80) {
+        return text;
+      }
     }
 
-    const text = normalizeTranscriptPanelText(transcriptContainer.innerText || transcriptContainer.textContent || "");
-    return text.length > 120 ? text : "";
+    return "";
   }
 
   function parseYouTubeTranscriptSegment(segment) {
-    const lines = String(segment.innerText || segment.textContent || "")
-      .split(/\n+/)
-      .map((line) => line.trim())
-      .filter(Boolean);
+    const structuredTime = getYouTubeTranscriptSegmentTime(segment);
+    const structuredContent = getYouTubeTranscriptSegmentContent(segment, structuredTime);
+    if (structuredContent) {
+      return formatTranscriptCue(structuredTime, structuredContent);
+    }
+
+    const lines = getTranscriptTextLines(segment.innerText || segment.textContent || "");
 
     if (!lines.length) {
       return "";
+    }
+
+    const inline = lines.map(parseTimeContentLine).find((item) => item);
+    if (inline) {
+      return formatTranscriptCue(inline.time, inline.content);
     }
 
     const timeIndex = lines.findIndex((line) => isTimeLabel(line));
     const time = timeIndex >= 0 ? lines[timeIndex] : "";
     const content = lines
       .filter((_line, index) => index !== timeIndex)
+      .filter((line) => !isTranscriptPanelChromeLine(line))
       .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
+      .replace(/\s+/g, " ");
 
-    if (!content) {
-      return "";
+    return formatTranscriptCue(time, content);
+  }
+
+  function getYouTubeTranscriptSegmentTime(segment) {
+    const selectors = [
+      ".segment-timestamp",
+      "#timestamp",
+      "[class*='timestamp' i]",
+      "[id*='timestamp' i]"
+    ];
+    for (const selector of selectors) {
+      const value = segment.querySelector?.(selector)?.textContent || "";
+      const time = getTranscriptTextLines(value).find(isTimeLabel);
+      if (time) {
+        return time;
+      }
     }
+    return getTranscriptTextLines(segment.getAttribute?.("aria-label") || "").find(isTimeLabel) || "";
+  }
 
-    return time ? `[${time}] ${content}` : content;
+  function getYouTubeTranscriptSegmentContent(segment, time = "") {
+    const selectors = [
+      "#segment-text",
+      "yt-formatted-string#segment-text",
+      "[class*='segment-text' i]",
+      "[id*='segment-text' i]"
+    ];
+    for (const selector of selectors) {
+      const element = segment.querySelector?.(selector);
+      if (!element) {
+        continue;
+      }
+      const content = cleanTranscriptSegmentContent(element.innerText || element.textContent || "", time);
+      if (content) {
+        return content;
+      }
+    }
+    return "";
   }
 
   function normalizeTranscriptPanelText(text) {
-    const lines = String(text || "")
-      .split(/\n+/)
-      .map((line) => line.trim())
-      .filter(Boolean);
+    const lines = getTranscriptTextLines(text);
     const output = [];
 
     for (let index = 0; index < lines.length; index += 1) {
+      const inline = parseTimeContentLine(lines[index]);
+      if (inline) {
+        const cue = formatTranscriptCue(inline.time, inline.content);
+        if (cue) {
+          output.push(cue);
+        }
+        continue;
+      }
+
       if (!isTimeLabel(lines[index])) {
         continue;
       }
       const time = lines[index];
       const contentParts = [];
-      for (let next = index + 1; next < lines.length && !isTimeLabel(lines[next]); next += 1) {
+      for (let next = index + 1; next < lines.length && !isTimeLabel(lines[next]) && !parseTimeContentLine(lines[next]); next += 1) {
         contentParts.push(lines[next]);
       }
-      const content = contentParts.join(" ").replace(/\s+/g, " ").trim();
-      if (content) {
-        output.push(`[${time}] ${content}`);
+      const content = contentParts
+        .filter((line) => !isTranscriptPanelChromeLine(line))
+        .join(" ")
+        .replace(/\s+/g, " ");
+      const cue = formatTranscriptCue(time, content);
+      if (cue) {
+        output.push(cue);
       }
     }
 
     return uniqueValues(output).join("\n");
   }
 
+  function formatTranscriptCue(time, content) {
+    const clean = cleanTranscriptSegmentContent(content, time);
+    if (!clean) {
+      return "";
+    }
+    return time ? `[${time}] ${clean}` : clean;
+  }
+
+  function cleanTranscriptSegmentContent(content, time = "") {
+    const value = String(content || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!value || isTranscriptPanelChromeLine(value)) {
+      return "";
+    }
+    return stripLeadingSpokenTimestamp(value, time)
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function isTranscriptPanelChromeLine(value) {
+    return /^(转写文稿|搜索转写内容|Transcript|Search transcript|正在播放|当前正在播放|currently playing)$/i
+      .test(String(value || "").trim());
+  }
+
   function isTimeLabel(value) {
     return /^\d{1,2}:\d{2}(?::\d{2})?$/.test(String(value || "").trim());
+  }
+
+  function parseTimeContentLine(value) {
+    const match = String(value || "")
+      .trim()
+      .match(/^(\d{1,2}:\d{2}(?::\d{2})?)\s*(.+)$/);
+    if (!match) {
+      return null;
+    }
+
+    const content = match[2]
+      .replace(/\s+/g, " ")
+      .trim();
+    return content ? { time: match[1], content } : null;
+  }
+
+  function stripLeadingSpokenTimestamp(value, time = "") {
+    const prefix = parseSpokenTimestampPrefix(value);
+    if (!prefix || !time) {
+      return value;
+    }
+
+    const cueSeconds = time ? Math.floor(parseTimestamp(time)) : Number.NaN;
+    if (Number.isFinite(cueSeconds) && Math.abs(prefix.seconds - cueSeconds) > 1) {
+      return value;
+    }
+
+    return value.slice(prefix.length).trim();
+  }
+
+  function parseSpokenTimestampPrefix(value) {
+    const match = String(value || "").match(
+      /^((?:(\d+)\s*(?:小时|小時|hours?\b|hrs?\b|h\b)\s*)?(?:(\d+)\s*(?:分钟|分鐘|分|minutes?\b|mins?\b|m\b)\s*)?(\d+)\s*(?:秒钟|秒鐘|秒|seconds?\b|secs?\b|sec\.?\b|s\b)[\s:：，,.\-]*)/i
+    );
+    if (!match) {
+      return null;
+    }
+    return {
+      length: match[1].length,
+      seconds: (Number(match[2]) || 0) * 3600
+        + (Number(match[3]) || 0) * 60
+        + (Number(match[4]) || 0)
+    };
+  }
+
+  function getTranscriptTextLines(text) {
+    return String(text || "")
+      .replace(/\r/g, "\n")
+      .split(/\n+/)
+      .flatMap(splitPackedTranscriptLine)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  }
+
+  function splitPackedTranscriptLine(line) {
+    const value = String(line || "").trim();
+    const matches = [...value.matchAll(/\d{1,2}:\d{2}(?::\d{2})?/g)];
+    if (matches.length < 2) {
+      return [value];
+    }
+
+    const chunks = [];
+    if (matches[0].index > 0) {
+      chunks.push(value.slice(0, matches[0].index));
+    }
+    for (let index = 0; index < matches.length; index += 1) {
+      const start = matches[index].index;
+      const end = matches[index + 1]?.index ?? value.length;
+      chunks.push(value.slice(start, end));
+    }
+    return chunks;
   }
 
   async function waitForCondition(predicate, timeoutMs, intervalMs) {
@@ -842,14 +1973,16 @@
 
   async function summarize() {
     try {
-      setStatus("正在准备字幕", "busy");
-      const transcript = await loadSelectedTranscript();
-      state.transcript = transcript;
-      render();
+      setStatus(t("content.status.preparing"), "busy");
+      const transcript = await hydrateTranscriptPreview();
+      const streamId = `summary-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      beginSummaryStream(streamId);
 
-      setStatus("正在请求 AI 总结", "busy");
+      setStatus(t("content.status.requestingSummary"), "busy");
       const response = await chrome.runtime.sendMessage({
         type: "VCS_SUMMARIZE",
+        stream: true,
+        streamId,
         payload: {
           title: state.title,
           platform: state.platform?.name || "Unknown",
@@ -859,36 +1992,371 @@
       });
 
       if (!response?.ok) {
-        throw new Error(response?.error || "总结失败。");
+        throw new Error(response?.error || t("content.status.summaryFailed"));
       }
 
-      state.lastSummary = response.payload.text;
-      setStatus(`完成：${response.payload.provider} / ${response.payload.model}`, "done");
-      render();
+      await finishSummaryStream(response.payload.text || "");
+      setStatus(t("content.status.complete", {
+        provider: response.payload.provider,
+        model: response.payload.model
+      }), "done");
     } catch (error) {
+      stopSummaryStream();
       setStatus(error.message, "error");
       render();
     }
   }
 
-  function getManualTranscript() {
-    return shadow?.querySelector("#vcs-manual")?.value.trim() || "";
+  function beginSummaryStream(streamId) {
+    summaryTargetText = "";
+    state.lastSummary = "";
+    state.summaryCollapsed = false;
+    state.summaryStreaming = true;
+    state.summaryStreamId = streamId;
+    render();
+  }
+
+  function appendSummaryStreamDelta(streamId, delta) {
+    if (!delta || !state.summaryStreaming || streamId !== state.summaryStreamId) {
+      return;
+    }
+
+    const shouldRevealSummary = !state.lastSummary && !summaryTargetText;
+    summaryTargetText += String(delta);
+    if (shouldRevealSummary) {
+      revealSummaryOutput();
+    }
+    state.lastSummary = summaryTargetText;
+    updateSummaryArticle();
+  }
+
+  async function finishSummaryStream(finalText) {
+    const cleanText = String(finalText || "").trim();
+    const hadSummaryOutput = Boolean(state.lastSummary || summaryTargetText);
+    if (cleanText && summaryTargetText.trim() !== cleanText) {
+      summaryTargetText = cleanText;
+    }
+    if (summaryTargetText && state.lastSummary !== summaryTargetText) {
+      state.lastSummary = summaryTargetText;
+    }
+    if (!hadSummaryOutput && summaryTargetText) {
+      revealSummaryOutput();
+    }
+
+    state.summaryStreaming = false;
+    state.summaryStreamId = "";
+    cancelSummaryFollowScroll();
+    syncSummaryOutputState();
+    updateSummaryArticle();
+  }
+
+  function stopSummaryStream() {
+    state.summaryStreaming = false;
+    state.summaryStreamId = "";
+    summaryTargetText = state.lastSummary || summaryTargetText;
+    cancelSummaryFollowScroll();
+  }
+
+  function resetSummaryStream() {
+    state.summaryStreaming = false;
+    state.summaryStreamId = "";
+    summaryTargetText = "";
+    state.summaryCollapsed = false;
+    cancelSummaryFollowScroll();
+  }
+
+  function updateSummaryArticle() {
+    const article = shadow?.querySelector("#vcs-summary");
+    if (!article) {
+      return;
+    }
+
+    article.innerHTML = markdownToHtml(state.lastSummary);
+    const details = shadow?.querySelector(".vcs-summary-details");
+    if (state.summaryStreaming && details && !details.hidden) {
+      placeSummaryCursor(article);
+      requestSummaryFollowScroll();
+    }
+  }
+
+  function revealSummaryOutput() {
+    const details = shadow?.querySelector(".vcs-summary-details");
+    if (!details) {
+      render();
+      return;
+    }
+
+    details.hidden = false;
+    details.open = !state.summaryCollapsed;
+    syncSummaryOutputState();
+  }
+
+  function syncSummaryOutputState() {
+    const details = shadow?.querySelector(".vcs-summary-details");
+    if (!details) {
+      return;
+    }
+
+    const hasSummaryOutput = Boolean(state.lastSummary || summaryTargetText);
+    details.hidden = !hasSummaryOutput;
+    details.classList.toggle("is-streaming", state.summaryStreaming);
+
+    const shell = details.querySelector(".vcs-summary-shell");
+    if (shell) {
+      shell.classList.toggle("is-streaming", state.summaryStreaming);
+      shell.setAttribute("aria-busy", state.summaryStreaming ? "true" : "false");
+    }
+  }
+
+  function updateSummarizeButtonLabel() {
+    const label = shadow?.querySelector("#vcs-summarize .vcs-primary-label");
+    if (label) {
+      label.textContent = state.statusTone === "busy" ? t("content.label.summarizeBusy") : t("content.label.summarize");
+    }
+  }
+
+  function placeSummaryCursor(article) {
+    const cursor = article.ownerDocument.createElement("span");
+    cursor.className = "vcs-stream-cursor";
+    cursor.setAttribute("aria-hidden", "true");
+
+    findSummaryCursorTarget(article).appendChild(cursor);
+  }
+
+  function findSummaryCursorTarget(article) {
+    const lastBlock = article.lastElementChild;
+    if (!lastBlock) {
+      return article;
+    }
+
+    if (lastBlock.matches("ul, ol")) {
+      return lastBlock.querySelector("li:last-child") || lastBlock;
+    }
+
+    if (lastBlock.matches("p, li, h3, h4, h5")) {
+      return lastBlock;
+    }
+
+    return article;
+  }
+
+  function requestSummaryFollowScroll() {
+    cancelSummaryFollowScroll();
+    summaryScrollFrame = requestAnimationFrame(() => {
+      summaryScrollFrame = null;
+      const shell = shadow?.querySelector(".vcs-summary-shell");
+      const cursor = shadow?.querySelector(".vcs-stream-cursor");
+      if (!shell || !cursor) {
+        return;
+      }
+
+      const shellRect = shell.getBoundingClientRect();
+      const cursorRect = cursor.getBoundingClientRect();
+      const bottomPadding = 18;
+      const bottomOverflow = cursorRect.bottom - shellRect.bottom + bottomPadding;
+
+      if (bottomOverflow > 0) {
+        shell.scrollTop += bottomOverflow;
+        return;
+      }
+
+      if (cursorRect.top < shellRect.top) {
+        shell.scrollTop += cursorRect.top - shellRect.top - bottomPadding;
+      }
+    });
+  }
+
+  function cancelSummaryFollowScroll() {
+    if (summaryScrollFrame) {
+      cancelAnimationFrame(summaryScrollFrame);
+      summaryScrollFrame = null;
+    }
   }
 
   function setStatus(message, tone = "neutral", progress = null) {
     state.status = message;
     state.statusTone = tone;
     state.progress = progress;
+    const panel = shadow?.querySelector(".vcs-panel");
+    if (panel) {
+      panel.dataset.tone = tone;
+    }
     const status = shadow?.querySelector("#vcs-status");
     if (status) {
-      status.textContent = message;
       status.dataset.tone = tone;
+      swapStatusText(status, message);
+    }
+    updateSummarizeButtonLabel();
+    const progressEl = shadow?.querySelector(".vcs-progress");
+    if (progressEl) {
+      progressEl.dataset.tone = tone;
     }
     const bar = shadow?.querySelector("#vcs-progress-bar");
     if (bar) {
       const percent = progress?.total ? Math.round((progress.current / progress.total) * 100) : 0;
       bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
     }
+  }
+
+  async function hydrateTranscriptPreview(options = {}) {
+    const silent = Boolean(options.silent);
+    if (previewPromise) {
+      return previewPromise;
+    }
+
+    const loadId = ++transcriptRunId;
+    const pageKey = options.pageKey || getPageKey();
+    const cachedTranscript = getSelectedCachedTranscript();
+    if (cachedTranscript) {
+      state.previewLoading = false;
+      state.transcript = cachedTranscript;
+      lastActiveTranscriptIndex = -1;
+      if (!silent) {
+        setStatus(t("content.status.transcriptRead", { count: cachedTranscript.length }), "done");
+      }
+      render();
+      return cachedTranscript;
+    }
+
+    state.previewLoading = true;
+    if (!silent) {
+      setStatus(t("content.status.readingTranscript"), "busy");
+    }
+    render();
+
+    previewPromise = loadSelectedTranscript()
+      .then((transcript) => {
+        if (!isCurrentTranscriptLoad(loadId, pageKey)) {
+          throw new Error(t("content.error.transcriptChanged"));
+        }
+        const cleanText = normalizeLoadedTranscript(transcript);
+        if (!cleanText) {
+          throw new Error(t("content.error.noTranscript"));
+        }
+        const cacheKey = getTranscriptCacheKey(getSelectedTrack());
+        if (cacheKey) {
+          transcriptCache.set(cacheKey, cleanText);
+        }
+        state.transcript = cleanText;
+        lastActiveTranscriptIndex = -1;
+        if (!silent || state.status === t("content.status.waitingForAd")) {
+          setStatus(t("content.status.transcriptRead", { count: cleanText.length }), "done");
+        }
+        return cleanText;
+      })
+      .catch((error) => {
+        if (isCurrentTranscriptLoad(loadId, pageKey)) {
+          setStatus(t("content.status.readFailed", { message: error.message }), "error");
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (!isCurrentTranscriptLoad(loadId, pageKey)) {
+          return;
+        }
+        state.previewLoading = false;
+        previewPromise = null;
+        render();
+      });
+
+    return previewPromise;
+  }
+
+  function getSelectedCachedTranscript() {
+    const track = getSelectedTrack();
+    const cacheKey = getTranscriptCacheKey(track);
+    return cacheKey ? transcriptCache.get(cacheKey) || "" : "";
+  }
+
+  function normalizeLoadedTranscript(transcript) {
+    const lines = getTranscriptTextLines(transcript);
+    if (!lines.length) {
+      return String(transcript || "").trim();
+    }
+    return removeDuplicateTranscriptLines(lines).join("\n").trim();
+  }
+
+  function removeDuplicateTranscriptLines(lines) {
+    const output = [];
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const current = parseTranscriptLineParts(lines[index]);
+      const previous = parseTranscriptLineParts(output[output.length - 1] || "");
+      const next = parseTranscriptLineParts(lines[index + 1] || "");
+
+      if (!current.time && current.key) {
+        if ((previous.time && previous.key === current.key) || (next.time && next.key === current.key)) {
+          continue;
+        }
+      }
+
+      if (current.time && current.key && !previous.time && previous.key === current.key) {
+        output.pop();
+      }
+
+      const last = parseTranscriptLineParts(output[output.length - 1] || "");
+      if (last.key && last.key === current.key && last.time === current.time) {
+        continue;
+      }
+
+      output.push(lines[index]);
+    }
+
+    return output;
+  }
+
+  function parseTranscriptLineParts(line) {
+    const value = String(line || "").trim();
+    const bracketed = value.match(/^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.*)$/);
+    const inline = bracketed ? null : parseTimeContentLine(value);
+    const time = bracketed?.[1] || inline?.time || "";
+    const content = (bracketed?.[2] || inline?.content || value).trim();
+    return {
+      time,
+      content,
+      key: normalizeTranscriptContent(content)
+    };
+  }
+
+  function normalizeTranscriptContent(content) {
+    return String(content || "")
+      .replace(/\s+/g, "")
+      .replace(/[，。！？、；：,.!?;:"“”'‘’()[\]【】]/g, "")
+      .toLowerCase();
+  }
+
+  function isCurrentTranscriptLoad(loadId, pageKey) {
+    return loadId === transcriptRunId && pageKey === getPageKey();
+  }
+
+  function swapStatusText(element, nextText) {
+    if (!element) {
+      return;
+    }
+
+    clearTimeout(statusSwapTimer);
+    element.classList.remove("is-exit", "is-enter-start");
+    if (element.textContent === nextText) {
+      return;
+    }
+
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      element.textContent = nextText;
+      return;
+    }
+
+    const duration = parseFloat(getComputedStyle(element).getPropertyValue("--text-swap-dur")) || 200;
+    element.classList.add("is-exit");
+    statusSwapTimer = setTimeout(() => {
+      if (!element.isConnected) {
+        return;
+      }
+      element.textContent = nextText;
+      element.classList.remove("is-exit");
+      element.classList.add("is-enter-start");
+      void element.offsetHeight;
+      element.classList.remove("is-enter-start");
+    }, duration);
   }
 
   function render() {
@@ -904,81 +2372,101 @@
     const progressWidth = state.progress?.total
       ? Math.round((state.progress.current / state.progress.total) * 100)
       : 0;
-    const summarizeLabel = state.statusTone === "busy" ? "正在解析…" : "解析字幕";
+    const summarizeLabel = state.statusTone === "busy" ? t("content.label.summarizeBusy") : t("content.label.summarize");
+    const previewPlaceholder = state.previewLoading
+      ? t("content.label.previewLoading")
+      : t("content.label.previewPlaceholder");
+    const previewContent = state.transcript
+      ? renderTranscriptPreview(state.transcript)
+      : `<span class="vcs-transcript-placeholder">${escapeHtml(previewPlaceholder)}</span>`;
+    const hasSummaryOutput = Boolean(state.lastSummary || summaryTargetText);
+    const summaryOpen = !state.summaryCollapsed;
 
     const trackCount = state.tracks.length
-      ? `字幕 · ${state.tracks.length}`
-      : "无字幕轨";
+      ? t("content.label.trackCount", { count: state.tracks.length })
+      : t("content.label.noTrack");
+    const platformLabel = state.platform?.name || "video";
+    const collapsedMeta = state.tracks.length
+      ? t("content.label.collapsedTracks", { platform: platformLabel, count: state.tracks.length })
+      : `${platformLabel} · ${state.status}`;
     const embedClass = state.embedded ? "is-embedded" : "is-floating";
 
     shadow.innerHTML = `
       <style>${getPanelCss()}</style>
-      <aside class="vcs-panel ${state.collapsed ? "is-collapsed" : ""} ${embedClass}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
-        <button id="vcs-expand" class="vcs-collapsed-toggle" type="button" title="展开字幕摘要" aria-label="展开字幕摘要">
-          <span class="vcs-collapsed-icon">${expandIcon()}</span>
-          <span class="vcs-collapsed-title">字幕摘要</span>
+      <aside class="vcs-panel t-resize ${state.collapsed ? "is-collapsed" : ""} ${embedClass}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
+        <button id="vcs-expand" class="vcs-collapsed-toggle" type="button" title="${escapeHtml(t("content.title.expand"))}" aria-label="${escapeHtml(t("content.title.expand"))}">
+          <span class="vcs-collapsed-icon"><img src="${escapeHtml(AI_MARK_URL)}" alt=""></span>
+          <span class="vcs-collapsed-copy">
+            <span class="vcs-collapsed-title">${escapeHtml(t("content.title"))}</span>
+            <span class="vcs-collapsed-meta">${escapeHtml(collapsedMeta)}</span>
+          </span>
+          <span class="vcs-collapsed-arrow">${chevronRightIcon()}</span>
         </button>
 
         <header class="vcs-header">
           <div class="vcs-brand">
-            <div class="vcs-seal" aria-hidden="true"><span>AI</span></div>
+            <div class="vcs-seal" aria-hidden="true"><img src="${escapeHtml(AI_MARK_URL)}" alt=""></div>
             <div class="vcs-brand-text">
-              <div class="vcs-title">字幕摘要</div>
-              <div class="vcs-subtitle">${escapeHtml(state.platform?.name || "video")} · ${escapeHtml(activeProfile)}</div>
+              <div class="vcs-title">${escapeHtml(t("content.title"))}</div>
+              <div class="vcs-subtitle">${escapeHtml(platformLabel)} · ${escapeHtml(activeProfile)}</div>
             </div>
           </div>
           <div class="vcs-actions">
-            <button id="vcs-refresh" class="vcs-icon-button ${state.refreshing ? "is-spinning" : ""}" data-motion="spin" title="重新检测字幕" aria-label="重新检测">${refreshIcon()}</button>
-            <button id="vcs-options" class="vcs-icon-button" data-motion="gear" title="打开设置" aria-label="设置">${settingsIcon()}</button>
-            <button id="vcs-collapse" class="vcs-icon-button vcs-collapse-button" title="折叠面板" aria-label="折叠面板">${collapseIcon()}</button>
+            <button id="vcs-refresh" class="vcs-icon-button ${state.refreshing ? "is-spinning" : ""}" data-motion="spin" title="${escapeHtml(t("content.title.refresh"))}" aria-label="${escapeHtml(t("content.title.refresh"))}">${refreshIcon()}</button>
+            <button id="vcs-options" class="vcs-icon-button" data-motion="gear" title="${escapeHtml(t("content.title.options"))}" aria-label="${escapeHtml(t("content.title.settings"))}">${settingsIcon()}</button>
+            <button id="vcs-collapse" class="vcs-icon-button vcs-collapse-button" title="${escapeHtml(t("content.title.collapse"))}" aria-label="${escapeHtml(t("content.title.collapse"))}">${chevronRightIcon()}</button>
           </div>
         </header>
 
-        <section class="vcs-body">
+        <section class="vcs-body t-panel-slide" data-open="${state.collapsed ? "false" : "true"}">
           <div class="vcs-meta-line">
-            <span class="vcs-meta-title" title="${escapeHtml(state.title)}">${escapeHtml(state.title || "未命名视频")}</span>
+            <span class="vcs-meta-title" title="${escapeHtml(state.title)}">${escapeHtml(state.title || t("content.label.unnamedVideo"))}</span>
           </div>
 
           <div class="vcs-status-wrap">
-            <div id="vcs-status" class="vcs-status" data-tone="${escapeHtml(state.statusTone)}">${escapeHtml(state.status)}</div>
+            <div id="vcs-status" class="vcs-status t-text-swap" data-tone="${escapeHtml(state.statusTone)}">${escapeHtml(state.status)}</div>
             <div class="vcs-progress" data-tone="${escapeHtml(state.statusTone)}"><span id="vcs-progress-bar" style="width:${progressWidth}%"></span></div>
           </div>
 
           <button id="vcs-summarize" class="vcs-primary" type="button">
-            <span>${escapeHtml(summarizeLabel)}</span>
+            <span class="vcs-primary-label">${escapeHtml(summarizeLabel)}</span>
           </button>
+
+          <details class="vcs-result vcs-details vcs-summary-details ${state.summaryStreaming ? "is-streaming" : ""}" aria-live="polite" ${hasSummaryOutput ? "" : "hidden"} ${summaryOpen ? "open" : ""}>
+            <summary>
+              <span class="vcs-result-title">${escapeHtml(t("content.label.summary"))}</span>
+              <button id="vcs-copy-summary" class="vcs-tool-button ${state.copyingSummary ? "is-busy" : ""}" type="button" title="${escapeHtml(t("content.title.copySummary"))}" aria-label="${escapeHtml(t("content.title.copySummary"))}">${copyButtonIcon(state.copyingSummary)}</button>
+              <span class="vcs-details-chevron" aria-hidden="true">${chevronRightIcon()}</span>
+            </summary>
+            <div class="vcs-summary-shell ${state.summaryStreaming ? "is-streaming" : ""}" role="region" aria-label="${escapeHtml(t("content.label.markdownSummary"))}" aria-busy="${state.summaryStreaming ? "true" : "false"}" tabindex="0">
+              <article id="vcs-summary" class="vcs-markdown">${markdownToHtml(state.lastSummary)}</article>
+            </div>
+          </details>
 
           <div class="vcs-track-row">
             <span class="vcs-track-label">${escapeHtml(trackCount)}</span>
             <select id="vcs-track" class="vcs-select" ${state.tracks.length ? "" : "disabled"}>
-              ${trackOptions || "<option>未发现字幕轨道</option>"}
+              ${trackOptions || `<option>${escapeHtml(t("content.label.noTrackOption"))}</option>`}
             </select>
-            <button id="vcs-copy-transcript" class="vcs-tool-button ${state.copyingTranscript ? "is-busy" : ""}" type="button" title="复制字幕" aria-label="复制字幕">${state.copyingTranscript ? loadingIcon() : copyIcon()}</button>
+            <button id="vcs-copy-transcript" class="vcs-tool-button ${state.copyingTranscript ? "is-busy" : ""}" type="button" title="${escapeHtml(t("content.title.copyTranscript"))}" aria-label="${escapeHtml(t("content.title.copyTranscript"))}">${copyButtonIcon(state.copyingTranscript)}</button>
           </div>
 
-          <details class="vcs-details">
-            <summary>手动粘贴字幕</summary>
-            <textarea id="vcs-manual" class="vcs-textarea" placeholder="若当前页面无法自动读取，可在此粘贴字幕原文。"></textarea>
+          <details class="vcs-details vcs-transcript-details" open>
+            <summary>
+              <span class="vcs-details-title">${escapeHtml(t("content.label.transcriptPreview"))}</span>
+              <span class="vcs-details-chevron" aria-hidden="true">${chevronRightIcon()}</span>
+            </summary>
+            <div id="vcs-preview" class="vcs-transcript-box" role="region" aria-label="${escapeHtml(t("content.label.transcriptPreviewAria"))}" data-empty="${state.transcript ? "false" : "true"}">${previewContent}</div>
           </details>
-
-          <details class="vcs-details" ${state.transcript ? "open" : ""}>
-            <summary>字幕预览</summary>
-            <textarea id="vcs-preview" class="vcs-textarea" readonly>${escapeHtml(state.transcript)}</textarea>
-          </details>
-
-          <section class="vcs-result" ${state.lastSummary ? "" : "hidden"}>
-            <div class="vcs-result-head">
-              <span class="vcs-result-title">摘要</span>
-              <button id="vcs-copy-summary" class="vcs-tool-button ${state.copyingSummary ? "is-busy" : ""}" type="button" title="复制摘要" aria-label="复制摘要">${state.copyingSummary ? loadingIcon() : copyIcon()}</button>
-            </div>
-            <article id="vcs-summary">${markdownToHtml(state.lastSummary)}</article>
-          </section>
         </section>
       </aside>
     `;
 
+    updateSummaryArticle();
     bindEvents();
     applyTheme();
+    bindVideoSync();
+    syncTranscriptToVideo(true);
   }
 
   function bindEvents() {
@@ -995,11 +2483,222 @@
       render();
     });
     shadow.querySelector("#vcs-track")?.addEventListener("change", (event) => {
+      transcriptRunId += 1;
+      previewPromise = null;
       state.selectedTrackId = event.target.value;
+      state.transcript = "";
+      lastActiveTranscriptIndex = -1;
+      hydrateTranscriptPreview().catch(() => {});
     });
     shadow.querySelector("#vcs-summarize")?.addEventListener("click", summarize);
     shadow.querySelector("#vcs-copy-transcript")?.addEventListener("click", copyTranscript);
-    shadow.querySelector("#vcs-copy-summary")?.addEventListener("click", copySummary);
+    shadow.querySelector(".vcs-summary-details")?.addEventListener("toggle", (event) => {
+      state.summaryCollapsed = !event.currentTarget.open;
+      if (event.currentTarget.open) {
+        updateSummaryArticle();
+      }
+    });
+    shadow.querySelector("#vcs-copy-summary")?.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      copySummary();
+    });
+    shadow.querySelector("#vcs-preview")?.addEventListener("click", handleTranscriptClick);
+  }
+
+  function renderTranscriptPreview(transcript) {
+    const items = parseTranscriptPreviewItems(transcript);
+    if (!items.length) {
+      return escapeHtml(transcript);
+    }
+
+    return `
+      <ol class="vcs-transcript-list" aria-label="${escapeHtml(t("content.label.transcriptTimeline"))}">
+        ${items.map(renderTranscriptItem).join("")}
+      </ol>
+    `;
+  }
+
+  function renderTranscriptItem(item) {
+    const content = escapeHtml(item.content || item.raw);
+    if (!item.time || !Number.isFinite(item.seconds)) {
+      return `
+        <li class="vcs-transcript-item">
+          <div class="vcs-transcript-row is-plain" data-index="${item.index}">
+            <span class="vcs-cue-text">${content}</span>
+          </div>
+        </li>
+      `;
+    }
+
+    return `
+      <li class="vcs-transcript-item">
+        <button class="vcs-transcript-row" type="button" data-index="${item.index}" data-seconds="${item.seconds}" aria-label="${escapeHtml(t("content.label.jumpToTime", { time: item.time }))}">
+          <span class="vcs-cue-time">${escapeHtml(item.time)}</span>
+          <span class="vcs-cue-text">${content}</span>
+        </button>
+      </li>
+    `;
+  }
+
+  function parseTranscriptPreviewItems(transcript) {
+    return getTranscriptTextLines(transcript)
+      .map((line, index) => {
+        const bracketed = line.match(/^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.*)$/);
+        const inline = bracketed ? null : parseTimeContentLine(line);
+        const time = bracketed?.[1] || inline?.time || "";
+        const content = (bracketed?.[2] || inline?.content || line).trim();
+        return {
+          index,
+          raw: line,
+          time,
+          seconds: time ? parseTimestamp(time) : Number.NaN,
+          content
+        };
+      });
+  }
+
+  function handleTranscriptClick(event) {
+    const row = event.target.closest?.(".vcs-transcript-row[data-seconds]");
+    if (!row) {
+      return;
+    }
+
+    const seconds = Number(row.dataset.seconds);
+    if (!Number.isFinite(seconds)) {
+      return;
+    }
+
+    seekVideoTo(seconds);
+  }
+
+  function bindVideoSync() {
+    const nextVideo = getPrimaryVideo();
+    if (activeVideo === nextVideo) {
+      return;
+    }
+
+    unbindVideoSync();
+    activeVideo = nextVideo;
+    if (!activeVideo) {
+      return;
+    }
+
+    activeVideo.addEventListener("timeupdate", syncTranscriptToVideo);
+    activeVideo.addEventListener("seeked", syncTranscriptToVideo);
+    activeVideo.addEventListener("play", syncTranscriptToVideo);
+  }
+
+  function unbindVideoSync() {
+    if (!activeVideo) {
+      return;
+    }
+
+    activeVideo.removeEventListener("timeupdate", syncTranscriptToVideo);
+    activeVideo.removeEventListener("seeked", syncTranscriptToVideo);
+    activeVideo.removeEventListener("play", syncTranscriptToVideo);
+    activeVideo = null;
+    lastActiveTranscriptIndex = -1;
+  }
+
+  function getPrimaryVideo() {
+    const videos = [...document.querySelectorAll("video")]
+      .filter((video) => !root?.contains(video) && isVisible(video))
+      .sort((a, b) => {
+        const rectA = a.getBoundingClientRect();
+        const rectB = b.getBoundingClientRect();
+        return (rectB.width * rectB.height) - (rectA.width * rectA.height);
+      });
+    return videos[0] || null;
+  }
+
+  function seekVideoTo(seconds) {
+    const video = activeVideo || getPrimaryVideo();
+    if (!video) {
+      return;
+    }
+
+    try {
+      video.currentTime = Math.max(0, seconds);
+      syncTranscriptToVideo(true);
+    } catch (_error) {
+      // Some embedded players can block direct seeking until media metadata is ready.
+    }
+  }
+
+  function syncTranscriptToVideo(force = false) {
+    const shouldForce = force === true;
+    const video = activeVideo || getPrimaryVideo();
+    const preview = shadow?.querySelector("#vcs-preview");
+    if (!video || !preview) {
+      return;
+    }
+
+    const rows = [...preview.querySelectorAll(".vcs-transcript-row[data-seconds]")];
+    if (!rows.length) {
+      return;
+    }
+
+    const currentTime = Number(video.currentTime) || 0;
+    let activeRow = rows[0];
+    for (const row of rows) {
+      const seconds = Number(row.dataset.seconds);
+      if (Number.isFinite(seconds) && seconds <= currentTime + 0.25) {
+        activeRow = row;
+      } else {
+        break;
+      }
+    }
+
+    const activeIndex = Number(activeRow.dataset.index);
+    if (!shouldForce && activeIndex === lastActiveTranscriptIndex) {
+      return;
+    }
+
+    preview.querySelectorAll(".vcs-transcript-row.is-active").forEach((row) => {
+      row.classList.remove("is-active");
+      row.removeAttribute("aria-current");
+    });
+    activeRow.classList.add("is-active");
+    activeRow.setAttribute("aria-current", "true");
+    lastActiveTranscriptIndex = activeIndex;
+
+    if (!isElementInsideContainer(activeRow, preview)) {
+      scrollElementInsideContainer(activeRow, preview, {
+        behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
+      });
+    }
+  }
+
+  function isElementInsideContainer(element, container) {
+    const elementRect = element.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    return elementRect.top >= containerRect.top + 8 && elementRect.bottom <= containerRect.bottom - 8;
+  }
+
+  function scrollElementInsideContainer(element, container, options = {}) {
+    const elementRect = element.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    const padding = 14;
+    const topOverflow = elementRect.top - containerRect.top - padding;
+    const bottomOverflow = elementRect.bottom - containerRect.bottom + padding;
+    let nextScrollTop = container.scrollTop;
+
+    if (topOverflow < 0) {
+      nextScrollTop += topOverflow;
+    } else if (bottomOverflow > 0) {
+      nextScrollTop += bottomOverflow;
+    }
+
+    nextScrollTop = Math.max(0, Math.min(nextScrollTop, container.scrollHeight - container.clientHeight));
+    if (Math.abs(nextScrollTop - container.scrollTop) < 1) {
+      return;
+    }
+
+    container.scrollTo({
+      top: nextScrollTop,
+      behavior: options.behavior || "auto"
+    });
   }
 
   async function copyTranscript() {
@@ -1008,23 +2707,23 @@
     }
 
     state.copyingTranscript = true;
-    setStatus("正在复制字幕", "busy");
-    render();
+    setStatus(t("content.status.copyingTranscript"), "busy");
+    setCopyButtonBusy("#vcs-copy-transcript", true);
 
     try {
-      const text = state.transcript || await loadSelectedTranscript();
+      const text = state.transcript || await hydrateTranscriptPreview();
       const cleanText = text.trim();
       if (!cleanText) {
-        throw new Error("没有可复制的字幕内容。");
+        throw new Error(t("content.error.noCopyableTranscript"));
       }
       state.transcript = cleanText;
       await copyTextToClipboard(cleanText);
-      setStatus(`字幕已复制（${cleanText.length} 字符）`, "done");
+      setStatus(t("content.status.transcriptCopied", { count: cleanText.length }), "done");
     } catch (error) {
-      setStatus(`复制失败：${error.message}`, "error");
+      setStatus(t("content.status.copyFailed", { message: error.message }), "error");
     } finally {
       state.copyingTranscript = false;
-      render();
+      setCopyButtonBusy("#vcs-copy-transcript", false);
     }
   }
 
@@ -1034,21 +2733,21 @@
     }
 
     state.copyingSummary = true;
-    setStatus("正在复制摘要", "busy");
-    render();
+    setStatus(t("content.status.copyingSummary"), "busy");
+    setCopyButtonBusy("#vcs-copy-summary", true);
 
     try {
       const text = (state.lastSummary || "").trim();
       if (!text) {
-        throw new Error("还没有可复制的摘要。");
+        throw new Error(t("content.error.noCopyableSummary"));
       }
       await copyTextToClipboard(text);
-      setStatus("摘要已复制", "done");
+      setStatus(t("content.status.summaryCopied"), "done");
     } catch (error) {
-      setStatus(`复制失败：${error.message}`, "error");
+      setStatus(t("content.status.copyFailed", { message: error.message }), "error");
     } finally {
       state.copyingSummary = false;
-      render();
+      setCopyButtonBusy("#vcs-copy-summary", false);
     }
   }
 
@@ -1080,7 +2779,7 @@
     textarea.remove();
 
     if (!copied) {
-      throw new Error("浏览器拒绝写入剪贴板。");
+      throw new Error(t("content.error.clipboardDenied"));
     }
   }
 
@@ -1089,6 +2788,44 @@
     if (panel) {
       panel.dataset.theme = getTheme();
     }
+  }
+
+  function applyPagePolish() {
+    const platform = detectPlatform();
+    if (platform?.kind !== "youtube") {
+      removePagePolish();
+      return;
+    }
+
+    if (document.getElementById(PAGE_STYLE_ID)) {
+      return;
+    }
+
+    const style = document.createElement("style");
+    style.id = PAGE_STYLE_ID;
+    style.textContent = getYouTubePageCss();
+    document.documentElement.appendChild(style);
+  }
+
+  function removePagePolish() {
+    endYouTubeTranscriptProbe();
+    document.getElementById(PAGE_STYLE_ID)?.remove();
+  }
+
+  function normalizeSettings(input) {
+    const normalized = {
+      ...DEFAULT_SETTINGS,
+      ...(input || {})
+    };
+    const importedVersion = Number(input?.settingsVersion || 0);
+    normalized.settingsVersion = DEFAULT_SETTINGS.settingsVersion;
+    normalized.theme = ["auto", "light", "dark"].includes(normalized.theme) ? normalized.theme : DEFAULT_SETTINGS.theme;
+    normalized.uiLanguage = globalThis.VCS_I18N.normalizeUiLanguage(normalized.uiLanguage);
+    normalized.language = String(normalized.language || "").trim() || DEFAULT_SETTINGS.language;
+    normalized.panelEnabled = normalized.panelEnabled !== false;
+    normalized.includeTimestamps = normalized.includeTimestamps !== false;
+    normalized.saveHistory = importedVersion < 2 ? true : normalized.saveHistory !== false;
+    return normalized;
   }
 
   function getTheme() {
@@ -1127,10 +2864,10 @@
     return document.querySelector("h1")?.textContent?.trim() || document.title.trim();
   }
 
-  function getJsonAssignment(name) {
+  function getJsonAssignment(name, validator = null) {
     for (const script of document.scripts) {
       const value = getJsonAssignmentFromText(script.textContent || "", name);
-      if (value) {
+      if (value && (!validator || validator(value))) {
         return value;
       }
     }
@@ -1144,7 +2881,7 @@
       .join("\n");
   }
 
-  function extractYouTubeCaptionTracks(text) {
+  function extractYouTubeCaptionTracks(text, videoId = "") {
     if (!text) {
       return [];
     }
@@ -1160,8 +2897,9 @@
       if (arrayText) {
         try {
           const tracks = JSON.parse(arrayText);
-          if (Array.isArray(tracks) && tracks.some((track) => track?.baseUrl)) {
-            return tracks;
+          const currentTracks = filterYouTubeCaptionTracksForVideo(tracks, videoId);
+          if (currentTracks.length) {
+            return currentTracks;
           }
         } catch (_error) {
           // Keep scanning in case the first match is not the player caption list.
@@ -1172,6 +2910,28 @@
     }
 
     return [];
+  }
+
+  function filterYouTubeCaptionTracksForVideo(tracks, videoId = "") {
+    if (!Array.isArray(tracks)) {
+      return [];
+    }
+
+    const usableTracks = tracks.filter((track) => track?.baseUrl);
+    if (!videoId) {
+      return usableTracks;
+    }
+
+    const tracksWithVideoId = usableTracks.filter((track) => getYouTubeUrlVideoId(track.baseUrl));
+    if (!tracksWithVideoId.length) {
+      return usableTracks;
+    }
+
+    return usableTracks.filter((track) => getYouTubeUrlVideoId(track.baseUrl) === videoId);
+  }
+
+  function getYouTubeUrlVideoId(url) {
+    return safeUrl(url)?.searchParams.get("v") || "";
   }
 
   function getJsonAssignmentFromText(text, name) {
@@ -1299,10 +3059,46 @@
     return match?.[1] || "";
   }
 
+  function getBilibiliIdsFromText(text) {
+    const source = String(text || "");
+    const bvid = source.match(/"bvid"\s*:\s*"(BV[^"]+)"/i)?.[1]
+      || source.match(/\b(BV[0-9A-Za-z]+)/)?.[1]
+      || "";
+    const aid = source.match(/"aid"\s*:\s*(\d+)/i)?.[1]
+      || source.match(/"aid"\s*:\s*"(\d+)"/i)?.[1]
+      || "";
+    const cid = source.match(/"cid"\s*:\s*(\d+)/i)?.[1]
+      || source.match(/"cid"\s*:\s*"(\d+)"/i)?.[1]
+      || "";
+    return { bvid, aid, cid };
+  }
+
+  function getBilibiliCidFromRuntimeUrls() {
+    const urls = [
+      location.href,
+      ...performance.getEntriesByType("resource").map((entry) => entry.name || "")
+    ];
+    for (const value of urls) {
+      const url = safeUrl(value);
+      const cid = url?.searchParams.get("cid");
+      if (cid) {
+        return cid;
+      }
+    }
+    return "";
+  }
+
   function getCidFromPage(initialState) {
-    const pages = initialState.videoData?.pages || [];
-    const page = pages.find((item) => String(item.page) === new URLSearchParams(location.search).get("p"));
-    return page?.cid || pages[0]?.cid || "";
+    const videoData = initialState.videoData || initialState.videoInfo || {};
+    const pages = videoData.pages || initialState.pages || [];
+    const pageNumber = new URLSearchParams(location.search).get("p") || "1";
+    const page = pages.find((item) => String(item.page) === pageNumber)
+      || pages[Number(pageNumber) - 1]
+      || pages[0];
+    return videoData.cid
+      || initialState.epInfo?.cid
+      || page?.cid
+      || "";
   }
 
   function getVisibleTranscript() {
@@ -1365,7 +3161,12 @@
 
   function parseBilibiliTranscript(text) {
     const json = JSON.parse(text);
-    const lines = (json.body || [])
+    const body = Array.isArray(json?.body)
+      ? json.body
+      : Array.isArray(json?.data?.body)
+        ? json.data.body
+        : [];
+    const lines = body
       .map((item) => {
         const start = formatSeconds(Number(item.from) || 0);
         const content = String(item.content || "").replace(/\s+/g, " ").trim();
@@ -1482,6 +3283,7 @@
     const html = [];
     let paragraph = [];
     let inList = false;
+    let listType = "";
 
     const flushParagraph = () => {
       if (paragraph.length) {
@@ -1492,8 +3294,20 @@
 
     const closeList = () => {
       if (inList) {
-        html.push("</ul>");
+        html.push(`</${listType}>`);
         inList = false;
+        listType = "";
+      }
+    };
+
+    const openList = (type) => {
+      if (inList && listType !== type) {
+        closeList();
+      }
+      if (!inList) {
+        html.push(`<${type}>`);
+        inList = true;
+        listType = type;
       }
     };
 
@@ -1506,37 +3320,85 @@
         continue;
       }
 
+      if (/^---+$/.test(line)) {
+        flushParagraph();
+        closeList();
+        html.push("<hr>");
+        continue;
+      }
+
+      if (line.startsWith("# ")) {
+        flushParagraph();
+        closeList();
+        html.push(`<h3>${renderInlineMarkdown(line.slice(2))}</h3>`);
+        continue;
+      }
+
       if (line.startsWith("### ")) {
         flushParagraph();
         closeList();
-        html.push(`<h4>${escapeHtml(line.slice(4))}</h4>`);
+        html.push(`<h5>${renderInlineMarkdown(line.slice(4))}</h5>`);
         continue;
       }
 
       if (line.startsWith("## ")) {
         flushParagraph();
         closeList();
-        html.push(`<h3>${escapeHtml(line.slice(3))}</h3>`);
+        html.push(`<h4>${renderInlineMarkdown(line.slice(3))}</h4>`);
         continue;
       }
 
-      if (line.startsWith("- ")) {
+      if (/^[-*]\s+/.test(line)) {
         flushParagraph();
-        if (!inList) {
-          html.push("<ul>");
-          inList = true;
-        }
-        html.push(`<li>${escapeHtml(line.slice(2))}</li>`);
+        openList("ul");
+        html.push(`<li>${renderInlineMarkdown(line.replace(/^[-*]\s+/, ""))}</li>`);
+        continue;
+      }
+
+      if (/^\d+\.\s+/.test(line)) {
+        flushParagraph();
+        openList("ol");
+        html.push(`<li>${renderInlineMarkdown(line.replace(/^\d+\.\s+/, ""))}</li>`);
         continue;
       }
 
       closeList();
-      paragraph.push(escapeHtml(line));
+      paragraph.push(renderInlineMarkdown(line));
     }
 
     flushParagraph();
     closeList();
     return html.join("");
+  }
+
+  function renderInlineMarkdown(value) {
+    const placeholders = [];
+    let html = escapeHtml(value);
+
+    const stash = (replacement) => {
+      const token = `@@VCSMD${placeholders.length}@@`;
+      placeholders.push(replacement);
+      return token;
+    };
+
+    html = html.replace(/`([^`]+)`/g, (_match, code) => {
+      return stash(`<code>${code}</code>`);
+    });
+
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_match, label, url) => {
+      const href = escapeHtml(url);
+      return stash(`<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`);
+    });
+    html = html
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+      .replace(/_([^_]+)_/g, "<em>$1</em>");
+
+    placeholders.forEach((replacement, index) => {
+      html = html.replace(`@@VCSMD${index}@@`, replacement);
+    });
+    return html;
   }
 
   function pad(value) {
@@ -1551,20 +3413,118 @@
     return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z'/><path d='M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1A2 2 0 1 1 4.2 17l.1-.1A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1A2 2 0 1 1 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3h.1a1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.6h.1a1.7 1.7 0 0 0 1.9-.3l.1-.1A2 2 0 1 1 19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.6 1h.1a2 2 0 1 1 0 4H21a1.7 1.7 0 0 0-1.6 1Z'/></svg>";
   }
 
-  function collapseIcon() {
-    return "<svg viewBox='0 0 24 24' aria-hidden='true'><rect x='4' y='5' width='16' height='14' rx='1'/><path d='M15 5v14'/><path d='M10 9l-3 3 3 3'/></svg>";
-  }
-
-  function expandIcon() {
-    return "<svg viewBox='0 0 24 24' aria-hidden='true'><rect x='4' y='5' width='16' height='14' rx='1'/><path d='M9 5v14'/><path d='M14 9l3 3-3 3'/></svg>";
+  function chevronRightIcon() {
+    return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M9 6l6 6-6 6'/></svg>";
   }
 
   function copyIcon() {
-    return "<svg viewBox='0 0 24 24' aria-hidden='true'><rect x='9' y='9' width='13' height='13' rx='2'/><path d='M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'/></svg>";
+    return "<svg class='vcs-copy-icon' viewBox='0 0 24 24' aria-hidden='true'><rect x='8' y='8' width='14' height='14' rx='2'/><path d='M16 4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2'/></svg>";
   }
 
   function loadingIcon() {
     return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3a9 9 0 1 0 9 9'/></svg>";
+  }
+
+  function copyButtonIcon(isBusy) {
+    return `
+      <span class="t-icon-swap" data-state="${isBusy ? "b" : "a"}">
+        <span class="t-icon" data-icon="a">${copyIcon()}</span>
+        <span class="t-icon" data-icon="b">${loadingIcon()}</span>
+      </span>
+    `;
+  }
+
+  function setCopyButtonBusy(selector, isBusy) {
+    const button = shadow?.querySelector(selector);
+    if (!button) {
+      return;
+    }
+    button.classList.toggle("is-busy", isBusy);
+    button.querySelector(".t-icon-swap")?.setAttribute("data-state", isBusy ? "b" : "a");
+  }
+
+  function getYouTubePageCss() {
+    return `
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i],
+      ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"] ytd-transcript-renderer {
+        --vcs-yt-transcript-body-size: 13.5px;
+        --vcs-yt-transcript-time-size: 11px;
+        --vcs-yt-transcript-title-size: 19px;
+      }
+
+      html[data-vcs-transcript-probe="true"] ytd-engagement-panel-section-list-renderer[target-id*="transcript" i],
+      html[data-vcs-transcript-probe="true"] ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"]:has(ytd-transcript-renderer),
+      ytd-engagement-panel-section-list-renderer[data-vcs-suppressed="true"] {
+        max-height: 0 !important;
+        min-height: 0 !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        opacity: 0 !important;
+        overflow: hidden !important;
+        pointer-events: none !important;
+        visibility: hidden !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] #header,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] .header {
+        padding-block: 12px !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] h2,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] #title,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] yt-formatted-string#title {
+        font-size: var(--vcs-yt-transcript-title-size) !important;
+        line-height: 1.25 !important;
+        letter-spacing: 0 !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] #content,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] #content *,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-renderer,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-renderer * {
+        font-size: var(--vcs-yt-transcript-body-size) !important;
+        letter-spacing: 0 !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-renderer,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-list-renderer [role="button"] {
+        align-items: flex-start !important;
+        column-gap: 8px !important;
+        padding-block: 5px !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-renderer yt-formatted-string,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-renderer #segment-text,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-renderer [id*="text" i],
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-list-renderer yt-formatted-string,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-list-renderer #segment-text,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-list-renderer [id*="text" i],
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] ytd-transcript-segment-list-renderer [role="button"] {
+        font-size: var(--vcs-yt-transcript-body-size) !important;
+        line-height: 1.42 !important;
+        letter-spacing: 0 !important;
+        font-weight: 500 !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] .segment-timestamp,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] #timestamp,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] yt-formatted-string[class*="timestamp" i],
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] [class*="timestamp" i],
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] [id*="timestamp" i] {
+        font-size: var(--vcs-yt-transcript-time-size) !important;
+        line-height: 1.3 !important;
+        font-weight: 600 !important;
+      }
+
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] input,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] tp-yt-paper-input,
+      ytd-engagement-panel-section-list-renderer[target-id*="transcript" i] yt-searchbox input {
+        font-size: 14px !important;
+        line-height: 1.35 !important;
+      }
+    `;
   }
 
   function getPanelCss() {
@@ -1574,33 +3534,60 @@
 
       .vcs-panel {
         --washi: #f7f7f7;
-        --washi-soft: #f1f1f1;
-        --paper: #ffffff;
-        --sumi: #0f0f0f;
-        --sumi-soft: #3f3f3f;
-        --nezumi: #606060;
-        --haijiro: #dedede;
-        --haijiro-soft: #eeeeee;
-        --rikyu: #0f0f0f;
-        --shu: #0f0f0f;
-        --good: #107c41;
-        --bad: #cc0000;
+        --washi-soft: #eeeeee;
+        --paper: #f1f1f1;
+        --paper-elevated: #f3f3f3;
+        --sumi: #111111;
+        --sumi-soft: #343434;
+        --nezumi: #6b6b6b;
+        --haijiro: #e0e0e0;
+        --haijiro-soft: #e8e8e8;
+        --rikyu: #111111;
+        --shu: #111111;
+        --clay: #767676;
+        --button: #111111;
+        --button-hover: #2a2a2a;
+        --neumo-surface: #ededed;
+        --neumo-text: #090909;
+        --neumo-muted: #666666;
+        --neumo-shadow-dark: #d1d1d1;
+        --neumo-shadow-light: #ffffff;
+        --good: #111111;
+        --bad: #b00020;
+        --shadow: rgba(0, 0, 0, 0.12);
+
+        --resize-dur: 300ms;
+        --resize-ease: cubic-bezier(0.22, 1, 0.36, 1);
+        --panel-open-dur: 240ms;
+        --panel-close-dur: 200ms;
+        --panel-translate-y: 8px;
+        --panel-blur: 2px;
+        --panel-ease: cubic-bezier(0.22, 1, 0.36, 1);
+        --text-swap-dur: 200ms;
+        --text-swap-translate-y: 8px;
+        --text-swap-blur: 2px;
+        --text-swap-ease: ease-out;
+        --icon-swap-dur: 200ms;
+        --icon-swap-blur: 2px;
+        --icon-swap-start-scale: 0.25;
+        --icon-swap-ease: ease-in-out;
 
         --sans: -apple-system, BlinkMacSystemFont, "Roboto", "Arial", "PingFang SC", "Hiragino Sans", "Microsoft YaHei", sans-serif;
         --serif: var(--sans);
 
         position: relative;
-        display: block;
+        display: flex;
+        flex-direction: column;
         width: 100%;
-        margin: 0 0 16px;
+        margin: 0 0 14px;
         color: var(--sumi);
         background: var(--paper);
-        border: 1px solid var(--haijiro);
-        border-radius: 6px;
+        border: 1px solid color-mix(in srgb, var(--haijiro) 54%, transparent);
+        border-radius: 8px;
         font: 13px/1.7 var(--sans);
         letter-spacing: 0;
         overflow: hidden;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+        box-shadow: 0 10px 26px color-mix(in srgb, var(--shadow) 72%, transparent);
         transform-origin: top right;
         animation: vcs-panel-in 180ms ease both;
       }
@@ -1615,34 +3602,52 @@
         margin: 0;
       }
 
+      .vcs-panel.is-embedded:not(.is-collapsed) {
+        height: auto;
+        max-height: none;
+      }
+
       .vcs-panel[data-theme="dark"] {
         --washi: #181818;
-        --washi-soft: #202020;
-        --paper: #0f0f0f;
-        --sumi: #f1f1f1;
+        --washi-soft: #242424;
+        --paper: #101010;
+        --paper-elevated: #151515;
+        --sumi: #f4f4f4;
         --sumi-soft: #d0d0d0;
         --nezumi: #a0a0a0;
-        --haijiro: #303030;
-        --haijiro-soft: #242424;
-        --rikyu: #ffffff;
-        --shu: #ffffff;
-        --good: #64d884;
-        --bad: #ff6b6b;
+        --haijiro: #3a3a3a;
+        --haijiro-soft: #292929;
+        --rikyu: #f4f4f4;
+        --shu: #f4f4f4;
+        --clay: #9a9a9a;
+        --button: #f4f4f4;
+        --button-hover: #ffffff;
+        --neumo-surface: #242424;
+        --neumo-text: #f4f4f4;
+        --neumo-muted: #a8a8a8;
+        --neumo-shadow-dark: #151515;
+        --neumo-shadow-light: #343434;
+        --good: #f4f4f4;
+        --bad: #ff6b7a;
+        --shadow: rgba(0, 0, 0, 0.32);
       }
 
       .vcs-header {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 12px;
-        padding: 14px 16px 12px;
-        border-bottom: 1px solid var(--haijiro);
+        gap: 10px;
+        padding: 12px 14px 10px;
+        border-bottom: 1px solid color-mix(in srgb, var(--haijiro) 48%, transparent);
+        background:
+          linear-gradient(90deg, color-mix(in srgb, var(--washi) 64%, transparent), transparent 58%),
+          var(--paper-elevated);
       }
 
       .vcs-brand {
         display: flex;
         align-items: center;
-        gap: 12px;
+        gap: 10px;
         min-width: 0;
       }
 
@@ -1650,25 +3655,26 @@
         flex: 0 0 auto;
         display: grid;
         place-items: center;
-        width: 30px;
-        height: 30px;
+        width: 36px;
+        height: 36px;
+        padding: 3px;
         color: var(--paper);
-        background: var(--shu);
-        border-radius: 4px;
-        font: 700 12px/1 var(--sans);
-        letter-spacing: 0;
+        background: color-mix(in srgb, var(--shu) 92%, var(--clay));
+        border: 1px solid color-mix(in srgb, var(--paper-elevated) 26%, transparent);
+        border-radius: 7px;
         user-select: none;
       }
-      .vcs-panel[data-theme="dark"] .vcs-seal {
-        color: var(--paper);
-        background: var(--sumi);
+      .vcs-seal img {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
       }
-      .vcs-seal span { transform: translateY(0.5px); }
 
       .vcs-brand-text { min-width: 0; }
       .vcs-title {
         color: var(--sumi);
-        font: 650 14px/1.3 var(--sans);
+        font: 720 14px/1.22 var(--sans);
         letter-spacing: 0;
         white-space: nowrap;
       }
@@ -1681,55 +3687,89 @@
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-        max-width: 220px;
+        max-width: 218px;
       }
 
       .vcs-actions {
         display: flex;
         align-items: center;
-        gap: 2px;
+        gap: 4px;
       }
 
       .vcs-icon-button, .vcs-tool-button {
         display: inline-grid;
         place-items: center;
-        width: 26px;
-        height: 26px;
+        width: 24px;
+        height: 24px;
         padding: 0;
-        color: var(--nezumi);
-        background: transparent;
-        border: 0;
-        border-radius: 4px;
+        color: var(--neumo-muted);
+        background: var(--neumo-surface);
+        border: 1px solid var(--neumo-surface);
+        border-radius: 999px;
         cursor: pointer;
-        transition: color 180ms ease, background 180ms ease, transform 180ms ease;
+        box-shadow:
+          inset 1.5px 1.5px 3px color-mix(in srgb, var(--neumo-shadow-dark) 74%, transparent),
+          inset -1.5px -1.5px 3px color-mix(in srgb, var(--neumo-shadow-light) 76%, transparent);
+        transition:
+          color 180ms ease,
+          background 180ms ease,
+          border-color 180ms ease,
+          box-shadow 180ms ease,
+          transform 180ms ease;
       }
       .vcs-icon-button:hover, .vcs-tool-button:hover {
-        color: var(--sumi);
-        background: var(--washi-soft);
-        transform: translateY(-1px);
+        color: var(--neumo-text);
+        box-shadow:
+          inset 1px 1px 2px color-mix(in srgb, var(--neumo-shadow-dark) 64%, transparent),
+          inset -1px -1px 2px color-mix(in srgb, var(--neumo-shadow-light) 70%, transparent);
       }
-      .vcs-icon-button:active, .vcs-tool-button:active,
-      .vcs-primary:active, .vcs-collapsed-toggle:active {
-        transform: translateY(0) scale(0.98);
+      .vcs-icon-button:active, .vcs-tool-button:active {
+        color: var(--neumo-muted);
+        transform: translateY(0);
+        box-shadow:
+          inset 2px 2px 4px color-mix(in srgb, var(--neumo-shadow-dark) 82%, transparent),
+          inset -2px -2px 4px color-mix(in srgb, var(--neumo-shadow-light) 76%, transparent);
       }
       .vcs-icon-button.is-spinning svg {
         animation: vcs-spin 720ms cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
         transform-origin: 50% 50%;
       }
-      .vcs-tool-button.is-busy svg {
+      .vcs-tool-button.is-busy .t-icon[data-icon="b"] svg {
         animation: vcs-spin 760ms linear infinite;
         transform-origin: 50% 50%;
       }
       .vcs-icon-button[data-motion="gear"]:hover svg {
         transform: rotate(38deg);
       }
+      .vcs-collapse-button svg {
+        transform: rotate(90deg);
+        transform-origin: 50% 50%;
+      }
       .vcs-collapse-button:hover svg {
-        transform: translateX(-1px);
+        transform: rotate(90deg) translateX(1px);
+      }
+      .vcs-track-row .vcs-tool-button {
+        width: 22px;
+        height: 22px;
+        justify-self: center;
+        align-self: center;
+      }
+      .vcs-track-row .vcs-tool-button svg {
+        width: 12px;
+        height: 12px;
+      }
+      .vcs-track-row .vcs-tool-button .t-icon-swap,
+      .vcs-track-row .vcs-tool-button .t-icon {
+        width: 14px;
+        height: 14px;
+      }
+      .vcs-track-row .vcs-copy-icon {
+        transform: translate(-0.5px, -0.5px);
       }
 
       svg {
-        width: 14px;
-        height: 14px;
+        width: 13px;
+        height: 13px;
         fill: none;
         stroke: currentColor;
         stroke-width: 1.8;
@@ -1738,55 +3778,149 @@
         transition: transform 180ms ease;
       }
 
+      .t-resize {
+        transition:
+          width  var(--resize-dur) var(--resize-ease),
+          height var(--resize-dur) var(--resize-ease);
+        will-change: width, height;
+      }
+
+      .t-panel-slide {
+        transform: translateY(var(--panel-translate-y));
+        opacity: 0;
+        filter: blur(var(--panel-blur));
+        pointer-events: none;
+        transition:
+          transform var(--panel-close-dur) var(--panel-ease),
+          opacity   var(--panel-close-dur) var(--panel-ease),
+          filter    var(--panel-close-dur) var(--panel-ease);
+        will-change: transform, opacity, filter;
+      }
+      .t-panel-slide[data-open="true"] {
+        transform: translateY(0);
+        opacity: 1;
+        filter: blur(0);
+        pointer-events: auto;
+        transition:
+          transform var(--panel-open-dur) var(--panel-ease),
+          opacity   var(--panel-open-dur) var(--panel-ease),
+          filter    var(--panel-open-dur) var(--panel-ease);
+      }
+
+      .t-text-swap {
+        display: inline-block;
+        transform: translateY(0);
+        filter: blur(0);
+        opacity: 1;
+        transition:
+          transform var(--text-swap-dur) var(--text-swap-ease),
+          filter    var(--text-swap-dur) var(--text-swap-ease),
+          opacity   var(--text-swap-dur) var(--text-swap-ease);
+        will-change: transform, filter, opacity;
+      }
+      .t-text-swap.is-exit {
+        transform: translateY(calc(var(--text-swap-translate-y) * -1));
+        filter: blur(var(--text-swap-blur));
+        opacity: 0;
+      }
+      .t-text-swap.is-enter-start {
+        transform: translateY(var(--text-swap-translate-y));
+        filter: blur(var(--text-swap-blur));
+        opacity: 0;
+        transition: none;
+      }
+
+      .t-icon-swap {
+        position: relative;
+        display: inline-grid;
+        place-items: center;
+      }
+      .t-icon-swap .t-icon {
+        grid-area: 1 / 1;
+        display: grid;
+        place-items: center;
+        transition:
+          opacity   var(--icon-swap-dur) var(--icon-swap-ease),
+          filter    var(--icon-swap-dur) var(--icon-swap-ease),
+          transform var(--icon-swap-dur) var(--icon-swap-ease);
+        will-change: opacity, filter, transform;
+      }
+      .t-icon-swap[data-state="a"] .t-icon[data-icon="a"],
+      .t-icon-swap[data-state="b"] .t-icon[data-icon="b"] {
+        opacity: 1;
+        filter: blur(0);
+        transform: scale(1);
+      }
+      .t-icon-swap[data-state="a"] .t-icon[data-icon="b"],
+      .t-icon-swap[data-state="b"] .t-icon[data-icon="a"] {
+        opacity: 0;
+        filter: blur(var(--icon-swap-blur));
+        transform: scale(var(--icon-swap-start-scale));
+      }
+
       .vcs-body {
         display: grid;
-        gap: 14px;
-        padding: 16px;
+        flex: 1 1 auto;
+        gap: 10px;
+        padding: 14px;
         max-height: 78vh;
-        overflow: auto;
+        min-height: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
       }
       .vcs-panel.is-floating .vcs-body {
         max-height: calc(100vh - 200px);
       }
+      .vcs-panel.is-embedded .vcs-body {
+        max-height: none;
+        overflow: visible;
+      }
 
       .vcs-body::-webkit-scrollbar,
-      #vcs-summary::-webkit-scrollbar,
-      .vcs-textarea::-webkit-scrollbar {
+      .vcs-summary-shell::-webkit-scrollbar,
+      .vcs-transcript-box::-webkit-scrollbar {
         width: 6px;
         height: 6px;
       }
       .vcs-body::-webkit-scrollbar-thumb,
-      #vcs-summary::-webkit-scrollbar-thumb,
-      .vcs-textarea::-webkit-scrollbar-thumb {
-        background: var(--haijiro);
-        border-radius: 0;
+      .vcs-summary-shell::-webkit-scrollbar-thumb,
+      .vcs-transcript-box::-webkit-scrollbar-thumb {
+        background: color-mix(in srgb, var(--haijiro) 82%, transparent);
+        border-radius: 999px;
       }
 
       .vcs-meta-line {
+        padding: 9px 11px;
         font-size: 12px;
         color: var(--sumi-soft);
         line-height: 1.5;
+        background: var(--neumo-surface);
+        border: 1px solid color-mix(in srgb, var(--neumo-surface) 86%, var(--haijiro-soft));
+        border-radius: 8px;
+        box-shadow:
+          inset 2px 2px 5px color-mix(in srgb, var(--neumo-shadow-dark) 54%, transparent),
+          inset -2px -2px 5px color-mix(in srgb, var(--neumo-shadow-light) 64%, transparent);
+        min-width: 0;
       }
       .vcs-meta-title {
         display: block;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+        overflow-wrap: anywhere;
+        white-space: normal;
         font-family: var(--sans);
         letter-spacing: 0;
       }
 
       .vcs-status-wrap {
         display: grid;
-        gap: 8px;
+        gap: 6px;
       }
       .vcs-status {
         color: var(--nezumi);
-        font-size: 12px;
+        font: 560 12px/1.5 var(--sans);
         letter-spacing: 0;
         min-height: 18px;
       }
-      .vcs-status[data-tone="busy"] { color: var(--rikyu); }
+      .vcs-status[data-tone="busy"] { color: var(--clay); }
       .vcs-status[data-tone="done"] { color: var(--good); }
       .vcs-status[data-tone="error"] { color: var(--bad); }
 
@@ -1795,13 +3929,13 @@
         height: 2px;
         border-radius: 2px;
         overflow: hidden;
-        background: var(--haijiro);
+        background: color-mix(in srgb, var(--haijiro) 72%, transparent);
       }
       .vcs-progress span {
         display: block;
         width: 0;
         height: 100%;
-        background: var(--rikyu);
+        background: linear-gradient(90deg, var(--clay), var(--rikyu));
         transition: width 280ms ease;
       }
       .vcs-progress[data-tone="done"] span { background: var(--good); }
@@ -1812,113 +3946,273 @@
       }
 
       .vcs-primary {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        justify-self: stretch;
         width: 100%;
-        height: 40px;
-        color: var(--paper);
-        background: var(--sumi);
-        border: 1px solid var(--sumi);
-        border-radius: 4px;
-        font: 650 13px/1 var(--sans);
+        min-width: 0;
+        min-height: 38px;
+        margin: 4px 0 8px;
+        padding: 0.55em 1.2em;
+        color: var(--neumo-text);
+        background: var(--neumo-surface);
+        border: 1px solid var(--neumo-surface);
+        border-radius: 0.5em;
+        font: 680 14px/1 var(--sans);
         letter-spacing: 0;
         cursor: pointer;
-        transition: background 180ms ease, color 180ms ease, transform 180ms ease;
+        box-shadow:
+          2px 2px 5px color-mix(in srgb, var(--neumo-shadow-dark) 58%, transparent),
+          -2px -2px 5px color-mix(in srgb, var(--neumo-shadow-light) 70%, transparent),
+          inset 0 0 0 color-mix(in srgb, var(--neumo-shadow-dark) 0%, transparent);
+        transition:
+          color 180ms ease,
+          box-shadow 220ms ease,
+          transform 180ms ease;
       }
       .vcs-primary:hover {
-        background: #000000;
-        border-color: #000000;
-        transform: translateY(-1px);
+        color: var(--neumo-text);
+        box-shadow:
+          2px 2px 4px color-mix(in srgb, var(--neumo-shadow-dark) 48%, transparent),
+          -2px -2px 4px color-mix(in srgb, var(--neumo-shadow-light) 62%, transparent);
       }
-      .vcs-panel[data-theme="dark"] .vcs-primary {
-        background: var(--sumi);
-        color: var(--paper);
+      .vcs-primary:active {
+        color: var(--neumo-muted);
+        box-shadow:
+          inset 2px 2px 5px color-mix(in srgb, var(--neumo-shadow-dark) 72%, transparent),
+          inset -2px -2px 5px color-mix(in srgb, var(--neumo-shadow-light) 72%, transparent);
       }
-      .vcs-panel[data-theme="dark"] .vcs-primary:hover {
-        background: #ffffff;
-        border-color: #ffffff;
-        color: #0f0f0f;
+      .vcs-primary-label {
+        display: block;
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      .vcs-collapsed-toggle:active {
+        transform: none;
       }
 
       .vcs-track-row {
         display: grid;
-        grid-template-columns: auto 1fr auto;
+        grid-template-columns: auto minmax(0, 1fr) 24px;
         align-items: center;
         gap: 8px;
-        padding-top: 4px;
-        border-top: 1px solid var(--haijiro-soft);
+        padding: 7px 0 0;
+        border-top: 0;
+        min-width: 0;
       }
       .vcs-track-label {
-        font-size: 11px;
+        font: 650 11px/1.35 var(--sans);
         color: var(--nezumi);
         letter-spacing: 0;
-        font-family: var(--sans);
+        white-space: nowrap;
       }
       .vcs-select {
         width: 100%;
         min-width: 0;
-        height: 28px;
-        padding: 0 6px;
+        height: 30px;
+        padding: 0 26px 0 8px;
         color: var(--sumi);
-        background: transparent;
-        border: 0;
-        border-bottom: 1px solid var(--haijiro);
-        border-radius: 0;
+        background:
+          linear-gradient(45deg, transparent 50%, var(--nezumi) 50%),
+          linear-gradient(135deg, var(--nezumi) 50%, transparent 50%),
+          var(--neumo-surface);
+        background-position:
+          calc(100% - 15px) 52%,
+          calc(100% - 10px) 52%,
+          0 0;
+        background-size: 5px 5px, 5px 5px, 100% 100%;
+        background-repeat: no-repeat;
+        border: 1px solid color-mix(in srgb, var(--neumo-surface) 86%, var(--haijiro-soft));
+        border-radius: 8px;
+        box-shadow:
+          inset 2px 2px 5px color-mix(in srgb, var(--neumo-shadow-dark) 54%, transparent),
+          inset -2px -2px 5px color-mix(in srgb, var(--neumo-shadow-light) 64%, transparent);
         outline: none;
+        appearance: none;
+        -webkit-appearance: none;
         font-family: var(--sans);
         font-size: 12px;
       }
-      .vcs-select:focus { border-bottom-color: var(--rikyu); }
+      .vcs-select:focus {
+        border-color: color-mix(in srgb, var(--rikyu) 22%, var(--neumo-surface));
+        box-shadow:
+          inset 2px 2px 5px color-mix(in srgb, var(--neumo-shadow-dark) 58%, transparent),
+          inset -2px -2px 5px color-mix(in srgb, var(--neumo-shadow-light) 68%, transparent);
+      }
 
       .vcs-details {
         border: 0;
-        border-top: 1px solid var(--haijiro-soft);
-        padding-top: 8px;
+        padding-top: 6px;
         background: transparent;
       }
       .vcs-details summary {
-        padding: 4px 0;
+        min-height: 28px;
+        padding: 2px 0;
         color: var(--sumi-soft);
-        font: 550 12px/1.5 var(--sans);
+        font: 650 12px/1.5 var(--sans);
         letter-spacing: 0;
         cursor: pointer;
         list-style: none;
         display: flex;
         align-items: center;
         justify-content: space-between;
+        gap: 8px;
       }
       .vcs-details summary::-webkit-details-marker { display: none; }
-      .vcs-details summary::after {
-        content: "＋";
-        color: var(--nezumi);
-        font-size: 12px;
-        line-height: 1;
-        font-weight: 400;
-        transition: transform 200ms ease;
+      .vcs-details-title {
+        min-width: 0;
+        overflow-wrap: anywhere;
       }
-      .vcs-details[open] summary::after { content: "－"; }
+      .vcs-details-chevron {
+        flex: 0 0 auto;
+        display: inline-grid;
+        place-items: center;
+        width: 24px;
+        height: 24px;
+        color: var(--neumo-muted);
+        background: var(--neumo-surface);
+        border: 1px solid var(--neumo-surface);
+        border-radius: 999px;
+        box-shadow:
+          inset 1.5px 1.5px 3px color-mix(in srgb, var(--neumo-shadow-dark) 74%, transparent),
+          inset -1.5px -1.5px 3px color-mix(in srgb, var(--neumo-shadow-light) 76%, transparent);
+        transition:
+          color 160ms ease,
+          box-shadow 180ms ease;
+      }
+      .vcs-details-chevron svg {
+        width: 13px;
+        height: 13px;
+        transform: rotate(0deg);
+        transform-origin: 50% 50%;
+        transition: transform 190ms cubic-bezier(0.22, 1, 0.36, 1);
+      }
+      .vcs-details[open] .vcs-details-chevron svg { transform: rotate(90deg); }
       .vcs-details summary:hover { color: var(--sumi); }
+      .vcs-details summary:hover .vcs-details-chevron {
+        color: var(--neumo-text);
+        box-shadow:
+          inset 1px 1px 2px color-mix(in srgb, var(--neumo-shadow-dark) 64%, transparent),
+          inset -1px -1px 2px color-mix(in srgb, var(--neumo-shadow-light) 70%, transparent);
+      }
+      .vcs-details[open] > :not(summary) {
+        animation: vcs-details-reveal 260ms var(--panel-ease) both;
+      }
 
-      .vcs-textarea {
+      .vcs-transcript-box {
         display: block;
         width: 100%;
-        min-height: 110px;
-        margin-top: 8px;
+        height: 220px;
+        margin-top: 6px;
         padding: 10px;
-        resize: vertical;
+        overflow: auto;
         color: var(--sumi);
-        background: var(--washi);
-        border: 1px solid var(--haijiro);
-        border-radius: 4px;
+        background: var(--neumo-surface);
+        border: 1px solid color-mix(in srgb, var(--neumo-surface) 86%, var(--haijiro-soft));
+        border-radius: 8px;
+        box-shadow:
+          inset 2px 2px 6px color-mix(in srgb, var(--neumo-shadow-dark) 58%, transparent),
+          inset -2px -2px 6px color-mix(in srgb, var(--neumo-shadow-light) 66%, transparent);
         outline: none;
-        font: 12px/1.7 var(--sans);
+        font: 400 11px/1.55 var(--sans);
+        overscroll-behavior: contain;
       }
-      .vcs-textarea:focus { border-color: var(--rikyu); }
+      .vcs-transcript-box[data-empty="true"] {
+        display: grid;
+        place-items: start;
+        color: var(--nezumi);
+      }
+      .vcs-transcript-placeholder {
+        color: var(--nezumi);
+      }
+      .vcs-transcript-box:focus {
+        border-color: color-mix(in srgb, var(--rikyu) 22%, var(--neumo-surface));
+      }
+      .vcs-transcript-list {
+        display: grid;
+        gap: 2px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+      .vcs-transcript-item {
+        margin: 0;
+        padding: 0;
+      }
+      .vcs-transcript-row {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: start;
+        gap: 8px;
+        width: 100%;
+        min-height: 28px;
+        padding: 4px 5px;
+        color: var(--sumi-soft);
+        background: transparent;
+        border: 0;
+        border-radius: 5px;
+        appearance: none;
+        -webkit-appearance: none;
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+        transition:
+          background 160ms ease,
+          color 160ms ease,
+          transform 160ms ease;
+      }
+      .vcs-transcript-row:hover {
+        color: var(--sumi);
+        background: color-mix(in srgb, var(--haijiro-soft) 68%, transparent);
+      }
+      .vcs-transcript-row.is-active {
+        color: var(--sumi);
+        background: color-mix(in srgb, #edf4ff 82%, transparent);
+      }
+      .vcs-transcript-row.is-plain {
+        display: block;
+        cursor: default;
+      }
+      .vcs-transcript-row.is-plain:hover {
+        color: var(--sumi-soft);
+        background: transparent;
+      }
+      .vcs-cue-time {
+        display: inline-grid;
+        place-items: center;
+        min-width: 38px;
+        height: 20px;
+        padding: 0 7px;
+        color: #5f6f8f;
+        background: #eef5ff;
+        border-radius: 999px;
+        font: 650 10.5px/1 var(--sans);
+        letter-spacing: 0;
+        white-space: nowrap;
+      }
+      .vcs-transcript-row.is-active .vcs-cue-time {
+        color: #2f4f86;
+        background: #dfeeff;
+      }
+      .vcs-cue-text {
+        min-width: 0;
+        overflow-wrap: anywhere;
+        white-space: normal;
+      }
 
       .vcs-result {
         display: grid;
-        gap: 10px;
-        padding-top: 12px;
-        border-top: 1px solid var(--sumi);
-        margin-top: 4px;
+        justify-self: center;
+        gap: 8px;
+        width: min(100%, 720px);
+        padding: 10px;
+        background: var(--neumo-surface);
+        border: 1px solid color-mix(in srgb, var(--neumo-surface) 86%, var(--haijiro-soft));
+        border-radius: 8px;
+        box-shadow:
+          inset 2px 2px 6px color-mix(in srgb, var(--neumo-shadow-dark) 54%, transparent),
+          inset -2px -2px 6px color-mix(in srgb, var(--neumo-shadow-light) 62%, transparent);
       }
       .vcs-result[hidden] { display: none; }
 
@@ -1932,16 +4226,62 @@
         letter-spacing: 0;
         color: var(--sumi);
       }
+      .vcs-summary-details summary {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto 24px;
+        align-items: center;
+        gap: 8px;
+        min-height: 28px;
+        padding: 0;
+        justify-content: initial;
+      }
+      .vcs-summary-details .vcs-result-title {
+        min-width: 0;
+        line-height: 1.3;
+      }
+      .vcs-summary-details #vcs-copy-summary {
+        grid-column: 2;
+        grid-row: 1;
+        justify-self: end;
+      }
+      .vcs-summary-details .vcs-details-chevron {
+        grid-column: 3;
+        grid-row: 1;
+        justify-self: end;
+      }
+
+      .vcs-summary-shell {
+        width: 100%;
+        max-height: clamp(260px, 42vh, 500px);
+        padding: 2px 8px 2px 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        overscroll-behavior: contain;
+        scrollbar-gutter: stable;
+      }
+      .vcs-summary-shell.is-streaming {
+        cursor: text;
+      }
+      .vcs-summary-shell:focus {
+        outline: 2px solid color-mix(in srgb, var(--rikyu) 38%, transparent);
+        outline-offset: 3px;
+        border-radius: 5px;
+      }
+      .vcs-panel.is-floating .vcs-summary-shell {
+        max-height: min(360px, 38vh);
+      }
+      .vcs-panel.is-embedded .vcs-summary-shell {
+        max-height: clamp(300px, 48vh, 560px);
+      }
 
       #vcs-summary {
         color: var(--sumi);
         background: transparent;
-        max-height: 360px;
-        overflow: auto;
         font: 13px/1.85 var(--sans);
         letter-spacing: 0;
+        overflow-wrap: anywhere;
       }
-      #vcs-summary h3, #vcs-summary h4 {
+      #vcs-summary h3, #vcs-summary h4, #vcs-summary h5 {
         margin: 16px 0 6px;
         font: 650 13px/1.5 var(--sans);
         letter-spacing: 0;
@@ -1949,60 +4289,127 @@
         padding-bottom: 4px;
         border-bottom: 1px solid var(--haijiro-soft);
       }
-      #vcs-summary h3:first-child, #vcs-summary h4:first-child { margin-top: 0; }
+      #vcs-summary h3:first-child, #vcs-summary h4:first-child, #vcs-summary h5:first-child { margin-top: 0; }
       #vcs-summary p { margin: 0 0 10px; color: var(--sumi-soft); }
-      #vcs-summary ul { margin: 0 0 10px; padding-left: 18px; color: var(--sumi-soft); }
+      #vcs-summary ul, #vcs-summary ol { margin: 0 0 10px; padding-left: 18px; color: var(--sumi-soft); }
       #vcs-summary li { margin-bottom: 4px; }
-
+      #vcs-summary strong { color: var(--sumi); font-weight: 720; }
+      #vcs-summary em { font-style: italic; }
+      #vcs-summary code {
+        padding: 1px 4px;
+        color: var(--sumi);
+        background: color-mix(in srgb, var(--haijiro-soft) 72%, transparent);
+        border-radius: 4px;
+        font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      #vcs-summary a {
+        color: var(--sumi);
+        text-decoration: underline;
+        text-decoration-color: color-mix(in srgb, var(--sumi) 38%, transparent);
+        text-underline-offset: 3px;
+      }
+      #vcs-summary hr {
+        height: 1px;
+        margin: 14px 0;
+        background: var(--haijiro-soft);
+        border: 0;
+      }
+      .vcs-stream-cursor {
+        display: inline-block;
+        width: 2px;
+        min-width: 2px;
+        height: 1.18em;
+        margin-left: 2px;
+        background: color-mix(in srgb, var(--sumi) 92%, var(--paper));
+        border-radius: 999px;
+        vertical-align: -0.22em;
+        box-shadow:
+          0 0 0 1px color-mix(in srgb, var(--sumi) 8%, transparent);
+        transform-origin: center bottom;
+        animation: vcs-caret-blink 620ms steps(1, end) infinite;
+      }
       .vcs-collapsed-toggle {
         display: none;
-        grid-template-columns: 22px auto;
+        grid-template-columns: 34px minmax(0, 1fr) 22px;
         align-items: center;
-        gap: 8px;
-        width: 136px;
-        min-height: 36px;
-        padding: 0 10px 0 8px;
+        gap: 9px;
+        width: 100%;
+        min-height: 54px;
+        padding: 8px 10px;
         color: var(--sumi);
-        background: var(--paper);
-        border: 1px solid var(--haijiro);
-        border-radius: 4px;
+        background: transparent;
+        border: 0;
+        border-radius: 0;
         cursor: pointer;
-        font: 650 12px/1 var(--sans);
+        font: 650 12px/1.2 var(--sans);
         letter-spacing: 0;
-        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.12);
+        box-shadow: none;
         transform-origin: top right;
-        animation: vcs-tab-in 180ms ease both;
-        transition: border-color 180ms ease, transform 180ms ease, box-shadow 180ms ease;
+        animation: none;
+        transition:
+          border-color 180ms ease,
+          background 180ms ease;
       }
       .vcs-collapsed-toggle:hover {
-        border-color: var(--sumi);
-        transform: translateY(-1px);
-        box-shadow: 0 14px 30px rgba(0, 0, 0, 0.16);
+        background: transparent;
       }
-      .vcs-collapsed-toggle:hover svg {
+      .vcs-collapsed-toggle:hover .vcs-collapsed-arrow svg {
         transform: translateX(1px);
       }
       .vcs-collapsed-icon {
         display: grid;
         place-items: center;
-        width: 22px;
-        height: 22px;
-        color: var(--paper);
-        background: var(--sumi);
-        border-radius: 3px;
+        width: 34px;
+        height: 34px;
+        padding: 3px;
+        background: color-mix(in srgb, var(--shu) 92%, var(--clay));
+        border-radius: 7px;
+        overflow: hidden;
+      }
+      .vcs-collapsed-icon img {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+      .vcs-collapsed-copy {
+        display: grid;
+        gap: 3px;
+        min-width: 0;
       }
       .vcs-collapsed-title {
         display: block;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+        color: var(--sumi);
+        font: 740 13px/1.2 var(--sans);
+      }
+      .vcs-collapsed-meta {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--nezumi);
+        font: 520 11px/1.35 var(--sans);
+      }
+      .vcs-collapsed-arrow {
+        display: grid;
+        place-items: center;
+        width: 24px;
+        height: 24px;
+        color: var(--nezumi);
       }
 
       .vcs-panel.is-collapsed {
-        width: auto;
-        background: transparent;
-        border: 0;
-        overflow: visible;
+        width: 100%;
+        background:
+          linear-gradient(90deg, color-mix(in srgb, var(--washi) 64%, transparent), transparent 58%),
+          var(--paper-elevated);
+        border: 1px solid color-mix(in srgb, var(--haijiro) 54%, transparent);
+        overflow: hidden;
+        box-shadow: none;
+        animation: none;
       }
       .vcs-panel.is-collapsed .vcs-header,
       .vcs-panel.is-collapsed .vcs-body {
@@ -2014,6 +4421,23 @@
       .vcs-panel.is-floating.is-collapsed {
         top: 84px;
         right: 20px;
+        width: 186px;
+      }
+      .vcs-panel.is-floating.is-collapsed .vcs-collapsed-toggle {
+        min-height: 48px;
+        grid-template-columns: 30px minmax(0, 1fr) 18px;
+        padding: 7px 9px;
+      }
+      .vcs-panel.is-floating.is-collapsed .vcs-collapsed-icon {
+        width: 30px;
+        height: 30px;
+        border-radius: 7px;
+      }
+      .vcs-panel.is-floating.is-collapsed .vcs-collapsed-title {
+        font-size: 13px;
+      }
+      .vcs-panel.is-floating.is-collapsed .vcs-collapsed-meta {
+        max-width: 108px;
       }
 
       @keyframes vcs-indeterminate {
@@ -2035,12 +4459,35 @@
         100% { opacity: 1; transform: translateX(0); }
       }
 
+      @keyframes vcs-details-reveal {
+        0% {
+          opacity: 0;
+          transform: translateY(8px);
+          filter: blur(2px);
+        }
+        100% {
+          opacity: 1;
+          transform: translateY(0);
+          filter: blur(0);
+        }
+      }
+
+      @keyframes vcs-caret-blink {
+        0%, 48% { opacity: 1; transform: translateY(0) scaleY(1); }
+        49%, 100% { opacity: 0.18; transform: translateY(0) scaleY(1); }
+      }
+
       @media (prefers-reduced-motion: reduce) {
         .vcs-panel[data-tone="busy"] .vcs-progress span { animation: none; }
         .vcs-icon-button.is-spinning svg { animation: none; }
         .vcs-tool-button.is-busy svg { animation: none; }
-        .vcs-panel, .vcs-collapsed-toggle { animation: none; }
+        .vcs-stream-cursor { animation: none; }
+        .vcs-panel, .vcs-collapsed-toggle, .vcs-details[open] > :not(summary) { animation: none; }
         .vcs-primary, .vcs-icon-button, .vcs-tool-button, .vcs-collapsed-toggle { transition: none; }
+        .t-resize { transition: none !important; }
+        .t-panel-slide { transition: none !important; }
+        .t-text-swap { transition: none !important; }
+        .t-icon-swap .t-icon { transition: none !important; }
       }
 
       @media (max-width: 1100px) {
@@ -2049,6 +4496,9 @@
           right: 16px;
           bottom: 16px;
           width: min(360px, calc(100vw - 32px));
+        }
+        .vcs-panel.is-floating.is-collapsed {
+          width: min(220px, calc(100vw - 32px));
         }
       }
     `;
