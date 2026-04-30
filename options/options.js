@@ -149,6 +149,7 @@ function bindEvents() {
   document.querySelector("#deleteProfile").addEventListener("click", deleteProfile);
   document.querySelector("#testProfile").addEventListener("click", testProfile);
   document.querySelector("#exportSettings").addEventListener("click", exportSettings);
+  document.querySelector("#exportCompleteSettings").addEventListener("click", exportCompleteSettings);
   document.querySelector("#importSettings").addEventListener("click", importSettings);
   document.querySelector("#resetSettings").addEventListener("click", resetSettings);
   document.querySelector("#clearHistory").addEventListener("click", clearHistory);
@@ -498,6 +499,27 @@ async function exportSettings() {
   downloadJson(json, `video-caption-ai-settings-${formatDateForFilename(new Date())}.json`);
   const copied = await writeClipboard(json);
   setStatus(fields.saveStatus, copied ? t("options.status.settingsExportedCopied") : t("options.status.settingsExported"), "ok");
+}
+
+async function exportCompleteSettings() {
+  saveCurrentProfileValuesOnly();
+  settings = normalizeSettings(settings);
+  const confirmed = window.confirm(t("options.confirm.exportSecrets"));
+  if (!confirmed) {
+    return;
+  }
+
+  await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
+  const payload = {
+    type: "video-caption-ai-settings",
+    version: 2,
+    exportedAt: new Date().toISOString(),
+    includesSecrets: true,
+    settings
+  };
+  const json = JSON.stringify(payload, null, 2);
+  downloadJson(json, `video-caption-ai-settings-full-${formatDateForFilename(new Date())}.json`);
+  setStatus(fields.saveStatus, t("options.status.fullSettingsExported"), "ok");
 }
 
 async function importSettings() {
@@ -935,6 +957,7 @@ function applyTranslations() {
   fields.importText.placeholder = locale.t("options.advanced.importJsonPlaceholder");
   setFieldLabel(fields.importFile, locale.t("options.advanced.importFile"));
   setText("#importSettings", locale.t("options.advanced.importSettings"));
+  setText("#exportCompleteSettings", locale.t("options.advanced.exportCompleteSettings"));
   setText("#resetSettings", locale.t("options.advanced.resetSettings"));
 }
 
