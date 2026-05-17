@@ -90,6 +90,8 @@
       getStatusPayload,
       detectPlatform,
       shouldShowPanel,
+      shouldUseFloatingPanel,
+      findEmbedTarget,
       isYouTubeShortsPage
     };
   } else {
@@ -347,6 +349,11 @@
   }
 
   function findEmbedTarget() {
+    const platform = detectPlatform();
+    if (shouldUseFloatingPanel(platform)) {
+      return document.documentElement;
+    }
+
     const host = location.hostname.replace(/^www\./, "");
     if (host.includes("youtube.com")) {
       return document.querySelector("#secondary-inner")
@@ -360,6 +367,10 @@
         || document.documentElement;
     }
     return document.documentElement;
+  }
+
+  function shouldUseFloatingPanel(platform = state.platform || detectPlatform()) {
+    return platform?.kind === "bilibili";
   }
 
   function findYouTubeShortsEmbedTarget() {
@@ -2485,11 +2496,13 @@
     const collapsedMeta = state.tracks.length
       ? t("content.label.collapsedTracks", { platform: platformLabel, count: state.tracks.length })
       : `${platformLabel} · ${state.status}`;
+    const platformKind = (state.platform || detectPlatform())?.kind || "";
+    const platformClass = platformKind ? `is-${platformKind}` : "";
     const embedClass = state.embedded ? "is-embedded" : "is-floating";
 
     shadow.innerHTML = `
       <style>${getPanelCss()}</style>
-      <aside class="vcs-panel t-resize ${state.collapsed ? "is-collapsed" : ""} ${embedClass}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
+      <aside class="vcs-panel t-resize ${state.collapsed ? "is-collapsed" : ""} ${embedClass} ${platformClass}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
         <button id="vcs-expand" class="vcs-collapsed-toggle" type="button" title="${escapeHtml(t("content.title.expand"))}" aria-label="${escapeHtml(t("content.title.expand"))}">
           <span class="vcs-collapsed-icon"><img src="${escapeHtml(AI_MARK_URL)}" alt=""></span>
           <span class="vcs-collapsed-copy">
@@ -4810,6 +4823,22 @@
         max-width: 108px;
       }
 
+      .vcs-panel.is-floating.is-bilibili {
+        top: auto;
+        right: auto;
+        bottom: 72px;
+        left: 20px;
+        width: min(360px, calc(100vw - 40px));
+        max-height: min(560px, calc(100vh - 120px));
+      }
+      .vcs-panel.is-floating.is-bilibili.is-collapsed {
+        top: auto;
+        right: auto;
+        bottom: 72px;
+        left: 20px;
+        width: min(220px, calc(100vw - 40px));
+      }
+
       @keyframes vcs-indeterminate {
         0% { transform: translateX(-100%); }
         100% { transform: translateX(280%); }
@@ -4868,6 +4897,20 @@
           width: min(360px, calc(100vw - 32px));
         }
         .vcs-panel.is-floating.is-collapsed {
+          width: min(220px, calc(100vw - 32px));
+        }
+        .vcs-panel.is-floating.is-bilibili {
+          top: auto;
+          right: auto;
+          bottom: 16px;
+          left: 16px;
+          width: min(360px, calc(100vw - 32px));
+        }
+        .vcs-panel.is-floating.is-bilibili.is-collapsed {
+          top: auto;
+          right: auto;
+          bottom: 16px;
+          left: 16px;
           width: min(220px, calc(100vw - 32px));
         }
       }

@@ -65,6 +65,8 @@ const {
   getVideoTitle,
   detectPlatform,
   shouldShowPanel,
+  shouldUseFloatingPanel,
+  findEmbedTarget,
   isYouTubeShortsPage
 } = context.__VCS_TEST_HOOKS__;
 
@@ -211,6 +213,12 @@ assert.equal(getVideoTitle(), "Previous Video");
 
 setLocation("https://www.bilibili.com/video/BVNEW");
 setTestPlatform({ id: "bilibili", name: "Bilibili", kind: "bilibili" });
+const bilibiliRightContainer = { id: "right-container-inner" };
+context.document.querySelector = (selector) => (
+  selector === ".right-container-inner" ? bilibiliRightContainer : null
+);
+assert.equal(shouldUseFloatingPanel(), true);
+assert.equal(findEmbedTarget(), context.document.documentElement);
 context.document.title = "Current Bilibili_哔哩哔哩_bilibili";
 context.document.scripts = [{
   textContent: 'window.__INITIAL_STATE__={"videoData":{"bvid":"BVOLD","title":"Old Bilibili"}};'

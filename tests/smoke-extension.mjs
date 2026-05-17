@@ -10,11 +10,13 @@ const fixtureDir = join(rootDir, "tests", "fixtures");
 const outputDir = join(rootDir, "output", "playwright");
 const userDataDir = join(rootDir, "output", "chrome-profile");
 const chromeCandidates = [
+  process.env.VCS_CHROME_PATH,
+  "/Users/liu/Library/Caches/ms-playwright/chromium-1223/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
   "/Users/liu/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
   "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
   "/Applications/Chromium.app/Contents/MacOS/Chromium",
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-];
+].filter(Boolean);
 const chromePath = await firstExisting(chromeCandidates);
 const debugPort = 9227;
 
