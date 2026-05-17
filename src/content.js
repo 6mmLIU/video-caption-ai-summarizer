@@ -80,9 +80,6 @@
       detectTranscriptLanguageFamily,
       getTrackLanguageFamily,
       getYouTubeTranslationSourceTracks,
-      normalizeTedSubtitleTracks,
-      getTedPlayerData,
-      getTedMetadataUrl,
       setTestTracks: (tracks) => {
         state.tracks = tracks;
       },
@@ -93,8 +90,8 @@
       getStatusPayload,
       detectPlatform,
       shouldShowPanel,
-      shouldUseFloatingPanel,
       findEmbedTarget,
+      getRootInsertBefore,
       isYouTubeShortsPage
     };
   } else {
@@ -352,11 +349,6 @@
   }
 
   function findEmbedTarget() {
-    const platform = detectPlatform();
-    if (shouldUseFloatingPanel(platform)) {
-      return document.documentElement;
-    }
-
     const host = location.hostname.replace(/^www\./, "");
     if (host.includes("youtube.com")) {
       return document.querySelector("#secondary-inner")
@@ -364,19 +356,25 @@
         || document.documentElement;
     }
     if (host.includes("bilibili.com")) {
-      return document.querySelector(".right-container-inner")
-        || document.querySelector(".right-container")
-        || document.querySelector("#reco_list")
-        || document.documentElement;
-    }
-    if (isTedPage()) {
-      return findTedEmbedTarget() || document.documentElement;
+      return findBilibiliEmbedTarget();
     }
     return document.documentElement;
   }
 
-  function shouldUseFloatingPanel(platform = state.platform || detectPlatform()) {
-    return platform?.kind === "bilibili";
+  function findBilibiliEmbedTarget() {
+    const inner = document.querySelector(".right-container-inner");
+    if (inner && !isBilibiliEpisodeList(inner)) {
+      return inner;
+    }
+
+    const parent = inner?.parentElement;
+    if (isBilibiliEmbedContainer(parent)) {
+      return parent;
+    }
+
+    return document.querySelector(".right-container")
+      || document.querySelector("#reco_list")
+      || document.documentElement;
   }
 
   function findYouTubeShortsEmbedTarget() {
@@ -510,48 +508,40 @@
     return target.firstElementChild === root ? root.nextSibling : target.firstChild;
   }
 
-  function findTedEmbedTarget() {
-    const transcriptControl = document.querySelector("#transcript-control");
-    const layout = findAncestor(transcriptControl, (element) => {
-      const className = getClassText(element);
-      return className.includes("lg:flex-row") && className.includes("flex-col");
-    });
-    const sideRail = [...(layout?.children || [])].find((element) => {
-      const className = getClassText(element);
-      return className.includes("lg:shrink-0")
-        || className.includes("lg:w-[425px]")
-        || className.includes("xl:w-[536px]");
-    });
-
-    return sideRail?.querySelector?.("[class*='lg:sticky']")
-      || sideRail
-      || document.querySelector("[data-testid*='transcript' i]")?.parentElement
-      || null;
-  }
-
-  function findAncestor(start, predicate) {
-    let element = start?.parentElement || null;
-    while (element && element !== document.documentElement) {
-      if (predicate(element)) {
-        return element;
-      }
-      element = element.parentElement;
-    }
-    return null;
-  }
-
-  function getClassText(element) {
-    return typeof element?.className === "string" ? element.className : "";
-  }
-
   function getBilibiliPanelInsertBefore(target) {
     const children = [...target.children].filter((child) => child !== root);
+    const episodeList = children.find(isBilibiliEpisodeList);
+    if (episodeList) {
+      return episodeList;
+    }
+
     const authorCard = children.find(isBilibiliAuthorCard) || children[0];
     let next = authorCard?.nextSibling || null;
     while (next === root) {
       next = next.nextSibling;
     }
     return next;
+  }
+
+  function isBilibiliEmbedContainer(element) {
+    return Boolean(element)
+      && element !== document.documentElement
+      && element !== document.body;
+  }
+
+  function isBilibiliEpisodeList(element) {
+    const value = [
+      element.id || "",
+      element.className || "",
+      element.getAttribute?.("aria-label") || "",
+      element.getAttribute?.("data-testid") || ""
+    ].join(" ").toLowerCase();
+
+    if (/(episode|section|playlist|multi|part|anthology|video-pod|selection|series|cur-list)/i.test(value)) {
+      return true;
+    }
+
+    return /选集|分集|合集|分p|播放列表/.test(String(element.textContent || "").slice(0, 600).toLowerCase());
   }
 
   function isBilibiliAuthorCard(element) {
@@ -571,15 +561,6 @@
 
   function isBilibiliPage() {
     return location.hostname.replace(/^www\./, "").includes("bilibili.com");
-  }
-
-  function isTedPage() {
-    const host = location.hostname.replace(/^www\./, "");
-    return host === "ted.com" || host.endsWith(".ted.com");
-  }
-
-  function isTedTalkPage() {
-    return isTedPage() && /^\/(?:talks|embed)\//.test(location.pathname);
   }
 
   async function refreshTracks() {
@@ -749,8 +730,8 @@
     if (host.includes("coursera.org")) {
       return { id: "coursera", name: "Coursera", kind: "generic" };
     }
-    if (isTedPage()) {
-      return isTedTalkPage() ? { id: "ted", name: "TED", kind: "ted" } : null;
+    if (host.includes("ted.com")) {
+      return { id: "ted", name: "TED", kind: "generic" };
     }
     if (getVisibleVideoElement()) {
       return { id: "generic", name: "Generic Video", kind: "generic" };
@@ -776,13 +757,6 @@
 
     if (platform.kind === "bilibili") {
       const tracks = await getBilibiliTracks();
-      if (tracks.length) {
-        return tracks;
-      }
-    }
-
-    if (platform.kind === "ted") {
-      const tracks = await getTedTracks();
       if (tracks.length) {
         return tracks;
       }
@@ -1124,104 +1098,6 @@
       }));
   }
 
-  async function getTedTracks() {
-    const playerData = getTedPlayerData();
-    const title = normalizePageTitle(playerData?.title || playerData?.name || "");
-    if (title) {
-      updateStateTitle(title, { shouldRender: false, trusted: true });
-    }
-
-    const metadataUrl = getTedMetadataUrl(playerData);
-    if (!metadataUrl) {
-      return [];
-    }
-
-    try {
-      const response = await extensionFetch(metadataUrl);
-      const metadata = JSON.parse(response.text || "{}");
-      return normalizeTedSubtitleTracks(metadata.subtitles, metadataUrl);
-    } catch (_error) {
-      return [];
-    }
-  }
-
-  function getTedPlayerData() {
-    const videoData = getTedNextData()?.props?.pageProps?.videoData || {};
-    const candidates = [
-      parseTedPlayerData(videoData.playerData),
-      parseTedPlayerData(videoData.acmePlayerData)
-    ].filter(Boolean);
-
-    return candidates.find((data) => getTedMetadataUrl(data))
-      || candidates.find((data) => data.title || data.name)
-      || null;
-  }
-
-  function getTedNextData() {
-    const text = document.getElementById("__NEXT_DATA__")?.textContent || "";
-    if (!text.trim()) {
-      return null;
-    }
-
-    try {
-      return JSON.parse(text);
-    } catch (_error) {
-      return null;
-    }
-  }
-
-  function parseTedPlayerData(value) {
-    if (!value) {
-      return null;
-    }
-    if (typeof value === "object") {
-      return value;
-    }
-    try {
-      return JSON.parse(value);
-    } catch (_error) {
-      return null;
-    }
-  }
-
-  function getTedMetadataUrl(playerData) {
-    const url = playerData?.resources?.hls?.metadata || "";
-    return url ? normalizeUrl(url) : "";
-  }
-
-  function normalizeTedSubtitleTracks(items, baseUrl = location.href) {
-    const seen = new Set();
-    return (Array.isArray(items) ? items : [])
-      .map((item, index) => {
-        const url = normalizeTedSubtitleUrl(item?.webvtt || item?.url || item?.file || "", baseUrl);
-        if (!url || seen.has(url)) {
-          return null;
-        }
-        seen.add(url);
-        const language = item.code || item.languageCode || item.lang || "auto";
-        return {
-          id: `ted-${index}`,
-          label: item.name || item.languageName || language || `TED Subtitle ${index + 1}`,
-          language,
-          source: "ted",
-          url
-        };
-      })
-      .filter(Boolean);
-  }
-
-  function normalizeTedSubtitleUrl(url, baseUrl) {
-    const value = String(url || "").trim();
-    if (!value) {
-      return "";
-    }
-    try {
-      return new URL(value, baseUrl || location.href).toString();
-    } catch (_error) {
-      return "";
-    }
-  }
-
   async function loadSelectedTranscript() {
     const track = getSelectedTrack();
     if (!track) {
@@ -1286,11 +1162,6 @@
     }
 
     if (track.source === "html5") {
-      const response = await extensionFetch(track.url);
-      return parseTextTrack(response.text);
-    }
-
-    if (track.source === "ted") {
       const response = await extensionFetch(track.url);
       return parseTextTrack(response.text);
     }
@@ -2655,13 +2526,11 @@
     const collapsedMeta = state.tracks.length
       ? t("content.label.collapsedTracks", { platform: platformLabel, count: state.tracks.length })
       : `${platformLabel} · ${state.status}`;
-    const platformKind = (state.platform || detectPlatform())?.kind || "";
-    const platformClass = platformKind ? `is-${platformKind}` : "";
     const embedClass = state.embedded ? "is-embedded" : "is-floating";
 
     shadow.innerHTML = `
       <style>${getPanelCss()}</style>
-      <aside class="vcs-panel t-resize ${state.collapsed ? "is-collapsed" : ""} ${embedClass} ${platformClass}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
+      <aside class="vcs-panel t-resize ${state.collapsed ? "is-collapsed" : ""} ${embedClass}" data-theme="${getTheme()}" data-tone="${escapeHtml(state.statusTone)}">
         <button id="vcs-expand" class="vcs-collapsed-toggle" type="button" title="${escapeHtml(t("content.title.expand"))}" aria-label="${escapeHtml(t("content.title.expand"))}">
           <span class="vcs-collapsed-icon"><img src="${escapeHtml(AI_MARK_URL)}" alt=""></span>
           <span class="vcs-collapsed-copy">
@@ -3224,13 +3093,6 @@
         || normalizePageTitle(document.title.replace(/_哔哩哔哩_bilibili$/, ""));
     }
 
-    if (platform?.kind === "ted") {
-      const playerData = getTedPlayerData();
-      return getTedDomTitle()
-        || normalizePageTitle(playerData?.title || playerData?.name || "")
-        || normalizePageTitle(document.title.replace(/\s*\|\s*TED Talk(?: Embed)?$/i, ""));
-    }
-
     return normalizePageTitle(document.querySelector("h1")?.textContent || document.title);
   }
 
@@ -3295,13 +3157,6 @@
     return normalizePageTitle(
       document.querySelector(".video-title")?.textContent
       || document.querySelector("h1.video-title")?.textContent
-      || document.querySelector("h1")?.textContent
-    );
-  }
-
-  function getTedDomTitle() {
-    return normalizePageTitle(
-      document.querySelector("#talk-title h1")?.textContent
       || document.querySelector("h1")?.textContent
     );
   }
@@ -4996,22 +4851,6 @@
         max-width: 108px;
       }
 
-      .vcs-panel.is-floating.is-bilibili {
-        top: auto;
-        right: auto;
-        bottom: 72px;
-        left: 20px;
-        width: min(360px, calc(100vw - 40px));
-        max-height: min(560px, calc(100vh - 120px));
-      }
-      .vcs-panel.is-floating.is-bilibili.is-collapsed {
-        top: auto;
-        right: auto;
-        bottom: 72px;
-        left: 20px;
-        width: min(220px, calc(100vw - 40px));
-      }
-
       @keyframes vcs-indeterminate {
         0% { transform: translateX(-100%); }
         100% { transform: translateX(280%); }
@@ -5070,20 +4909,6 @@
           width: min(360px, calc(100vw - 32px));
         }
         .vcs-panel.is-floating.is-collapsed {
-          width: min(220px, calc(100vw - 32px));
-        }
-        .vcs-panel.is-floating.is-bilibili {
-          top: auto;
-          right: auto;
-          bottom: 16px;
-          left: 16px;
-          width: min(360px, calc(100vw - 32px));
-        }
-        .vcs-panel.is-floating.is-bilibili.is-collapsed {
-          top: auto;
-          right: auto;
-          bottom: 16px;
-          left: 16px;
           width: min(220px, calc(100vw - 32px));
         }
       }
