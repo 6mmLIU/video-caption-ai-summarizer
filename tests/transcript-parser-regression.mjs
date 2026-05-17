@@ -60,6 +60,9 @@ const {
   detectTranscriptLanguageFamily,
   getTrackLanguageFamily,
   getYouTubeTranslationSourceTracks,
+  normalizeTedSubtitleTracks,
+  getTedPlayerData,
+  getTedMetadataUrl,
   setTestTracks,
   setTestPlatform,
   getVideoTitle,
@@ -230,6 +233,72 @@ assert.equal(getVideoTitle(), "Current Bilibili");
 
 context.document.querySelector = () => null;
 assert.equal(getVideoTitle(), "Current Bilibili");
+
+setLocation("https://www.ted.com/talks/example_ted_talk");
+setTestPlatform({ id: "ted", name: "TED", kind: "ted" });
+const tedPlayerData = {
+  title: "TED Metadata Title",
+  resources: {
+    hls: {
+      metadata: "https://hls.ted.com/project_masters/8855/metadata.json?intro_master_id=9294"
+    }
+  }
+};
+context.document.getElementById = (id) => (
+  id === "__NEXT_DATA__"
+    ? {
+        textContent: JSON.stringify({
+          props: {
+            pageProps: {
+              videoData: {
+                playerData: JSON.stringify(tedPlayerData)
+              }
+            }
+          }
+        })
+      }
+    : null
+);
+context.document.querySelector = (selector) => (
+  selector === "#talk-title h1" ? { textContent: "TED DOM Title" } : null
+);
+assert.equal(JSON.stringify(detectPlatform()), JSON.stringify({ id: "ted", name: "TED", kind: "ted" }));
+assert.equal(shouldShowPanel(), true);
+assert.equal(getTedMetadataUrl(getTedPlayerData()), tedPlayerData.resources.hls.metadata);
+assert.equal(getVideoTitle(), "TED DOM Title");
+assert.deepEqual(
+  normalizeTedSubtitleTracks([
+    { code: "en", name: "English", webvtt: "https://hls.ted.com/project_masters/8855/subtitles/en/full.vtt?intro_master_id=9294" },
+    { code: "zh-cn", name: "Chinese, Simplified", webvtt: "/project_masters/8855/subtitles/zh-cn/full.vtt?intro_master_id=9294" },
+    { code: "en", name: "Duplicate English", webvtt: "https://hls.ted.com/project_masters/8855/subtitles/en/full.vtt?intro_master_id=9294" }
+  ], tedPlayerData.resources.hls.metadata).map((track) => ({
+    id: track.id,
+    label: track.label,
+    language: track.language,
+    source: track.source,
+    url: track.url
+  })),
+  [
+    {
+      id: "ted-0",
+      label: "English",
+      language: "en",
+      source: "ted",
+      url: "https://hls.ted.com/project_masters/8855/subtitles/en/full.vtt?intro_master_id=9294"
+    },
+    {
+      id: "ted-1",
+      label: "Chinese, Simplified",
+      language: "zh-cn",
+      source: "ted",
+      url: "https://hls.ted.com/project_masters/8855/subtitles/zh-cn/full.vtt?intro_master_id=9294"
+    }
+  ]
+);
+
+setLocation("https://www.ted.com/about");
+assert.equal(detectPlatform(), null);
+assert.equal(shouldShowPanel(), false);
 
 function textSegment(text) {
   return {
