@@ -540,8 +540,11 @@ async function callGemini(profile, messages, options = {}) {
     url.searchParams.set("alt", "sse");
   }
   const apiKey = getProfileApiKey(profile);
-  if (apiKey && !url.searchParams.has("key")) {
-    url.searchParams.set("key", apiKey);
+  const headers = {
+    "Content-Type": "application/json"
+  };
+  if (apiKey) {
+    headers["x-goog-api-key"] = apiKey;
   }
 
   const text = messages
@@ -550,9 +553,7 @@ async function callGemini(profile, messages, options = {}) {
 
   const response = await fetchModel(url.toString(), {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers,
     body: JSON.stringify({
       contents: [
         {
