@@ -46,9 +46,9 @@ The goal is not to repeat captions line by line. It helps convert long videos in
 | --- | --- |
 | 🎞️ Multi-source caption reading | Supports YouTube, Bilibili, generic HTML5 caption tracks, VTT/SRT files, and visible transcript / caption text. |
 | 🧷 Manual paste fallback | Paste captions or transcript text into the floating panel when a site does not expose readable captions. |
-| 🧠 Bring your own AI service | Supports OpenAI-compatible APIs, Claude, Gemini, Ollama, local models, and proxy services. |
+| 🧠 Bring your own AI service | Supports compatible chat-completion APIs, provider-specific API types, local model endpoints, and proxy services. |
 | 🧰 Multiple API profiles | Save and switch between different providers, endpoints, API keys, and model names. |
-| 📌 Provider presets | Includes templates for DeepSeek, OpenAI / ChatGPT, Claude, Gemini, Kimi, Qwen, Zhipu GLM, Xiaomi MiMo, and Ollama. |
+| 📌 Provider presets | Includes setup templates that prefill common endpoint and model fields, then lets you edit them for your own account. |
 | ✍️ Custom prompts | Customize the prompt and output template to control structure, tone, language, and detail level. |
 | 📚 Long transcript chunking | Long videos are summarized in chunks, then merged into a final result. |
 | 🛡️ Privacy controls | Toggle timestamp sharing, redact sensitive terms, and choose whether to keep the latest 30 summaries locally. |
@@ -78,10 +78,9 @@ The options page lets you create, delete, and switch between API profiles.
 
 | Type | Use Case |
 | --- | --- |
-| OpenAI-compatible APIs | DeepSeek, OpenAI / ChatGPT, Kimi, Qwen, Zhipu GLM, Xiaomi MiMo, and other services compatible with `/v1/chat/completions`. |
-| Anthropic Claude | Claude Messages API. |
-| Google Gemini | Gemini API. If no endpoint is entered, the extension generates the Gemini request URL from the model name. |
-| Ollama / local OpenAI-compatible services | Defaults to `http://localhost:11434/v1/chat/completions`, suitable for local models or LAN-hosted compatible APIs. |
+| Compatible chat-completion API | Services compatible with the `/v1/chat/completions` request format. |
+| Provider-specific APIs | Services with dedicated request formats in the Settings page. |
+| Local model service | Defaults to `http://localhost:11434/v1/chat/completions`, suitable for local models or LAN-hosted compatible APIs. |
 
 Required values typically include endpoint, API key, model name, temperature, and maximum output tokens. Provider behavior varies, so confirm model names, quota limits, context windows, and safety policies in the provider console.
 

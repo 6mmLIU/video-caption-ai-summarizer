@@ -46,9 +46,9 @@
 | --- | --- |
 | 🎞️ 多平台字幕读取 | 支持 YouTube、Bilibili、通用 HTML5 视频字幕轨道、VTT/SRT 字幕，以及页面可见 transcript / caption 文本。 |
 | 🧷 手动粘贴兜底 | 平台不开放字幕接口时，可以直接把字幕或转写文本粘贴到浮动面板中总结。 |
-| 🧠 自选 AI 服务 | 支持 OpenAI 兼容接口、Claude、Gemini、Ollama、本地模型和代理服务。 |
+| 🧠 自选 AI 服务 | 支持兼容聊天补全格式的接口、专用服务接入、本地模型和代理服务。 |
 | 🧰 多 API 配置 | 可以保存多个 API 配置，在不同服务、模型和端点之间切换。 |
-| 📌 服务预设 | 内置 DeepSeek、OpenAI / ChatGPT、Claude、Gemini、Kimi、通义千问、智谱 GLM、小米 MiMo、Ollama 等常用模板。 |
+| 📌 服务预设 | 内置配置模板，可预填常见端点和模型字段，并按你的账号继续调整。 |
 | ✍️ 自定义 Prompt | 支持自定义总结 Prompt 和输出模板，可控制摘要结构、语气、语言和细节密度。 |
 | 📚 长字幕分段 | 长视频会先按设定字符数分段提炼，再合并成最终摘要。 |
 | 🛡️ 隐私控制 | 可关闭时间戳发送、配置敏感词替换，并选择是否保存最近 30 条本地摘要历史。 |
@@ -78,10 +78,9 @@
 
 | 类型 | 适用场景 |
 | --- | --- |
-| OpenAI 兼容接口 | DeepSeek、OpenAI / ChatGPT、Kimi、通义千问、智谱 GLM、小米 MiMo，以及其他兼容 `/v1/chat/completions` 的服务。 |
-| Anthropic Claude | 使用 Claude Messages API 的场景。 |
-| Google Gemini | 使用 Gemini API；未填写接口地址时，扩展会根据模型名称生成 Gemini 请求地址。 |
-| Ollama / 本地 OpenAI 兼容服务 | 默认使用 `http://localhost:11434/v1/chat/completions`，适合本地模型或局域网内兼容服务。 |
+| 兼容聊天补全的接口 | 适用于兼容 `/v1/chat/completions` 请求格式的云端或自建服务。 |
+| 专用服务类型 | 适用于设置页中提供专用接入方式的服务。 |
+| 本地模型服务 | 默认使用 `http://localhost:11434/v1/chat/completions`，适合本地模型或局域网内兼容服务。 |
 
 通常需要填写接口地址、API Key、模型名称、Temperature 和最大输出 Token。不同服务商对模型名称、额度、上下文长度和安全策略的要求不同，请以对应服务商控制台为准。
 

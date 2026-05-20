@@ -7,8 +7,15 @@ import vm from "node:vm";
 const rootDir = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const source = await readFile(resolve(rootDir, "src", "content.js"), "utf8");
 const pageUrl = new URL("https://www.youtube.com/watch?v=test-video");
+let testNow = 1000;
+class TestDate extends Date {
+  static now() {
+    return testNow;
+  }
+}
 const context = {
   __VCS_TEST_MODE__: true,
+  Date: TestDate,
   URL,
   URLSearchParams,
   chrome: {
@@ -28,6 +35,9 @@ const context = {
     },
     querySelectorAll() {
       return [];
+    },
+    createElement(tagName) {
+      return testElement({ tagName: String(tagName || "div").toUpperCase() });
     },
     getElementById() {
       return null;
@@ -60,6 +70,9 @@ const {
   detectTranscriptLanguageFamily,
   getTrackLanguageFamily,
   getYouTubeTranslationSourceTracks,
+  normalizeTedSubtitleTracks,
+  getTedPlayerData,
+  getTedMetadataUrl,
   setTestTracks,
   setTestPlatform,
   getVideoTitle,
@@ -67,6 +80,7 @@ const {
   shouldShowPanel,
   findEmbedTarget,
   getRootInsertBefore,
+  findTedEmbedTarget,
   isYouTubeShortsPage
 } = context.__VCS_TEST_HOOKS__;
 
@@ -213,21 +227,27 @@ assert.equal(getVideoTitle(), "Previous Video");
 
 setLocation("https://www.bilibili.com/video/BVNEW");
 setTestPlatform({ id: "bilibili", name: "Bilibili", kind: "bilibili" });
-const rightInner = testElement({ className: "right-container-inner" });
+const bilibiliUpCard = testElement({ className: "up-panel-container" });
+const bilibiliDanmaku = testElement({ id: "danmukuBox", className: "danmaku-box" });
+const bilibiliEpisodeList = testElement({ className: "video-pod__list", attributes: { "data-testid": "video-pod" } });
+const rightInner = testElement({
+  className: "right-container-inner",
+  children: [bilibiliUpCard, bilibiliDanmaku, bilibiliEpisodeList]
+});
 const rightContainer = testElement({
   className: "right-container",
   children: [rightInner]
 });
 rightInner.parentElement = rightContainer;
+context.document.getElementById = (id) => findDescendant(rightContainer, (element) => element.id === id);
 context.document.querySelector = (selector) => (
   selector === ".right-container-inner" ? rightInner : null
 );
-assert.equal(findEmbedTarget(), rightInner);
-
-rightInner.className = "right-container-inner video-pod__list";
-rightInner.textContent = "选集";
-assert.equal(findEmbedTarget(), rightContainer);
-assert.equal(getRootInsertBefore(rightContainer), rightInner);
+assert.equal(findEmbedTarget(), context.document.documentElement);
+assert.equal(rightInner.children.length, 3);
+assert.equal(rightInner.children.includes(bilibiliUpCard), true);
+assert.equal(rightInner.children.includes(bilibiliDanmaku), true);
+assert.equal(rightInner.children.includes(bilibiliEpisodeList), true);
 
 context.document.title = "Current Bilibili_哔哩哔哩_bilibili";
 context.document.scripts = [{
@@ -240,6 +260,94 @@ assert.equal(getVideoTitle(), "Current Bilibili");
 
 context.document.querySelector = () => null;
 assert.equal(getVideoTitle(), "Current Bilibili");
+
+setLocation("https://www.ted.com/talks/example_ted_talk");
+setTestPlatform({ id: "ted", name: "TED", kind: "ted" });
+const tedSticky = testElement({ className: "lg:sticky lg:top-4" });
+const tedSideRail = testElement({
+  className: "order-last px-5 lg:order-none lg:w-[425px] lg:shrink-0 xl:w-[536px]",
+  children: [tedSticky]
+});
+const tedMainColumn = testElement({});
+const tedLayout = testElement({
+  className: "flex w-full flex-col lg:flex-row",
+  children: [tedMainColumn, tedSideRail]
+});
+const transcriptControl = testElement({ id: "transcript-control", parentElement: tedMainColumn });
+tedMainColumn.parentElement = tedLayout;
+tedSideRail.parentElement = tedLayout;
+tedSticky.parentElement = tedSideRail;
+context.document.querySelector = (selector) => {
+  if (selector === "#transcript-control") {
+    return transcriptControl;
+  }
+  if (selector === "#talk-title h1") {
+    return { textContent: "TED DOM Title" };
+  }
+  return null;
+};
+const tedPlayerData = {
+  title: "TED Metadata Title",
+  resources: {
+    hls: {
+      metadata: "https://hls.ted.com/project_masters/8855/metadata.json?intro_master_id=9294"
+    }
+  }
+};
+context.document.getElementById = (id) => (
+  id === "__NEXT_DATA__"
+    ? {
+        textContent: JSON.stringify({
+          props: {
+            pageProps: {
+              videoData: {
+                playerData: JSON.stringify(tedPlayerData)
+              }
+            }
+          }
+        })
+      }
+    : null
+);
+assert.equal(JSON.stringify(detectPlatform()), JSON.stringify({ id: "ted", name: "TED", kind: "ted" }));
+assert.equal(shouldShowPanel(), true);
+assert.equal(findTedEmbedTarget(), tedSticky);
+assert.equal(findEmbedTarget(), tedSticky);
+assert.equal(getTedMetadataUrl(getTedPlayerData()), tedPlayerData.resources.hls.metadata);
+assert.equal(getVideoTitle(), "TED DOM Title");
+assert.deepEqual(
+  normalizeTedSubtitleTracks([
+    { code: "en", name: "English", webvtt: "https://hls.ted.com/project_masters/8855/subtitles/en/full.vtt?intro_master_id=9294" },
+    { code: "zh-cn", name: "Chinese, Simplified", webvtt: "/project_masters/8855/subtitles/zh-cn/full.vtt?intro_master_id=9294" },
+    { code: "en", name: "Duplicate English", webvtt: "https://hls.ted.com/project_masters/8855/subtitles/en/full.vtt?intro_master_id=9294" }
+  ], tedPlayerData.resources.hls.metadata).map((track) => ({
+    id: track.id,
+    label: track.label,
+    language: track.language,
+    source: track.source,
+    url: track.url
+  })),
+  [
+    {
+      id: "ted-0",
+      label: "English",
+      language: "en",
+      source: "ted",
+      url: "https://hls.ted.com/project_masters/8855/subtitles/en/full.vtt?intro_master_id=9294"
+    },
+    {
+      id: "ted-1",
+      label: "Chinese, Simplified",
+      language: "zh-cn",
+      source: "ted",
+      url: "https://hls.ted.com/project_masters/8855/subtitles/zh-cn/full.vtt?intro_master_id=9294"
+    }
+  ]
+);
+
+setLocation("https://www.ted.com/about");
+assert.equal(detectPlatform(), null);
+assert.equal(shouldShowPanel(), false);
 
 function textSegment(text) {
   return {
@@ -255,20 +363,92 @@ function textSegment(text) {
 }
 
 function testElement(props = {}) {
-  return {
+  const styleValues = new Map();
+  const element = {
+    tagName: props.tagName || "DIV",
     id: props.id || "",
     className: props.className || "",
     textContent: props.textContent || "",
-    children: props.children || [],
+    children: props.children ? [...props.children] : [],
     parentElement: props.parentElement || null,
     nextSibling: props.nextSibling || null,
-    getAttribute(name) {
-      return props.attributes?.[name] || "";
+    nextElementSibling: props.nextElementSibling || null,
+    attributes: { ...(props.attributes || {}) },
+    get firstChild() {
+      return this.children[0] || null;
     },
-    querySelector() {
+    get firstElementChild() {
+      return this.children[0] || null;
+    },
+    style: {
+      setProperty(name, value) {
+        styleValues.set(name, String(value));
+      },
+      getPropertyValue(name) {
+        return styleValues.get(name) || "";
+      },
+      getPropertyPriority() {
+        return "";
+      },
+      removeProperty(name) {
+        styleValues.delete(name);
+      }
+    },
+    remove() {
+      if (!this.parentElement) {
+        return;
+      }
+      this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
+      syncChildSiblings(this.parentElement);
+      this.parentElement = null;
+    },
+    insertBefore(child, before) {
+      child.remove?.();
+      const nextIndex = before ? this.children.indexOf(before) : -1;
+      const insertIndex = nextIndex >= 0 ? nextIndex : this.children.length;
+      this.children.splice(insertIndex, 0, child);
+      child.parentElement = this;
+      syncChildSiblings(this);
+      return child;
+    },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+    },
+    getAttribute(name) {
+      return this.attributes[name] || "";
+    },
+    querySelector(selector) {
+      if (selector === "[class*='lg:sticky']") {
+        return findDescendant(this, (element) => String(element.className || "").includes("lg:sticky"));
+      }
       return null;
     }
   };
+  element.children.forEach((child) => {
+    child.parentElement = element;
+  });
+  syncChildSiblings(element);
+  return element;
+}
+
+function syncChildSiblings(parent) {
+  (parent.children || []).forEach((child, index, children) => {
+    child.nextSibling = children[index + 1] || null;
+    child.nextElementSibling = children[index + 1] || null;
+  });
+}
+
+function findDescendant(element, predicate) {
+  for (const child of element.children || []) {
+    if (predicate(child)) {
+      return child;
+    }
+    const match = findDescendant(child, predicate);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
 }
 
 function setLocation(url) {
